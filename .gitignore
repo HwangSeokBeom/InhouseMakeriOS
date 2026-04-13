@@ -1,0 +1,38 @@
+# macOS
+.DS_Store
+
+# Xcode user data
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.moved-aside
+*.xcscmblueprint
+
+# Xcode build outputs
+DerivedData/
+build/
+.derived-data/
+
+# Swift Package Manager
+.swiftpm/
+.build/
+
+# Package.resolved is committed for reproducible Xcode app builds.
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/
+fastlane/test_output/
+
+# Simulator and device artifacts
+*.simruntime/
+*.crash
+
+# Local environment and secrets
+.env
+.env.*
+*.local
+
+# Codex local state
+.codex-home/
