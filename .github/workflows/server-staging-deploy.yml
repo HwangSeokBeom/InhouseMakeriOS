@@ -1,0 +1,71 @@
+name: Server Staging Deploy
+
+on:
+  push:
+    branches:
+      - staging
+    paths:
+      - "server/**"
+      - "scripts/server/**"
+      - ".github/workflows/server-staging-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: server-staging-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ github.ref_name == 'staging' && hashFiles('server/package.json') != '' }}
+    runs-on: ubuntu-latest
+    environment: server-staging
+    env:
+      EC2_HOST_STAGING: ${{ secrets.EC2_HOST_STAGING }}
+      EC2_PORT_STAGING: ${{ secrets.EC2_PORT_STAGING }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      SERVER_APP_DIR_STAGING: ${{ secrets.SERVER_APP_DIR_STAGING }}
+      SERVER_HEALTHCHECK_URL_STAGING: ${{ secrets.SERVER_HEALTHCHECK_URL_STAGING }}
+    steps:
+      - name: Guard release branch
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" == "staging" ]]
+
+      - name: Validate SSH inputs
+        run: |
+          set -euo pipefail
+          required_vars=(
+            EC2_HOST_STAGING
+            EC2_USER
+            EC2_SSH_KEY
+            SERVER_APP_DIR_STAGING
+          )
+
+          for required_var in "${required_vars[@]}"; do
+            if [[ -z "${!required_var:-}" ]]; then
+              echo "Missing required deploy secret: ${required_var}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Load deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Trust staging host
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${EC2_PORT_STAGING:-22}" -H "${EC2_HOST_STAGING}" >> ~/.ssh/known_hosts
+
+      - name: Deploy staging server
+        run: |
+          set -euo pipefail
+          ssh -p "${EC2_PORT_STAGING:-22}" "${EC2_USER}@${EC2_HOST_STAGING}" <<EOF
+          set -euo pipefail
+          export DEPLOY_HEALTHCHECK_URL="${SERVER_HEALTHCHECK_URL_STAGING}"
+          cd "${SERVER_APP_DIR_STAGING}"
+          bash scripts/server/deploy-staging.sh
+          EOF

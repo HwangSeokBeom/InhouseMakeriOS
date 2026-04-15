@@ -142,6 +142,138 @@ struct NavHeaderView: View {
     }
 }
 
+struct TabHeaderAction: Identifiable {
+    let id: String
+    let systemName: String
+    let accessibilityLabel: String
+    let action: () -> Void
+
+    init(
+        id: String? = nil,
+        systemName: String,
+        accessibilityLabel: String,
+        action: @escaping () -> Void
+    ) {
+        self.id = id ?? accessibilityLabel
+        self.systemName = systemName
+        self.accessibilityLabel = accessibilityLabel
+        self.action = action
+    }
+}
+
+struct TabNavigationHeader: View {
+    let title: String
+    var subtitle: String? = nil
+    var leadingAction: TabHeaderAction? = nil
+    var trailingAction: TabHeaderAction? = nil
+
+    private var titleSpacing: CGFloat {
+        subtitle == nil ? 0 : 2
+    }
+
+    private var headerHeight: CGFloat {
+        subtitle == nil ? 44 : 50
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                HStack(spacing: 0) {
+                    headerActionSlot(leadingAction)
+                    Spacer(minLength: 0)
+                    headerActionSlot(trailingAction)
+                }
+
+                VStack(spacing: titleSpacing) {
+                    Text(title)
+                        .font(AppTypography.heading(21, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.textSecondary)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .multilineTextAlignment(.center)
+            }
+            .frame(height: headerHeight)
+            .padding(.horizontal, 16)
+            .padding(.top, 4)
+            .padding(.bottom, 6)
+
+            Rectangle()
+                .fill(Color.white.opacity(0.035))
+                .frame(height: 0.5)
+                .padding(.horizontal, 16)
+        }
+        .background(AppPalette.bgPrimary.opacity(0.985))
+    }
+
+    @ViewBuilder
+    private func headerActionSlot(_ action: TabHeaderAction?) -> some View {
+        if let action {
+            Button(action: action.action) {
+                Image(systemName: action.systemName)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                    .frame(width: 36, height: 36)
+                    .background(
+                        Circle()
+                            .fill(AppPalette.bgTertiary.opacity(0.72))
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                    )
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel(action.accessibilityLabel)
+            .frame(width: 44, height: 36, alignment: .center)
+        } else {
+            Color.clear
+                .frame(width: 44, height: 36)
+        }
+    }
+}
+
+struct TabRootScaffold<Content: View>: View {
+    let title: String
+    var subtitle: String? = nil
+    var leadingAction: TabHeaderAction? = nil
+    var trailingAction: TabHeaderAction? = nil
+    let content: Content
+
+    init(
+        title: String,
+        subtitle: String? = nil,
+        leadingAction: TabHeaderAction? = nil,
+        trailingAction: TabHeaderAction? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.leadingAction = leadingAction
+        self.trailingAction = trailingAction
+        self.content = content()
+    }
+
+    var body: some View {
+        content
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .toolbar(.hidden, for: .navigationBar)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                TabNavigationHeader(
+                    title: title,
+                    subtitle: subtitle,
+                    leadingAction: leadingAction,
+                    trailingAction: trailingAction
+                )
+            }
+    }
+}
+
 enum AppNavigationAppearance {
     static func apply() {
         let navigationBarAppearance = UINavigationBarAppearance()
@@ -161,7 +293,7 @@ enum AppNavigationAppearance {
         navigationBar.compactAppearance = navigationBarAppearance
         navigationBar.compactScrollEdgeAppearance = navigationBarAppearance
         navigationBar.tintColor = UIColor(hex: 0x4A9FFF)
-        navigationBar.prefersLargeTitles = true
+        navigationBar.prefersLargeTitles = false
 
         let barButtonItem = UIBarButtonItem.appearance()
         barButtonItem.tintColor = UIColor(hex: 0x4A9FFF)
@@ -180,11 +312,14 @@ struct SectionHeaderView: View {
                 .font(AppTypography.heading(16, weight: .bold))
                 .foregroundStyle(AppPalette.textPrimary)
             Spacer()
-            if showsTrailing {
-                Button(action: { onTap?() }) {
+            if showsTrailing, let onTap {
+                Button(action: onTap) {
                     Text(trailing)
                         .font(AppTypography.body(13))
                         .foregroundStyle(AppPalette.textMuted)
+                        .padding(.horizontal, 10)
+                        .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -306,34 +441,49 @@ struct AppTabBar: View {
     let onSelect: (AppTab) -> Void
 
     var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 0) {
-                ForEach(AppTab.allCases, id: \.self) { tab in
-                    Button(action: { onSelect(tab) }) {
-                        VStack(spacing: 3) {
-                            Image(systemName: tab.iconName)
-                                .font(.system(size: 18, weight: .semibold))
-                            Text(tab.title)
-                                .font(AppTypography.body(10, weight: .semibold))
-                                .tracking(0.5)
-                        }
-                        .foregroundStyle(selectedTab == tab ? AppPalette.accentBlue : AppPalette.textMuted)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 62)
-                        .background(
-                            RoundedRectangle(cornerRadius: 26)
-                                .fill(selectedTab == tab ? AppPalette.accentBlue.opacity(0.16) : .clear)
-                        )
+        HStack(spacing: 8) {
+            ForEach(AppTab.allCases, id: \.self) { tab in
+                Button(action: { onSelect(tab) }) {
+                    VStack(spacing: 3) {
+                        Image(systemName: tab.iconName)
+                            .font(.system(size: 18, weight: selectedTab == tab ? .semibold : .medium))
+                            .foregroundStyle(selectedTab == tab ? AppPalette.accentBlue : AppPalette.textMuted)
+                            .frame(height: 20)
+                        Text(tab.title)
+                            .font(AppTypography.body(10, weight: selectedTab == tab ? .semibold : .medium))
+                            .foregroundStyle(selectedTab == tab ? AppPalette.textPrimary : AppPalette.textSecondary)
+                            .lineLimit(1)
                     }
-                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 52)
+                    .background(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .fill(selectedTab == tab ? Color.white.opacity(0.045) : .clear)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .stroke(selectedTab == tab ? Color.white.opacity(0.05) : .clear, lineWidth: 1)
+                            )
+                    )
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
             }
-            .padding(.horizontal, 8)
-            .padding(.top, 4)
-            .frame(height: 62)
         }
-        .frame(height: 83)
-        .background(AppPalette.bgSecondary)
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+        .padding(.bottom, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .fill(AppPalette.bgSecondary.opacity(0.98))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.1), radius: 10, x: 0, y: 4)
+        )
+        .padding(.horizontal, 12)
+        .padding(.top, 6)
+        .padding(.bottom, 4)
     }
 }
 
@@ -572,6 +722,67 @@ struct ToastBanner: View {
                     .stroke(tint, lineWidth: 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+struct ScreenScaffold<Content: View>: View {
+    let title: String
+    var showBack: Bool = true
+    var rightSystemImage: String? = nil
+    var onBack: () -> Void
+    var onRightTap: (() -> Void)?
+    let content: Content
+
+    var body: some View {
+        VStack(spacing: 0) {
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .navigationTitle(title)
+        .toolbar {
+            if let rightSystemImage {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: { onRightTap?() }) {
+                        Image(systemName: rightSystemImage)
+                    }
+                }
+            }
+        }
+        .appNavigationBarStyle(.inline)
+    }
+}
+
+@ViewBuilder
+func screenScaffold<Content: View>(
+    title: String,
+    onBack: @escaping () -> Void,
+    rightSystemImage: String? = nil,
+    onRightTap: (() -> Void)? = nil,
+    @ViewBuilder content: () -> Content
+) -> some View {
+    ScreenScaffold(
+        title: title,
+        rightSystemImage: rightSystemImage,
+        onBack: onBack,
+        onRightTap: onRightTap,
+        content: content()
+    )
+}
+
+@ViewBuilder
+func actionBanner(_ state: AsyncActionState) -> some View {
+    switch state {
+    case .idle:
+        EmptyView()
+    case let .inProgress(message):
+        ToastBanner(message: message, tint: AppPalette.accentBlue)
+            .padding(16)
+    case let .success(message):
+        ToastBanner(message: message, tint: AppPalette.accentGreen)
+            .padding(16)
+    case let .failure(message):
+        ToastBanner(message: message, tint: AppPalette.accentRed)
+            .padding(16)
     }
 }
 

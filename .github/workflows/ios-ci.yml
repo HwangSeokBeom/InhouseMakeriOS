@@ -1,0 +1,87 @@
+name: iOS CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - staging
+      - main
+    paths:
+      - "InhouseMakeriOS/**"
+      - "InhouseMakeriOS.xcodeproj/**"
+      - "fastlane/**"
+      - "scripts/ios/**"
+      - "Gemfile"
+      - ".github/workflows/ios-*.yml"
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+    paths:
+      - "InhouseMakeriOS/**"
+      - "InhouseMakeriOS.xcodeproj/**"
+      - "fastlane/**"
+      - "scripts/ios/**"
+      - "Gemfile"
+      - ".github/workflows/ios-*.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: macos-latest
+    env:
+      PROJECT_PATH: InhouseMakeriOS.xcodeproj
+      SCHEME_NAME: InhouseMakeriOS-Dev
+      CONFIGURATION_NAME: Dev
+      SOURCE_PACKAGES_DIR: ${{ github.workspace }}/.cache/source-packages
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.SOURCE_PACKAGES_DIR }}
+          key: ${{ runner.os }}-spm-${{ hashFiles('InhouseMakeriOS.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          restore-keys: |
+            ${{ runner.os }}-spm-
+
+      - name: Resolve Swift packages
+        run: |
+          set -euo pipefail
+          mkdir -p "${SOURCE_PACKAGES_DIR}"
+          xcodebuild \
+            -resolvePackageDependencies \
+            -project "${PROJECT_PATH}" \
+            -scheme "${SCHEME_NAME}" \
+            -clonedSourcePackagesDirPath "${SOURCE_PACKAGES_DIR}"
+
+      - name: Resolve simulator destination
+        id: simulator
+        run: |
+          set -euo pipefail
+          destination="$(bash scripts/ios/select_simulator_destination.sh "${PROJECT_PATH}" "${SCHEME_NAME}")"
+          echo "destination=${destination}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build and test
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            test \
+            -project "${PROJECT_PATH}" \
+            -scheme "${SCHEME_NAME}" \
+            -configuration "${CONFIGURATION_NAME}" \
+            -destination "${{ steps.simulator.outputs.destination }}" \
+            -clonedSourcePackagesDirPath "${SOURCE_PACKAGES_DIR}" \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO

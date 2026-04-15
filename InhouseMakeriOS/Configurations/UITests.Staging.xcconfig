@@ -1,0 +1,2 @@
+#include "UITests.Base.xcconfig"
+INHOUSE_APP_BUNDLE_SUFFIX = .staging

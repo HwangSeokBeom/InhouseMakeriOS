@@ -331,7 +331,7 @@ struct TeamBalanceFeatureView: View {
                 .background(AppPalette.bgSecondary)
             }
         }
-        .overlay(alignment: .bottom) { actionBanner(store.actionState) }
+        .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
         .onChange(of: store.pendingProtectedAction) { _, pendingAction in
             guard let pendingAction else { return }
             switch pendingAction {

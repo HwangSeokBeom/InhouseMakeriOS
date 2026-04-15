@@ -1,0 +1,71 @@
+name: Server Production Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "server/**"
+      - "scripts/server/**"
+      - ".github/workflows/server-production-deploy.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: server-production-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    if: ${{ github.ref_name == 'main' && hashFiles('server/package.json') != '' }}
+    runs-on: ubuntu-latest
+    environment: server-production
+    env:
+      EC2_HOST_PRODUCTION: ${{ secrets.EC2_HOST_PRODUCTION }}
+      EC2_PORT_PRODUCTION: ${{ secrets.EC2_PORT_PRODUCTION }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+      SERVER_APP_DIR_PRODUCTION: ${{ secrets.SERVER_APP_DIR_PRODUCTION }}
+      SERVER_HEALTHCHECK_URL_PRODUCTION: ${{ secrets.SERVER_HEALTHCHECK_URL_PRODUCTION }}
+    steps:
+      - name: Guard release branch
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" == "main" ]]
+
+      - name: Validate SSH inputs
+        run: |
+          set -euo pipefail
+          required_vars=(
+            EC2_HOST_PRODUCTION
+            EC2_USER
+            EC2_SSH_KEY
+            SERVER_APP_DIR_PRODUCTION
+          )
+
+          for required_var in "${required_vars[@]}"; do
+            if [[ -z "${!required_var:-}" ]]; then
+              echo "Missing required deploy secret: ${required_var}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Load deploy key
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Trust production host
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${EC2_PORT_PRODUCTION:-22}" -H "${EC2_HOST_PRODUCTION}" >> ~/.ssh/known_hosts
+
+      - name: Deploy production server
+        run: |
+          set -euo pipefail
+          ssh -p "${EC2_PORT_PRODUCTION:-22}" "${EC2_USER}@${EC2_HOST_PRODUCTION}" <<EOF
+          set -euo pipefail
+          export DEPLOY_HEALTHCHECK_URL="${SERVER_HEALTHCHECK_URL_PRODUCTION}"
+          cd "${SERVER_APP_DIR_PRODUCTION}"
+          bash scripts/server/deploy-production.sh
+          EOF

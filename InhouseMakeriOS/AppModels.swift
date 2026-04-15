@@ -77,11 +77,129 @@ enum AsyncActionState: Equatable {
     case failure(String)
 }
 
+enum RiotSyncStatus: String, Codable, Hashable {
+    case idle = "IDLE"
+    case queued = "QUEUED"
+    case running = "RUNNING"
+    case partial = "PARTIAL"
+    case succeeded = "SUCCEEDED"
+    case failed = "FAILED"
+    case retryScheduled = "RETRY_SCHEDULED"
+
+    var isInFlight: Bool {
+        switch self {
+        case .queued, .running, .retryScheduled:
+            return true
+        case .idle, .partial, .succeeded, .failed:
+            return false
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawStatus = try container.decode(String.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+
+        switch rawStatus {
+        case Self.idle.rawValue:
+            self = .idle
+        case Self.queued.rawValue:
+            self = .queued
+        case Self.running.rawValue, "SYNCING":
+            self = .running
+        case Self.partial.rawValue:
+            self = .partial
+        case Self.succeeded.rawValue:
+            self = .succeeded
+        case Self.failed.rawValue:
+            self = .failed
+        case Self.retryScheduled.rawValue:
+            self = .retryScheduled
+        default:
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported RiotSyncStatus value: \(rawStatus)"
+            )
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
+enum RiotSyncUIState: Equatable {
+    case pending
+    case syncing
+    case success
+    case accountNotFound
+    case invalidInput
+    case serverConfiguration
+    case failure
+
+    var title: String {
+        switch self {
+        case .pending:
+            return "동기화 대기"
+        case .syncing:
+            return "동기화 중"
+        case .success:
+            return "동기화 성공"
+        case .accountNotFound:
+            return "계정을 찾을 수 없음"
+        case .invalidInput:
+            return "입력 형식 오류"
+        case .serverConfiguration:
+            return "서버 설정 문제"
+        case .failure:
+            return "동기화 실패"
+        }
+    }
+
+    var summary: String {
+        switch self {
+        case .pending:
+            return "Sync 버튼을 누르면 Riot 전적 동기화 요청을 보낼 수 있습니다."
+        case .syncing:
+            return "Riot API에서 최신 전적을 확인하고 있습니다."
+        case .success:
+            return "가장 최근 동기화가 정상적으로 완료되었습니다."
+        case .accountNotFound:
+            return "게임 이름과 태그라인이 현재 Riot ID와 일치하는지 확인해 주세요."
+        case .invalidInput:
+            return "Riot ID 형식이 잘못되었거나 요청 값이 유효하지 않습니다."
+        case .serverConfiguration:
+            return "Riot API 인증 또는 서버 설정을 확인해야 합니다."
+        case .failure:
+            return "동기화 처리 중 문제가 발생했습니다. 잠시 후 다시 시도해 주세요."
+        }
+    }
+
+    var isFailure: Bool {
+        switch self {
+        case .accountNotFound, .invalidInput, .serverConfiguration, .failure:
+            return true
+        case .pending, .syncing, .success:
+            return false
+        }
+    }
+}
+
 enum ServerContractErrorCode: Equatable {
     case socialTokenInvalid
     case accountExistsWithApple
     case accountExistsWithGoogle
     case authProviderMismatch
+    case unsupportedProvider
+    case emailAlreadyExists
+    case nicknameAlreadyExists
+    case invalidEmailFormat
+    case weakPassword
+    case requiredTermsNotAgreed
+    case invalidPayload
+    case internalServerError
     case invalidCredentials
     case emailAuthDisabled
     case passwordAuthDisabled
@@ -106,6 +224,22 @@ enum ServerContractErrorCode: Equatable {
             return .accountExistsWithGoogle
         case let code where code.contains("AUTH_PROVIDER_MISMATCH"):
             return .authProviderMismatch
+        case let code where code.contains("UNSUPPORTED_PROVIDER") || code.contains("UNSUPPORTED_AUTH_PROVIDER") || code.contains("UNSUPPORTED_LOGIN_METHOD"):
+            return .unsupportedProvider
+        case let code where code.contains("EMAIL_ALREADY_IN_USE") || code.contains("EMAIL_ALREADY_EXISTS") || code.contains("EMAIL_DUPLICATE") || code.contains("DUPLICATE_EMAIL") || code.contains("ACCOUNT_EXISTS_WITH_EMAIL"):
+            return .emailAlreadyExists
+        case let code where code.contains("NICKNAME_ALREADY_IN_USE") || code.contains("NICKNAME_ALREADY_EXISTS") || code.contains("NICKNAME_DUPLICATE") || code.contains("DUPLICATE_NICKNAME") || code.contains("NICKNAME_TAKEN"):
+            return .nicknameAlreadyExists
+        case let code where code.contains("INVALID_EMAIL_FORMAT"):
+            return .invalidEmailFormat
+        case let code where code.contains("WEAK_PASSWORD"):
+            return .weakPassword
+        case let code where code.contains("REQUIRED_TERMS_NOT_AGREED"):
+            return .requiredTermsNotAgreed
+        case let code where code.contains("INVALID_PAYLOAD"):
+            return .invalidPayload
+        case let code where code.contains("INTERNAL_SERVER_ERROR"):
+            return .internalServerError
         case let code where code.contains("INVALID_CREDENTIALS"):
             return .invalidCredentials
         case let code where code.contains("EMAIL_AUTH_DISABLED"):
@@ -182,7 +316,7 @@ extension UserFacingError {
         case .authRequired:
             return UserFacingError(
                 title: "로그인이 필요해요",
-                message: "이 기능은 로그인 후 사용할 수 있어요. Apple 또는 Google로 로그인해 주세요.",
+                message: "이 기능은 로그인 후 사용할 수 있어요. 이메일, Apple 또는 Google로 로그인해 주세요.",
                 code: self.code,
                 provider: provider,
                 statusCode: statusCode,
@@ -233,6 +367,78 @@ extension UserFacingError {
                 statusCode: statusCode,
                 details: details
             )
+        case .unsupportedProvider:
+            return UserFacingError(
+                title: "지원하지 않는 로그인 방식이에요",
+                message: "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .emailAlreadyExists:
+            return UserFacingError(
+                title: "이미 가입된 이메일이에요",
+                message: "다른 이메일을 사용하거나 로그인으로 계속해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .nicknameAlreadyExists:
+            return UserFacingError(
+                title: "이미 사용 중인 닉네임이에요",
+                message: "다른 닉네임으로 다시 시도해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .invalidEmailFormat:
+            return UserFacingError(
+                title: "이메일 형식을 확인해 주세요",
+                message: "올바른 이메일 형식으로 다시 입력해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .weakPassword:
+            return UserFacingError(
+                title: "비밀번호를 다시 확인해 주세요",
+                message: "비밀번호 조건을 만족하도록 다시 입력해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .requiredTermsNotAgreed:
+            return UserFacingError(
+                title: "필수 약관 동의가 필요해요",
+                message: "서비스 이용약관과 개인정보 처리방침에 동의해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .invalidPayload:
+            return UserFacingError(
+                title: "입력값을 다시 확인해 주세요",
+                message: "입력한 회원가입 정보를 다시 확인한 뒤 시도해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .internalServerError:
+            return UserFacingError(
+                title: "서버에 잠시 문제가 있어요",
+                message: "잠시 후 다시 시도해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
         case .invalidCredentials:
             return UserFacingError(
                 title: "로그인 정보를 다시 확인해 주세요",
@@ -242,10 +448,19 @@ extension UserFacingError {
                 statusCode: statusCode,
                 details: details
             )
-        case .emailAuthDisabled, .passwordAuthDisabled:
+        case .emailAuthDisabled:
             return UserFacingError(
-                title: "지원하지 않는 로그인 방식이에요",
-                message: "이 앱에서는 Apple 또는 Google 로그인만 사용할 수 있어요.",
+                title: "이메일 회원가입을 사용할 수 없어요",
+                message: "현재 이메일 회원가입이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .passwordAuthDisabled:
+            return UserFacingError(
+                title: "이메일 로그인을 사용할 수 없어요",
+                message: "현재 이메일 로그인이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요.",
                 code: self.code,
                 provider: provider,
                 statusCode: statusCode,
@@ -265,7 +480,7 @@ extension UserFacingError {
         }
     }
 
-    static func authRequiredFallback(message: String = "세션이 만료되어 다시 로그인이 필요해요. Apple 또는 Google로 다시 로그인해 주세요.") -> UserFacingError {
+    static func authRequiredFallback(message: String = "세션이 만료되어 다시 로그인이 필요해요. 이메일, Apple 또는 Google로 다시 로그인해 주세요.") -> UserFacingError {
         UserFacingError(
             title: "로그인이 필요해요",
             message: message,
@@ -491,12 +706,59 @@ struct AuthUser: Codable, Hashable {
     let id: String
     let email: String
     let nickname: String
+    let provider: AuthProvider?
+    let status: AuthenticatedUserStatus?
+
+    init(
+        id: String,
+        email: String,
+        nickname: String,
+        provider: AuthProvider? = nil,
+        status: AuthenticatedUserStatus? = nil
+    ) {
+        self.id = id
+        self.email = email
+        self.nickname = nickname
+        self.provider = provider
+        self.status = status
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case nickname
+        case provider
+        case status
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        email = try container.decode(String.self, forKey: .email)
+        nickname = try container.decode(String.self, forKey: .nickname)
+        provider = try container.decodeIfPresent(AuthProvider.self, forKey: .provider)
+        status = try container.decodeIfPresent(AuthenticatedUserStatus.self, forKey: .status)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(email, forKey: .email)
+        try container.encode(nickname, forKey: .nickname)
+        try container.encodeIfPresent(provider, forKey: .provider)
+        try container.encodeIfPresent(status, forKey: .status)
+    }
 }
 
 struct AuthTokens: Codable, Hashable {
     let user: AuthUser
     let accessToken: String
     let refreshToken: String
+}
+
+enum AuthenticatedUserStatus: String, Codable, Hashable {
+    case active = "ACTIVE"
+    case suspended = "SUSPENDED"
 }
 
 struct UserSession: Equatable {
@@ -540,7 +802,186 @@ struct RiotAccount: Codable, Hashable, Identifiable {
     let puuid: String
     let isPrimary: Bool
     let verificationStatus: VerificationStatus
+    let syncStatus: RiotSyncStatus
+    let lastSyncRequestedAt: Date?
+    let lastSyncSucceededAt: Date?
+    let lastSyncFailedAt: Date?
+    let lastSyncErrorCode: String?
+    let lastSyncErrorMessage: String?
     let lastSyncedAt: Date?
+
+    var displayName: String {
+        "\(riotGameName)#\(tagLine)"
+    }
+
+    var syncUIState: RiotSyncUIState {
+        switch syncStatus {
+        case .idle, .queued, .retryScheduled:
+            return .pending
+        case .running:
+            return .syncing
+        case .partial, .succeeded:
+            return .success
+        case .failed:
+            switch normalizedSyncErrorCode {
+            case "RIOT_RESOURCE_NOT_FOUND":
+                return .accountNotFound
+            case "RIOT_CLIENT_ERROR", "INVALID_PAYLOAD":
+                return .invalidInput
+            case "RIOT_AUTH_FAILED":
+                return .serverConfiguration
+            default:
+                return .failure
+            }
+        }
+    }
+
+    var syncStatusSummary: String {
+        if syncUIState.isFailure, let lastSyncErrorMessage, !lastSyncErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return lastSyncErrorMessage
+        }
+        return syncUIState.summary
+    }
+
+    var syncStatusTimestamp: Date? {
+        switch syncUIState {
+        case .success:
+            return lastSyncSucceededAt ?? lastSyncedAt
+        case .accountNotFound, .invalidInput, .serverConfiguration, .failure:
+            return lastSyncFailedAt
+        case .syncing:
+            return lastSyncRequestedAt
+        case .pending:
+            return lastSyncRequestedAt ?? lastSyncedAt
+        }
+    }
+
+    var normalizedSyncErrorCode: String {
+        lastSyncErrorCode?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased() ?? ""
+    }
+
+    func withPrimary(_ isPrimary: Bool) -> RiotAccount {
+        RiotAccount(
+            id: id,
+            riotGameName: riotGameName,
+            tagLine: tagLine,
+            region: region,
+            puuid: puuid,
+            isPrimary: isPrimary,
+            verificationStatus: verificationStatus,
+            syncStatus: syncStatus,
+            lastSyncRequestedAt: lastSyncRequestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: lastSyncErrorCode,
+            lastSyncErrorMessage: lastSyncErrorMessage,
+            lastSyncedAt: lastSyncedAt
+        )
+    }
+
+    func withSyncAccepted(_ accepted: RiotAccountSyncAccepted, requestedAt: Date) -> RiotAccount {
+        RiotAccount(
+            id: id,
+            riotGameName: riotGameName,
+            tagLine: tagLine,
+            region: region,
+            puuid: puuid,
+            isPrimary: isPrimary,
+            verificationStatus: verificationStatus,
+            syncStatus: accepted.syncStatus,
+            lastSyncRequestedAt: requestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: accepted.syncStatus == .failed ? lastSyncErrorCode : nil,
+            lastSyncErrorMessage: accepted.syncStatus == .failed ? lastSyncErrorMessage : nil,
+            lastSyncedAt: lastSyncedAt
+        )
+    }
+
+    func withSyncStatus(_ status: RiotAccountSyncState) -> RiotAccount {
+        RiotAccount(
+            id: id,
+            riotGameName: riotGameName,
+            tagLine: tagLine,
+            region: region,
+            puuid: puuid,
+            isPrimary: isPrimary,
+            verificationStatus: verificationStatus,
+            syncStatus: status.syncStatus,
+            lastSyncRequestedAt: status.lastSyncRequestedAt,
+            lastSyncSucceededAt: status.lastSyncSucceededAt,
+            lastSyncFailedAt: status.lastSyncFailedAt,
+            lastSyncErrorCode: status.lastSyncErrorCode,
+            lastSyncErrorMessage: status.lastSyncErrorMessage,
+            lastSyncedAt: status.lastSyncSucceededAt ?? lastSyncedAt
+        )
+    }
+}
+
+struct RiotAccountSyncAccepted: Codable, Hashable {
+    let riotAccountId: String
+    let queued: Bool
+    let syncStatus: RiotSyncStatus
+}
+
+struct RiotAccountSyncState: Codable, Hashable {
+    let riotAccountId: String
+    let syncStatus: RiotSyncStatus
+    let lastSyncRequestedAt: Date?
+    let lastSyncSucceededAt: Date?
+    let lastSyncFailedAt: Date?
+    let lastSyncErrorCode: String?
+    let lastSyncErrorMessage: String?
+}
+
+enum RiotAccountInputValidator {
+    static let region = "kr"
+    static let gameNameMaxLength = 32
+    static let tagLineMinLength = 2
+    static let tagLineMaxLength = 8
+
+    static func normalizedGameName(_ rawValue: String) -> String {
+        rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func normalizedTagLine(_ rawValue: String) -> String {
+        rawValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "#", with: "")
+            .uppercased()
+    }
+
+    static func validateGameName(_ rawValue: String) -> FieldValidationState {
+        let normalizedValue = normalizedGameName(rawValue)
+        guard !normalizedValue.isEmpty else {
+            return .invalid("게임 이름을 입력해 주세요")
+        }
+        guard !normalizedValue.contains("#") else {
+            return .invalid("게임 이름과 태그라인을 나눠 입력해 주세요")
+        }
+        guard normalizedValue.count <= gameNameMaxLength else {
+            return .invalid("게임 이름은 32자 이하로 입력해 주세요")
+        }
+        return .valid("예: Hide on bush")
+    }
+
+    static func validateTagLine(_ rawValue: String) -> FieldValidationState {
+        let normalizedValue = normalizedTagLine(rawValue)
+        guard !normalizedValue.isEmpty else {
+            return .invalid("태그라인을 입력해 주세요")
+        }
+        guard !rawValue.contains("#") else {
+            return .invalid("# 없이 KR1만 입력해 주세요")
+        }
+        guard normalizedValue.count >= tagLineMinLength && normalizedValue.count <= tagLineMaxLength else {
+            return .invalid("태그라인은 2자 이상 8자 이하로 입력해 주세요")
+        }
+        return .valid("예: KR1, KOR")
+    }
 }
 
 struct GroupSummary: Codable, Hashable, Identifiable {
@@ -954,6 +1395,7 @@ struct GroupDetailSnapshot: Equatable {
     let group: GroupSummary
     let members: [GroupMember]
     let latestMatch: MatchHistoryItem?
+    let powerProfiles: [String: PowerProfile]
 }
 
 struct MatchLobbySnapshot: Equatable {

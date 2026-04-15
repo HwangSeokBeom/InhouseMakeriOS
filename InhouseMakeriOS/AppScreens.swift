@@ -32,6 +32,79 @@ enum SessionState {
     case authenticated(UserSession)
 }
 
+enum OnboardingPresentationState: Equatable {
+    case unresolved
+    case required
+    case completed
+}
+
+enum AppModalKind: String {
+    case loginPrompt
+    case groupCreate
+    case recruitCreate
+
+    var debugName: String { rawValue }
+}
+
+private enum InitialLoadSkipReason: String {
+    case alreadyLoaded = "already_loaded"
+    case inFlight = "in_flight"
+    case sessionReused = "session_reused"
+}
+
+@MainActor
+private final class InitialLoadTracker {
+    private let screen: String
+    private(set) var hasLoadedInitialData = false
+    private(set) var isInFlight = false
+
+    init(screen: String) {
+        self.screen = screen
+    }
+
+    func begin(force: Bool, trigger: String) -> Bool {
+        if isInFlight {
+            debugSkip(trigger: trigger, reason: .inFlight)
+            return false
+        }
+        if !force, hasLoadedInitialData {
+            debugSkip(trigger: trigger, reason: .alreadyLoaded)
+            return false
+        }
+        isInFlight = true
+        debugStart(trigger: trigger)
+        return true
+    }
+
+    func finish(success: Bool) {
+        isInFlight = false
+        if success {
+            hasLoadedInitialData = true
+        }
+    }
+
+    func reset() {
+        hasLoadedInitialData = false
+        isInFlight = false
+    }
+
+    func logSessionReused(trigger: String) {
+        debugSkip(trigger: trigger, reason: .sessionReused)
+    }
+
+    private func debugStart(trigger: String) {
+        #if DEBUG
+        print("[InitialLoad] screen=\(screen) trigger=\(trigger) started")
+        #endif
+    }
+
+    private func debugSkip(trigger: String, reason: InitialLoadSkipReason) {
+        #if DEBUG
+        print("[InitialLoad] screen=\(screen) trigger=\(trigger) skipped reason=\(reason.rawValue)")
+        #endif
+    }
+}
+
 @MainActor
 final class AppSessionViewModel: ObservableObject {
     private struct PendingAuthAction {
@@ -43,10 +116,14 @@ final class AppSessionViewModel: ObservableObject {
     @Published var selectedTab: AppTab = .home
     @Published var actionState: AsyncActionState = .idle
     @Published var authPrompt: AuthPromptContext?
+    @Published private(set) var onboardingPresentationState: OnboardingPresentationState = .unresolved
+    @Published private(set) var activeModal: AppModalKind?
 
     let container: AppContainer
     private(set) var userSession: UserSession?
     private var pendingAuthAction: PendingAuthAction?
+    private var deferredAuthPrompt: AuthPromptContext?
+    private var suppressNextAuthPromptDismissSync = false
 
     init(container: AppContainer) {
         self.container = container
@@ -84,8 +161,12 @@ final class AppSessionViewModel: ObservableObject {
         return false
     }
 
+    var hasCompletedOnboarding: Bool {
+        onboardingPresentationState == .completed
+    }
+
     var shouldPresentOnboarding: Bool {
-        !container.localStore.hasCompletedGuestOnboarding && !isAuthenticated
+        onboardingPresentationState == .required && !isAuthenticated
     }
 
     var dataScopeKey: String {
@@ -97,6 +178,7 @@ final class AppSessionViewModel: ObservableObject {
         let persistedTokens = await container.authRepository.loadPersistedTokens()
 
         guard let persistedTokens else {
+            syncOnboardingPresentation(hasAuthenticatedSession: false)
             debugLog("bootstrap completed without persisted tokens; session changed to guest")
             state = .guest
             return
@@ -106,23 +188,27 @@ final class AppSessionViewModel: ObservableObject {
             let profile = try await container.profileRepository.me()
             let session = UserSession(authTokens: persistedTokens, user: profile)
             userSession = session
+            syncOnboardingPresentation(hasAuthenticatedSession: true)
             debugLog("bootstrap restored authenticated session for user \(session.user.id)")
             state = .authenticated(session)
         } catch {
             await container.authRepository.signOut()
             userSession = nil
+            syncOnboardingPresentation(hasAuthenticatedSession: false)
             debugLog("bootstrap failed to restore session; falling back to guest")
             state = .guest
         }
     }
 
-    func completeGuestOnboarding() {
-        debugLog("continueAsGuest tapped")
-        container.localStore.setGuestOnboardingCompleted(true)
-        selectedTab = .home
+    func completeGuestOnboarding(resetTabSelection: Bool = true) {
+        debugLog(resetTabSelection ? "continueAsGuest tapped" : "onboarding completed by authenticated session")
+        container.localStore.setOnboardingStatus(.completed)
+        onboardingPresentationState = .completed
+        if resetTabSelection {
+            selectedTab = .home
+        }
         if isAuthenticated {
             debugLog("guest onboarding flag completed while authenticated; keeping current session")
-            objectWillChange.send()
             return
         }
         debugLog("guest onboarding completed; session changed to guest")
@@ -150,7 +236,7 @@ final class AppSessionViewModel: ObservableObject {
 
         if let action {
             pendingAuthAction = PendingAuthAction(requirement: requirement, action: action)
-            authPrompt = AuthPromptContext(requirement: requirement)
+            presentLoginPrompt(AuthPromptContext(requirement: requirement), replacingExisting: true)
             return
         }
 
@@ -158,8 +244,8 @@ final class AppSessionViewModel: ObservableObject {
             pendingAuthAction = PendingAuthAction(requirement: requirement, action: nil)
         }
 
-        if authPrompt == nil {
-            authPrompt = AuthPromptContext(requirement: requirement)
+        if authPrompt == nil, deferredAuthPrompt == nil {
+            presentLoginPrompt(AuthPromptContext(requirement: requirement), replacingExisting: false)
         }
     }
 
@@ -179,9 +265,42 @@ final class AppSessionViewModel: ObservableObject {
         }
     }
 
-    func dismissAuthPrompt() {
-        authPrompt = nil
+    func requestModalPresentation(_ modal: AppModalKind) {
+        guard activeModal != modal else { return }
+        debugLog("present \(modal.debugName) requested")
+        activeModal = modal
+    }
+
+    func handleModalDismissed(_ modal: AppModalKind) {
+        if activeModal == modal {
+            activeModal = nil
+        }
+        debugLog("\(modal.debugName) dismissed by user")
+        guard modal != .loginPrompt else { return }
+        presentDeferredLoginPromptIfPossible()
+    }
+
+    func syncAuthPromptPresentation(_ prompt: AuthPromptContext?) {
+        guard prompt == nil else {
+            requestModalPresentation(.loginPrompt)
+            return
+        }
+
+        if suppressNextAuthPromptDismissSync {
+            suppressNextAuthPromptDismissSync = false
+            return
+        }
+
+        if activeModal == .loginPrompt {
+            activeModal = nil
+        }
         pendingAuthAction = nil
+        deferredAuthPrompt = nil
+        debugLog("loginPrompt dismissed by user")
+    }
+
+    func dismissAuthPrompt() {
+        clearAuthPrompt(userInitiated: true)
     }
 
     func resumePendingAuthActionIfNeeded() {
@@ -250,14 +369,17 @@ final class AppSessionViewModel: ObservableObject {
         router.reset()
         userSession = nil
         selectedTab = .home
-        authPrompt = nil
         pendingAuthAction = nil
+        deferredAuthPrompt = nil
+        clearAuthPrompt(userInitiated: false)
+        syncOnboardingPresentation(hasAuthenticatedSession: false)
         debugLog("signOut completed; route reset to main home and session changed to guest")
         state = .guest
     }
 
     func applyAuthenticatedSession(_ session: UserSession) {
         userSession = session
+        syncOnboardingPresentation(hasAuthenticatedSession: true)
         debugLog("session changed to authenticated for user \(session.user.id)")
         state = .authenticated(session)
     }
@@ -265,8 +387,65 @@ final class AppSessionViewModel: ObservableObject {
     func consumePendingAuthAction() -> (@MainActor () -> Void)? {
         let action = pendingAuthAction?.action
         pendingAuthAction = nil
-        authPrompt = nil
+        deferredAuthPrompt = nil
+        clearAuthPrompt(userInitiated: false)
         return action
+    }
+
+    private func presentLoginPrompt(_ prompt: AuthPromptContext, replacingExisting: Bool) {
+        if let activeModal, activeModal != .loginPrompt {
+            if replacingExisting || deferredAuthPrompt == nil {
+                deferredAuthPrompt = prompt
+            }
+            debugLog("login prompt suppressed because \(activeModal.debugName) is active")
+            return
+        }
+
+        if replacingExisting || authPrompt == nil {
+            authPrompt = prompt
+        }
+    }
+
+    private func presentDeferredLoginPromptIfPossible() {
+        guard authPrompt == nil, activeModal == nil, let deferredAuthPrompt else { return }
+        self.deferredAuthPrompt = nil
+        debugLog("presenting login prompt after dismiss")
+        authPrompt = deferredAuthPrompt
+    }
+
+    private func clearAuthPrompt(userInitiated: Bool) {
+        let hadAuthPrompt = authPrompt != nil
+        suppressNextAuthPromptDismissSync = hadAuthPrompt
+        authPrompt = nil
+        if activeModal == .loginPrompt {
+            activeModal = nil
+        }
+
+        guard userInitiated else { return }
+        pendingAuthAction = nil
+        deferredAuthPrompt = nil
+        debugLog("loginPrompt dismissed by user")
+    }
+
+    private func syncOnboardingPresentation(hasAuthenticatedSession: Bool) {
+        let normalizationResult = container.localStore.resolveOnboardingStatus(
+            hasAuthenticatedSession: hasAuthenticatedSession
+        )
+
+        switch normalizationResult.status {
+        case .pending:
+            onboardingPresentationState = .required
+        case .completed:
+            onboardingPresentationState = .completed
+        }
+
+        let normalizationLabel = normalizationResult.status.rawValue
+        let sourceLabel = normalizationResult.source.rawValue
+        if normalizationResult.didMigrate {
+            debugLog("onboarding normalized to \(normalizationLabel) via \(sourceLabel)")
+        } else {
+            debugLog("onboarding resolved as \(normalizationLabel)")
+        }
     }
 }
 
@@ -274,16 +453,19 @@ final class AppSessionViewModel: ObservableObject {
 
 @MainActor
 final class HomeViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<HomeContentState> = .initial
+    @Published private(set) var state: ScreenLoadState<HomeContentState> = .initial
 
     private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "home")
 
     init(session: AppSessionViewModel) {
         self.session = session
     }
 
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
         state = .loading
 
         if let profile = session.profile, let userID = session.currentUserID {
@@ -307,6 +489,7 @@ final class HomeViewModel: ObservableObject {
                 } else {
                     state = .content(.authenticated(snapshot))
                 }
+                didSucceed = true
             } catch let error as UserFacingError {
                 session.handleProtectedLoadError(
                     error,
@@ -334,19 +517,21 @@ final class HomeViewModel: ObservableObject {
         } else {
             state = .content(.guest(guestSnapshot))
         }
+        didSucceed = true
     }
 
     func refresh() async {
         guard let current = state.value else {
-            await load(force: true)
+            await load(force: true, trigger: "pull_to_refresh")
             return
         }
         state = .refreshing(current)
-        await load(force: true)
+        await load(force: true, trigger: "pull_to_refresh")
     }
 
     func reset() {
         state = .initial
+        initialLoadTracker.reset()
     }
 
     private func loadTrackedGroups() async throws -> [GroupSummary] {
@@ -372,17 +557,20 @@ final class HomeViewModel: ObservableObject {
 
 @MainActor
 final class GroupMainViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<[GroupSummary]> = .initial
+    @Published private(set) var state: ScreenLoadState<[GroupSummary]> = .initial
     @Published var actionState: AsyncActionState = .idle
 
     private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "group")
 
     init(session: AppSessionViewModel) {
         self.session = session
     }
 
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
         state = .loading
         if session.isGuest {
             do {
@@ -390,6 +578,7 @@ final class GroupMainViewModel: ObservableObject {
                 state = groups.isEmpty
                     ? .empty("공개 그룹이 아직 없습니다.\n나중에 다시 확인하거나 로그인 후 직접 그룹을 만들어 보세요.")
                     : .content(groups)
+                didSucceed = true
             } catch let error as UserFacingError {
                 state = .error(error)
             } catch {
@@ -411,6 +600,7 @@ final class GroupMainViewModel: ObservableObject {
                 }
             }
             state = groups.isEmpty ? .empty("추적 중인 그룹이 없습니다.\n그룹을 생성하면 이 탭에서 다시 불러옵니다.") : .content(groups)
+            didSucceed = true
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
                 error,
@@ -435,7 +625,7 @@ final class GroupMainViewModel: ObservableObject {
             )
             session.container.localStore.trackGroup(id: group.id)
             session.container.localStore.appendNotification(title: "그룹 생성", body: "\(group.name) 그룹이 생성되었습니다.", symbol: "person.3.fill")
-            await load(force: true)
+            await load(force: true, trigger: "group_created_refresh")
             actionState = .success("그룹이 생성되었습니다")
             return group
         } catch let error as UserFacingError {
@@ -450,24 +640,28 @@ final class GroupMainViewModel: ObservableObject {
     func reset() {
         state = .initial
         actionState = .idle
+        initialLoadTracker.reset()
     }
 }
 
 @MainActor
 final class RecruitBoardViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<RecruitBoardSnapshot> = .initial
+    @Published private(set) var state: ScreenLoadState<RecruitBoardSnapshot> = .initial
     @Published var actionState: AsyncActionState = .idle
     @Published var selectedType: RecruitingPostType
 
     private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "recruit")
 
     init(session: AppSessionViewModel) {
         self.session = session
         self.selectedType = session.container.localStore.recruitFilterType
     }
 
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
         state = .loading
         do {
             let posts: [RecruitPost]
@@ -478,6 +672,7 @@ final class RecruitBoardViewModel: ObservableObject {
             }
             let snapshot = RecruitBoardSnapshot(selectedType: selectedType, posts: posts)
             state = posts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(snapshot)
+            didSucceed = true
         } catch let error as UserFacingError {
             if session.isAuthenticated {
                 session.handleProtectedLoadError(
@@ -497,7 +692,7 @@ final class RecruitBoardViewModel: ObservableObject {
     func switchType(_ type: RecruitingPostType) async {
         selectedType = type
         session.container.localStore.setRecruitFilterType(type)
-        await load(force: true)
+        await load(force: true, trigger: "type_switch")
     }
 
     func createPost(groupID: String, title: String, body: String, tags: [String], positions: [String]) async {
@@ -514,7 +709,7 @@ final class RecruitBoardViewModel: ObservableObject {
             )
             session.container.localStore.appendNotification(title: "모집글 등록", body: "\(post.title) 글이 등록되었습니다.", symbol: "megaphone.fill")
             actionState = .success("모집글이 등록되었습니다")
-            await load(force: true)
+            await load(force: true, trigger: "post_created_refresh")
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .recruitingWrite, actionState: &actionState)
         } catch {
@@ -526,21 +721,25 @@ final class RecruitBoardViewModel: ObservableObject {
         state = .initial
         actionState = .idle
         selectedType = session.container.localStore.recruitFilterType
+        initialLoadTracker.reset()
     }
 }
 
 @MainActor
 final class HistoryViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<HistoryContentState> = .initial
+    @Published private(set) var state: ScreenLoadState<HistoryContentState> = .initial
 
     private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "history")
 
     init(session: AppSessionViewModel) {
         self.session = session
     }
 
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
         let localItems = session.container.localStore.localMatchRecords
 
         guard let userID = session.currentUserID else {
@@ -549,6 +748,7 @@ final class HistoryViewModel: ObservableObject {
             } else {
                 state = .content(.guest(localItems))
             }
+            didSucceed = true
             return
         }
 
@@ -556,6 +756,7 @@ final class HistoryViewModel: ObservableObject {
         do {
             let items = try await session.container.profileRepository.history(userID: userID, limit: 30)
             state = items.isEmpty ? .empty("아직 기록된 내전이 없습니다.") : .content(.authenticated(items))
+            didSucceed = true
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
                 error,
@@ -570,21 +771,25 @@ final class HistoryViewModel: ObservableObject {
 
     func reset() {
         state = .initial
+        initialLoadTracker.reset()
     }
 }
 
 @MainActor
 final class ProfileViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<ProfileContentState> = .initial
+    @Published private(set) var state: ScreenLoadState<ProfileContentState> = .initial
 
     private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "profile")
 
     init(session: AppSessionViewModel) {
         self.session = session
     }
 
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
         guard let userID = session.currentUserID else {
             let guestSnapshot = GuestProfileSnapshot(
                 localResults: session.container.localStore.localMatchRecords,
@@ -592,18 +797,26 @@ final class ProfileViewModel: ObservableObject {
                 notificationCount: session.container.localStore.notifications.count
             )
             state = .content(.guest(guestSnapshot))
+            didSucceed = true
             return
         }
 
         state = .loading
 
         do {
-            let profile = try await session.container.profileRepository.me()
-            session.updateAuthenticatedProfile(profile)
+            let profile: UserProfile
+            if !force, let existingProfile = session.profile {
+                profile = existingProfile
+                initialLoadTracker.logSessionReused(trigger: trigger)
+            } else {
+                profile = try await session.container.profileRepository.me()
+                session.updateAuthenticatedProfile(profile)
+            }
             let power = try? await session.container.profileRepository.powerProfile(userID: userID)
             let riotAccounts = (try? await session.container.riotRepository.list()) ?? []
             let history = (try? await session.container.profileRepository.history(userID: userID, limit: 10)) ?? []
             state = .content(.authenticated(ProfileSnapshot(profile: profile, power: power, riotAccounts: riotAccounts, history: history)))
+            didSucceed = true
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
                 error,
@@ -618,10 +831,756 @@ final class ProfileViewModel: ObservableObject {
 
     func reset() {
         state = .initial
+        initialLoadTracker.reset()
     }
 }
 
-// MARK: - Detail View Models
+fileprivate enum PowerAccentTone: Hashable {
+    case blue
+    case green
+    case gold
+    case purple
+    case orange
+    case red
+    case muted
+
+    var color: Color {
+        switch self {
+        case .blue:
+            return AppPalette.accentBlue
+        case .green:
+            return AppPalette.accentGreen
+        case .gold:
+            return AppPalette.accentGold
+        case .purple:
+            return AppPalette.accentPurple
+        case .orange:
+            return AppPalette.accentOrange
+        case .red:
+            return AppPalette.accentRed
+        case .muted:
+            return AppPalette.textMuted
+        }
+    }
+
+    var badgeBackground: Color {
+        switch self {
+        case .green:
+            return Color(hex: 0x162D1F)
+        case .red:
+            return Color(hex: 0x2D1A1A)
+        case .blue:
+            return Color(hex: 0x162035)
+        case .gold:
+            return Color(hex: 0x2B2111)
+        case .purple:
+            return Color(hex: 0x241B35)
+        case .orange:
+            return Color(hex: 0x2E2114)
+        case .muted:
+            return AppPalette.bgTertiary
+        }
+    }
+}
+
+fileprivate enum PowerDeltaDirection: Hashable {
+    case up
+    case down
+    case neutral
+}
+
+fileprivate struct PowerDeltaViewState: Hashable {
+    let text: String
+    let direction: PowerDeltaDirection
+    let tone: PowerAccentTone
+
+    var symbolName: String? {
+        switch direction {
+        case .up:
+            return "arrow.up"
+        case .down:
+            return "arrow.down"
+        case .neutral:
+            return nil
+        }
+    }
+}
+
+fileprivate struct PowerComponentRowViewState: Hashable, Identifiable {
+    let id: String
+    let title: String
+    let shortMetricLabel: String
+    let scoreText: String
+    let description: String
+    let progress: Double
+    let tone: PowerAccentTone
+    let delta: PowerDeltaViewState?
+}
+
+fileprivate struct PowerTimelineItemViewState: Hashable, Identifiable {
+    let id: String
+    let title: String
+    let description: String
+    let metricText: String
+    let tone: PowerAccentTone
+}
+
+fileprivate struct PowerTipItemViewState: Hashable, Identifiable {
+    let id: String
+    let title: String
+    let description: String
+    let symbolName: String
+    let tone: PowerAccentTone
+}
+
+fileprivate struct PowerFAQItemViewState: Hashable, Identifiable {
+    let id: String
+    let question: String
+}
+
+fileprivate struct PowerCalculationFactorViewState: Hashable, Identifiable {
+    let id: String
+    let title: String
+    let description: String
+    let tone: PowerAccentTone
+}
+
+fileprivate struct PowerCalculationSheetViewState: Hashable {
+    let title: String
+    let summaryText: String
+    let highlightText: String
+    let factors: [PowerCalculationFactorViewState]
+    let noteTitle: String
+    let notes: [String]
+}
+
+fileprivate struct PowerOverviewViewState: Hashable {
+    let scoreText: String
+    let scoreLabel: String
+    let tierText: String?
+    let change: PowerDeltaViewState?
+    let changeCaptionText: String?
+    let percentileText: String?
+    let supportingText: String
+    let insightText: String
+    let components: [PowerComponentRowViewState]
+    let isPlaceholder: Bool
+}
+
+fileprivate struct HomePowerCardViewState: Hashable {
+    let overview: PowerOverviewViewState
+}
+
+fileprivate struct PowerDetailViewState: Hashable {
+    let overview: PowerOverviewViewState
+    let timeline: [PowerTimelineItemViewState]
+    let tips: [PowerTipItemViewState]
+    let faqs: [PowerFAQItemViewState]
+    let calculationSheet: PowerCalculationSheetViewState
+}
+
+fileprivate enum GroupMemberPowerSource: Hashable {
+    case snapshot
+    case liveFallback
+    case unavailable
+}
+
+fileprivate struct GroupMemberPowerRowViewState: Hashable, Identifiable {
+    let id: String
+    let name: String
+    let subtitle: String
+    let powerText: String
+    let powerLabel: String
+    let source: GroupMemberPowerSource
+}
+
+fileprivate struct GroupPowerGuideViewState: Hashable {
+    let title: String
+    let message: String
+}
+
+fileprivate enum PowerViewStateBuilder {
+    static func home(power: PowerProfile?) -> HomePowerCardViewState {
+        HomePowerCardViewState(
+            overview: overview(
+                power: power,
+                history: [],
+                hasLinkedRiotAccount: true,
+                showsTier: false
+            )
+        )
+    }
+
+    static func detail(power: PowerProfile?, history: [MatchHistoryItem], hasLinkedRiotAccount: Bool) -> PowerDetailViewState {
+        let overview = overview(
+            power: power,
+            history: history,
+            hasLinkedRiotAccount: hasLinkedRiotAccount,
+            showsTier: true
+        )
+
+        return PowerDetailViewState(
+            overview: overview,
+            timeline: timeline(power: power, history: history, components: overview.components),
+            tips: tips(power: power, history: history),
+            faqs: [
+                PowerFAQItemViewState(id: "game-change", question: "왜 한 경기로 점수가 많이 안 변하나요?"),
+                PowerFAQItemViewState(id: "group-diff", question: "그룹 파워와 홈 파워가 다른 이유는?"),
+                PowerFAQItemViewState(id: "mmr", question: "내전 MMR은 어떻게 결정되나요?"),
+            ],
+            calculationSheet: calculationSheet()
+        )
+    }
+
+    static func groupGuide() -> GroupPowerGuideViewState {
+        GroupPowerGuideViewState(
+            title: "그룹 파워 vs 홈 파워",
+            message: "여기 표시되는 파워는 마지막 내전 참여 시점의 스냅샷이에요. 각 멤버의 최신 종합 파워는 프로필에서 확인할 수 있어요."
+        )
+    }
+
+    static func groupMember(member: GroupMember, powerProfile: PowerProfile?) -> GroupMemberPowerRowViewState {
+        let source: GroupMemberPowerSource = powerProfile == nil ? .unavailable : .liveFallback
+        let powerText = powerProfile.map { String(Int($0.overallPower.rounded())) } ?? "--"
+        let powerLabel: String
+        switch source {
+        case .snapshot:
+            powerLabel = "스냅샷"
+        case .liveFallback:
+            powerLabel = "최신"
+        case .unavailable:
+            powerLabel = "대기"
+        }
+
+        let roleText: String
+        switch member.role {
+        case .owner:
+            roleText = "방장"
+        case .admin:
+            roleText = "운영진"
+        case .member:
+            roleText = "멤버"
+        }
+
+        let subtitle: String
+        switch source {
+        case .snapshot:
+            subtitle = "\(roleText) · 파워 \(powerText)"
+        case .liveFallback:
+            subtitle = "\(roleText) · 최신 파워 \(powerText)"
+        case .unavailable:
+            subtitle = "\(roleText) · 파워 정보 없음"
+        }
+
+        return GroupMemberPowerRowViewState(
+            id: member.id,
+            name: member.nickname,
+            subtitle: subtitle,
+            powerText: powerText,
+            powerLabel: powerLabel,
+            source: source
+        )
+    }
+
+    private static func overview(
+        power: PowerProfile?,
+        history: [MatchHistoryItem],
+        hasLinkedRiotAccount: Bool,
+        showsTier: Bool
+    ) -> PowerOverviewViewState {
+        guard let power else {
+            return PowerOverviewViewState(
+                scoreText: "--",
+                scoreLabel: "종합 파워",
+                tierText: nil,
+                change: nil,
+                changeCaptionText: nil,
+                percentileText: nil,
+                supportingText: "최근 경기와 결과 입력이 쌓이면 파워가 계산돼요",
+                insightText: "파워를 계산할 데이터가 아직 충분하지 않아요",
+                components: placeholderComponents(),
+                isPlaceholder: true
+            )
+        }
+
+        let overallScore = Int(power.overallPower.rounded())
+        let totalDelta = Int((power.overallPower - power.basePower).rounded())
+        let percentile = estimatedPercentile(from: power)
+        let components = componentRows(power: power, history: history, totalDelta: totalDelta, percentile: percentile)
+
+        return PowerOverviewViewState(
+            scoreText: String(overallScore),
+            scoreLabel: "종합 파워",
+            tierText: showsTier ? tierText(for: overallScore) : nil,
+            change: deltaState(from: totalDelta, tone: totalDelta >= 0 ? .green : .red),
+            changeCaptionText: totalDelta == 0 ? nil : "지난 주 대비",
+            percentileText: "상위 \(percentile)%",
+            supportingText: hasLinkedRiotAccount
+                ? "최근 10경기 기준 · 라이엇 연동 데이터 반영"
+                : "최근 10경기 기준 · 내전 기록 기반 추정",
+            insightText: insightText(power: power),
+            components: components,
+            isPlaceholder: false
+        )
+    }
+
+    private static func placeholderComponents() -> [PowerComponentRowViewState] {
+        [
+            PowerComponentRowViewState(
+                id: "form",
+                title: "최근 폼",
+                shortMetricLabel: "폼",
+                scoreText: "--",
+                description: "최근 경기 데이터가 쌓이면 자동으로 계산돼요",
+                progress: 0.28,
+                tone: .blue,
+                delta: nil
+            ),
+            PowerComponentRowViewState(
+                id: "stability",
+                title: "안정성",
+                shortMetricLabel: "안정",
+                scoreText: "--",
+                description: "포지션 편차와 경기 편차가 충분히 쌓이면 반영돼요",
+                progress: 0.34,
+                tone: .green,
+                delta: nil
+            ),
+            PowerComponentRowViewState(
+                id: "carry",
+                title: "캐리 기여",
+                shortMetricLabel: "캐리",
+                scoreText: "--",
+                description: "핵심 교전과 딜 기여 데이터가 반영될 예정이에요",
+                progress: 0.30,
+                tone: .gold,
+                delta: nil
+            ),
+            PowerComponentRowViewState(
+                id: "team",
+                title: "팀 기여도",
+                shortMetricLabel: "팀",
+                scoreText: "--",
+                description: "오브젝트와 팀 시너지가 충분히 쌓이면 반영돼요",
+                progress: 0.32,
+                tone: .purple,
+                delta: nil
+            ),
+            PowerComponentRowViewState(
+                id: "mmr",
+                title: "내전 MMR",
+                shortMetricLabel: "MMR",
+                scoreText: "--",
+                description: "내전 결과와 라이엇 데이터가 연결되면 계산돼요",
+                progress: 0.26,
+                tone: .orange,
+                delta: nil
+            ),
+        ]
+    }
+
+    private static func componentRows(
+        power: PowerProfile,
+        history: [MatchHistoryItem],
+        totalDelta: Int,
+        percentile: Int
+    ) -> [PowerComponentRowViewState] {
+        let streak = resultStreak(from: history)
+        let formDelta = clampedDelta(Int((Double(totalDelta) * 0.67).rounded()))
+        let stabilityDelta = power.stability >= 80 ? 1 : (power.stability < 55 ? -1 : 0)
+        let carryDelta = power.carry <= power.overallPower - 6 ? -1 : (power.carry >= power.overallPower + 8 ? 1 : 0)
+        let teamDelta = power.teamContribution >= power.overallPower + 4 ? 1 : (power.teamContribution <= power.overallPower - 5 ? -1 : 0)
+
+        let formDescription: String
+        if streak.count >= 2, streak.result == "WIN" {
+            formDescription = "최근 \(streak.count)경기 연속 승리로 상승 중"
+        } else if streak.count >= 2, streak.result == "LOSE" {
+            formDescription = "최근 경기 결과가 반영되며 조정 중"
+        } else {
+            formDescription = "최근 경기 결과가 폼에 반영되고 있어요"
+        }
+
+        let stabilityDescription = power.stability >= 80
+            ? "포지션 편차가 적어 안정적이에요"
+            : "경기별 편차가 있어 조금 더 데이터가 필요해요"
+        let carryDescription = carryDelta < 0
+            ? "최근 캐리력이 약간 하락했어요"
+            : "핵심 교전 기여가 반영되고 있어요"
+        let teamDescription = teamDelta > 0
+            ? "팀원과의 시너지가 높아요"
+            : "오브젝트와 팀 플레이 기여가 반영돼요"
+        let mmrDescription = "상위 \(max(5, percentile - 3))% 수준의 내전 실력이에요"
+
+        return [
+            PowerComponentRowViewState(
+                id: "form",
+                title: "최근 폼",
+                shortMetricLabel: "폼",
+                scoreText: String(Int(power.formScore.rounded())),
+                description: formDescription,
+                progress: normalizedScore(power.formScore),
+                tone: .blue,
+                delta: deltaState(from: formDelta, tone: formDelta >= 0 ? .green : .red)
+            ),
+            PowerComponentRowViewState(
+                id: "stability",
+                title: "안정성",
+                shortMetricLabel: "안정",
+                scoreText: String(Int(power.stability.rounded())),
+                description: stabilityDescription,
+                progress: normalizedScore(power.stability),
+                tone: .green,
+                delta: deltaState(from: stabilityDelta, tone: stabilityDelta >= 0 ? .green : .red)
+            ),
+            PowerComponentRowViewState(
+                id: "carry",
+                title: "캐리 기여",
+                shortMetricLabel: "캐리",
+                scoreText: String(Int(power.carry.rounded())),
+                description: carryDescription,
+                progress: normalizedScore(power.carry),
+                tone: .gold,
+                delta: deltaState(from: carryDelta, tone: carryDelta >= 0 ? .green : .red)
+            ),
+            PowerComponentRowViewState(
+                id: "team",
+                title: "팀 기여도",
+                shortMetricLabel: "팀",
+                scoreText: String(Int(power.teamContribution.rounded())),
+                description: teamDescription,
+                progress: normalizedScore(power.teamContribution),
+                tone: .purple,
+                delta: deltaState(from: teamDelta, tone: teamDelta >= 0 ? .green : .red)
+            ),
+            PowerComponentRowViewState(
+                id: "mmr",
+                title: "내전 MMR",
+                shortMetricLabel: "MMR",
+                scoreText: NumberFormatter.powerMMR.string(from: NSNumber(value: Int(power.inhouseMMR.rounded()))) ?? String(Int(power.inhouseMMR.rounded())),
+                description: mmrDescription,
+                progress: normalizedMMR(power.inhouseMMR),
+                tone: .orange,
+                delta: nil
+            ),
+        ]
+    }
+
+    private static func timeline(
+        power: PowerProfile?,
+        history: [MatchHistoryItem],
+        components: [PowerComponentRowViewState]
+    ) -> [PowerTimelineItemViewState] {
+        guard power != nil else {
+            return [
+                PowerTimelineItemViewState(
+                    id: "placeholder",
+                    title: "최근 반영 내역을 준비 중이에요",
+                    description: "경기 결과가 쌓이면 변화 로그가 여기에 표시돼요",
+                    metricText: "대기",
+                    tone: .muted
+                ),
+            ]
+        }
+
+        let items = Array(history.prefix(3))
+        let formMetric = timelineMetric(for: components, id: "form", fallback: "+1")
+        let stabilityMetric = timelineMetric(for: components, id: "stability", fallback: "+1")
+        let carryMetric = timelineMetric(for: components, id: "carry", fallback: "-1")
+
+        if items.isEmpty {
+            return [
+                PowerTimelineItemViewState(
+                    id: "no-history",
+                    title: "최근 반영 내역이 아직 없어요",
+                    description: "경기 결과를 입력하면 파워 변화 로그가 쌓여요",
+                    metricText: "대기",
+                    tone: .muted
+                ),
+            ]
+        }
+
+        return items.enumerated().map { index, item in
+            switch index {
+            case 0:
+                return PowerTimelineItemViewState(
+                    id: item.id,
+                    title: "\(item.scheduledAt.powerTimelineDateText) 경기 결과 반영",
+                    description: item.result == "WIN" ? "최근 승리 흐름이 폼에 반영됐어요" : "최근 경기 결과가 폼 지표에 반영됐어요",
+                    metricText: "폼 \(formMetric)",
+                    tone: .green
+                )
+            case 1:
+                return PowerTimelineItemViewState(
+                    id: item.id,
+                    title: "\(item.scheduledAt.powerTimelineDateText) 안정성 업데이트",
+                    description: "포지션 일관성과 경기 편차가 함께 조정됐어요",
+                    metricText: "안정 \(stabilityMetric)",
+                    tone: .blue
+                )
+            default:
+                return PowerTimelineItemViewState(
+                    id: item.id,
+                    title: "\(item.scheduledAt.powerTimelineDateText) 결과 입력 반영",
+                    description: item.result == "WIN" ? "최근 기여도가 다시 반영됐어요" : "팀 내 기여 비중이 조정됐어요",
+                    metricText: "캐리 \(carryMetric)",
+                    tone: carryMetric.hasPrefix("-") ? .red : .gold
+                )
+            }
+        }
+    }
+
+    private static func tips(power: PowerProfile?, history: [MatchHistoryItem]) -> [PowerTipItemViewState] {
+        var tips: [PowerTipItemViewState] = []
+
+        if history.count < 10 {
+            tips.append(
+                PowerTipItemViewState(
+                    id: "results",
+                    title: "결과 입력을 꾸준히 쌓으세요",
+                    description: "경기 데이터가 쌓일수록 정확도와 신뢰도가 높아져요",
+                    symbolName: "target",
+                    tone: .blue
+                )
+            )
+        }
+
+        if (power?.formScore ?? 0) < 75 {
+            tips.append(
+                PowerTipItemViewState(
+                    id: "form",
+                    title: "최근 승률과 기여도를 개선하세요",
+                    description: "최근 경기 승률이 오르면 '최근 폼' 점수가 상승해요",
+                    symbolName: "chart.line.uptrend.xyaxis",
+                    tone: .green
+                )
+            )
+        }
+
+        if (power?.stability ?? 0) < 80 {
+            tips.append(
+                PowerTipItemViewState(
+                    id: "stability",
+                    title: "포지션 편차를 줄이세요",
+                    description: "같은 포지션을 자주 플레이하면 안정성 점수가 올라가요",
+                    symbolName: "shield",
+                    tone: .purple
+                )
+            )
+        }
+
+        let defaults = [
+            PowerTipItemViewState(
+                id: "results",
+                title: "결과 입력을 꾸준히 쌓으세요",
+                description: "경기 데이터가 쌓일수록 정확도와 신뢰도가 높아져요",
+                symbolName: "target",
+                tone: .blue
+            ),
+            PowerTipItemViewState(
+                id: "form",
+                title: "최근 승률과 기여도를 개선하세요",
+                description: "최근 경기 승률이 오르면 '최근 폼' 점수가 상승해요",
+                symbolName: "chart.line.uptrend.xyaxis",
+                tone: .green
+            ),
+            PowerTipItemViewState(
+                id: "stability",
+                title: "포지션 편차를 줄이세요",
+                description: "같은 포지션을 자주 플레이하면 안정성 점수가 올라가요",
+                symbolName: "shield",
+                tone: .purple
+            ),
+        ]
+
+        for item in defaults where tips.count < 3 && tips.contains(where: { $0.id == item.id }) == false {
+            tips.append(item)
+        }
+
+        return Array(tips.prefix(3))
+    }
+
+    static func calculationSheet() -> PowerCalculationSheetViewState {
+        PowerCalculationSheetViewState(
+            title: "파워는 어떻게 계산되나요?",
+            summaryText: "파워는 여러 경기 데이터를 종합적으로 분석해서 계산돼요. 한 경기 결과만으로 크게 바뀌지 않아요.",
+            highlightText: "최근 경기, 꾸준함, 팀 기여, 내전 MMR 등을 함께 반영해요.",
+            factors: [
+                PowerCalculationFactorViewState(
+                    id: "form",
+                    title: "최근 폼",
+                    description: "최근 경기에서의 승률과 활약도를 반영해요. 최근 결과일수록 더 큰 비중을 가져요.",
+                    tone: .blue
+                ),
+                PowerCalculationFactorViewState(
+                    id: "stability",
+                    title: "안정성",
+                    description: "경기마다 퍼포먼스가 얼마나 일관적인지 평가해요. 편차가 적으면 높은 점수를 받아요.",
+                    tone: .green
+                ),
+                PowerCalculationFactorViewState(
+                    id: "carry",
+                    title: "캐리 기여",
+                    description: "팀 내 딜 비중, 핵심 교전 기여도 등 개인 캐리력을 반영해요.",
+                    tone: .gold
+                ),
+                PowerCalculationFactorViewState(
+                    id: "team",
+                    title: "팀 기여도",
+                    description: "비전 점수, 오브젝트 참여, 팀원과의 시너지를 종합해요.",
+                    tone: .purple
+                ),
+                PowerCalculationFactorViewState(
+                    id: "mmr",
+                    title: "내전 MMR",
+                    description: "내전 매칭 결과를 기반으로 산출되는 실력 지표예요. 라이엇 계정 데이터도 함께 반영돼요.",
+                    tone: .orange
+                ),
+            ],
+            noteTitle: "알아두세요",
+            notes: [
+                "파워는 충분한 경기 데이터가 쌓여야 정확해져요. 경기 수가 적으면 신뢰도가 낮을 수 있어요.",
+                "그룹 화면에 표시되는 파워는 마지막 참여 시점의 스냅샷이에요. 최신 파워는 홈 프로필에서 확인하세요.",
+            ]
+        )
+    }
+
+    private static func insightText(power: PowerProfile) -> String {
+        if power.teamContribution > power.formScore + 5 {
+            return "팀 기여도는 높지만 최근 폼이 약간 내려갔어요"
+        }
+        if power.formScore >= 78, power.teamContribution >= 78 {
+            return "최근 폼과 팀 기여가 함께 올라가고 있어요"
+        }
+        if power.stability < 65 {
+            return "포지션과 경기 편차를 줄이면 파워가 더 안정적으로 올라가요"
+        }
+        return "최근 경기, 팀 기여, 내전 MMR이 종합적으로 반영되고 있어요"
+    }
+
+    private static func tierText(for score: Int) -> String {
+        switch score {
+        case 85...:
+            return "최상급"
+        case 70...84:
+            return "고급"
+        case 55...69:
+            return "중급"
+        default:
+            return "성장중"
+        }
+    }
+
+    private static func normalizedScore(_ score: Double) -> Double {
+        min(max(score / 100, 0.12), 1)
+    }
+
+    private static func normalizedMMR(_ mmr: Double) -> Double {
+        min(max((mmr - 800) / 900, 0.18), 1)
+    }
+
+    private static func deltaState(from delta: Int, tone: PowerAccentTone) -> PowerDeltaViewState? {
+        guard delta != 0 else { return nil }
+        return PowerDeltaViewState(
+            text: delta > 0 ? "+\(delta)" : "\(delta)",
+            direction: delta > 0 ? .up : .down,
+            tone: tone
+        )
+    }
+
+    private static func timelineMetric(
+        for components: [PowerComponentRowViewState],
+        id: String,
+        fallback: String
+    ) -> String {
+        components.first(where: { $0.id == id })?.delta?.text ?? fallback
+    }
+
+    private static func resultStreak(from history: [MatchHistoryItem]) -> (count: Int, result: String) {
+        guard let first = history.first else { return (0, "") }
+        let streak = history.prefix { $0.result == first.result }.count
+        return (streak, first.result)
+    }
+
+    private static func clampedDelta(_ delta: Int) -> Int {
+        max(-3, min(3, delta))
+    }
+
+    private static func estimatedPercentile(from power: PowerProfile) -> Int {
+        max(1, 100 - Int((power.overallPower * 1.08).rounded()))
+    }
+}
+
+private extension NumberFormatter {
+    static let powerMMR: NumberFormatter = {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter
+    }()
+}
+
+private extension Date {
+    var powerTimelineDateText: String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.dateFormat = "M/d"
+        return formatter.string(from: self)
+    }
+}
+
+@MainActor
+// Power detail view state types are file-local, so the view model must stay file-local too.
+fileprivate final class PowerDetailViewModel: ObservableObject {
+    @Published var state: ScreenLoadState<PowerDetailViewState> = .initial
+
+    private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "power_detail")
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+    }
+
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
+
+        guard let userID = session.currentUserID else {
+            state = .empty("로그인 후 파워 상세를 확인할 수 있어요.")
+            return
+        }
+
+        state = .loading
+
+        let power = try? await session.container.profileRepository.powerProfile(userID: userID)
+        let history = (try? await session.container.profileRepository.history(userID: userID, limit: 10)) ?? []
+        let riotAccounts = (try? await session.container.riotRepository.list()) ?? []
+
+        state = .content(
+            PowerViewStateBuilder.detail(
+                power: power,
+                history: history,
+                hasLinkedRiotAccount: riotAccounts.isEmpty == false
+            )
+        )
+        didSucceed = true
+    }
+
+    func refresh() async {
+        guard let current = state.value else {
+            await load(force: true, trigger: "pull_to_refresh")
+            return
+        }
+        state = .refreshing(current)
+        await load(force: true, trigger: "pull_to_refresh")
+    }
+
+    func reset() {
+        state = .initial
+        initialLoadTracker.reset()
+    }
+}
+
+// MARK: - Restored Shell View Models
 
 @MainActor
 final class GroupDetailViewModel: ObservableObject {
@@ -652,7 +1611,15 @@ final class GroupDetailViewModel: ObservableObject {
             } else {
                 latestHistory = nil
             }
-            state = .content(GroupDetailSnapshot(group: group, members: members, latestMatch: latestHistory?.first))
+            let powerProfiles = await loadPowerProfiles(for: members.map(\.userID))
+            state = .content(
+                GroupDetailSnapshot(
+                    group: group,
+                    members: members,
+                    latestMatch: latestHistory?.first,
+                    powerProfiles: powerProfiles
+                )
+            )
             session.container.localStore.trackGroup(id: groupID)
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
@@ -699,95 +1666,6 @@ final class GroupDetailViewModel: ObservableObject {
             actionState = .failure("멤버 추가에 실패했습니다")
         }
     }
-}
-
-@MainActor
-final class MatchLobbyViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<MatchLobbySnapshot> = .initial
-    @Published var actionState: AsyncActionState = .idle
-
-    private let session: AppSessionViewModel
-    let groupID: String
-    let matchID: String
-
-    init(session: AppSessionViewModel, groupID: String, matchID: String) {
-        self.session = session
-        self.groupID = groupID
-        self.matchID = matchID
-    }
-
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
-        state = .loading
-        do {
-            let group = try await session.container.groupRepository.detail(groupID: groupID)
-            let members = try await session.container.groupRepository.members(groupID: groupID)
-            let match = try await session.container.matchRepository.detail(matchID: matchID)
-            let powerProfiles = await loadPowerProfiles(for: match.players.map(\.userID))
-            state = .content(MatchLobbySnapshot(match: match, group: group, members: members, powerProfiles: powerProfiles))
-            session.container.localStore.trackGroup(id: groupID)
-            session.container.localStore.trackMatch(
-                RecentMatchContext(matchID: match.id, groupID: groupID, groupName: group.name, createdAt: Date())
-            )
-        } catch let error as UserFacingError {
-            session.handleProtectedLoadError(
-                error,
-                requirement: .matchSave,
-                state: &state,
-                fallbackMessage: "로그인 후 내전 로비를 다시 열 수 있어요."
-            )
-        } catch {
-            state = .error(UserFacingError(title: "로비 로딩 실패", message: "내전 로비를 불러오지 못했습니다."))
-        }
-    }
-
-    func addPlayers(userIDs: [String]) async {
-        guard !userIDs.isEmpty else { return }
-        actionState = .inProgress("참가자를 추가하는 중입니다")
-        do {
-            _ = try await session.container.matchRepository.addPlayers(
-                matchID: matchID,
-                players: userIDs.map {
-                    MatchPlayerInputDTO(
-                        userId: $0,
-                        riotAccountId: nil,
-                        participationStatus: .accepted,
-                        sameTeamPreferenceUserIds: [],
-                        avoidTeamPreferenceUserIds: [],
-                        isCaptain: false
-                    )
-                }
-            )
-            actionState = .success("참가자가 추가되었습니다")
-            await load(force: true)
-        } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
-        } catch {
-            actionState = .failure("참가자 추가에 실패했습니다")
-        }
-    }
-
-    func prepareAutoBalance() async -> Bool {
-        guard let snapshot = state.value else { return false }
-        actionState = .inProgress("자동 팀 생성을 준비하는 중입니다")
-        do {
-            if snapshot.match.status != .locked && snapshot.match.status != .balanced {
-                _ = try await session.container.matchRepository.lock(matchID: matchID)
-            }
-            _ = try await session.container.matchRepository.autoBalance(matchID: matchID)
-            let refreshed = try await session.container.matchRepository.detail(matchID: matchID)
-            state = .content(MatchLobbySnapshot(match: refreshed, group: snapshot.group, members: snapshot.members, powerProfiles: snapshot.powerProfiles))
-            session.container.localStore.appendNotification(title: "자동 밸런스 생성", body: "추천 조합이 생성되었습니다.", symbol: "arrow.trianglehead.2.clockwise")
-            actionState = .success("추천 조합이 생성되었습니다")
-            return true
-        } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
-            return false
-        } catch {
-            actionState = .failure("자동 팀 생성에 실패했습니다")
-            return false
-        }
-    }
 
     private func loadPowerProfiles(for userIDs: [String]) async -> [String: PowerProfile] {
         var profiles: [String: PowerProfile] = [:]
@@ -797,377 +1675,6 @@ final class MatchLobbyViewModel: ObservableObject {
             }
         }
         return profiles
-    }
-}
-
-@MainActor
-final class TeamBalanceViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<TeamBalanceSnapshot> = .initial
-    @Published var actionState: AsyncActionState = .idle
-    @Published var selectedMode: BalanceMode = .balanced
-
-    private let session: AppSessionViewModel
-    let groupID: String
-    let matchID: String
-    private var preferredPositions: [String: [Position]] = [:]
-    private(set) var groupName: String = "내전"
-
-    init(session: AppSessionViewModel, groupID: String, matchID: String) {
-        self.session = session
-        self.groupID = groupID
-        self.matchID = matchID
-    }
-
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
-        state = .loading
-        do {
-            async let group = session.container.groupRepository.detail(groupID: groupID)
-            async let match = session.container.matchRepository.detail(matchID: matchID)
-            let (groupValue, matchValue) = try await (group, match)
-            groupName = groupValue.name
-            preferredPositions = await inferPreferredPositions(userIDs: matchValue.players.map(\.userID))
-            let snapshot = TeamBalanceSnapshot(match: matchValue, candidates: matchValue.candidates)
-            state = matchValue.candidates.isEmpty ? .empty("추천 조합이 없습니다.\n로비에서 자동 팀 생성을 다시 실행해주세요.") : .content(snapshot)
-            selectedMode = matchValue.candidates.first?.type ?? .balanced
-        } catch let error as UserFacingError {
-            session.handleProtectedLoadError(
-                error,
-                requirement: .matchSave,
-                state: &state,
-                fallbackMessage: "로그인 후 팀 밸런스를 다시 확인할 수 있어요."
-            )
-        } catch {
-            state = .error(UserFacingError(title: "팀 밸런스 로딩 실패", message: "추천 조합을 불러오지 못했습니다."))
-        }
-    }
-
-    func reroll() async {
-        guard let current = selectedCandidate else { return }
-        actionState = .inProgress("조합을 다시 생성하는 중입니다")
-        do {
-            _ = try await session.container.matchRepository.reroll(
-                matchID: matchID,
-                mode: selectedMode,
-                excludeCandidateIDs: [current.candidateID]
-            )
-            actionState = .success("새 조합이 생성되었습니다")
-            await load(force: true)
-        } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
-        } catch {
-            actionState = .failure("조합 재생성에 실패했습니다")
-        }
-    }
-
-    func confirmSelection(router: AppRouter) async {
-        guard let candidate = selectedCandidate else { return }
-        actionState = .inProgress("조합을 확정하는 중입니다")
-        do {
-            _ = try await session.container.matchRepository.selectCandidate(matchID: matchID, candidateNo: candidate.candidateNo)
-            session.container.localStore.trackMatch(
-                RecentMatchContext(matchID: matchID, groupID: groupID, groupName: groupName, createdAt: Date())
-            )
-            session.container.localStore.appendNotification(title: "팀 확정", body: "추천 조합 \(candidate.candidateNo)번이 확정되었습니다.", symbol: "checkmark.seal.fill")
-            actionState = .success("조합이 확정되었습니다")
-            router.push(.matchResult(matchID: matchID))
-        } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
-        } catch {
-            actionState = .failure("조합 확정에 실패했습니다")
-        }
-    }
-
-    var availableModes: [BalanceMode] {
-        guard let snapshot = state.value else { return [] }
-        return Array(Set(snapshot.candidates.map(\.type))).sorted { $0.rawValue < $1.rawValue }
-    }
-
-    var selectedCandidate: MatchCandidate? {
-        guard let snapshot = state.value else { return nil }
-        return snapshot.candidates.first(where: { $0.type == selectedMode }) ?? snapshot.candidates.first
-    }
-
-    func draftForManualAdjust() -> ManualAdjustDraft? {
-        guard let candidate = selectedCandidate else { return nil }
-        let blue = candidate.teamA.map { player in
-            ManualAdjustRow(
-                id: player.id,
-                userID: player.userID,
-                role: player.assignedRole,
-                name: player.nickname,
-                score: Int(player.rolePower.rounded()),
-                isOffRole: !(preferredPositions[player.userID] ?? [player.assignedRole]).contains(player.assignedRole)
-            )
-        }
-        let red = candidate.teamB.map { player in
-            ManualAdjustRow(
-                id: player.id,
-                userID: player.userID,
-                role: player.assignedRole,
-                name: player.nickname,
-                score: Int(player.rolePower.rounded()),
-                isOffRole: !(preferredPositions[player.userID] ?? [player.assignedRole]).contains(player.assignedRole)
-            )
-        }
-        return ManualAdjustDraft(blueRows: blue, redRows: red)
-    }
-
-    func rows(for side: TeamSide) -> [TeamBalanceRow] {
-        guard let candidate = selectedCandidate else { return [] }
-        let players = side == .blue ? candidate.teamA : candidate.teamB
-        return players.map { player in
-            TeamBalanceRow(
-                id: player.id,
-                roleLabel: player.assignedRole.shortLabel,
-                name: player.nickname,
-                score: Int(player.rolePower.rounded()),
-                isOffRole: !(preferredPositions[player.userID] ?? [player.assignedRole]).contains(player.assignedRole),
-                isHighlighted: false
-            )
-        }
-    }
-
-    private func inferPreferredPositions(userIDs: [String]) async -> [String: [Position]] {
-        var map: [String: [Position]] = [:]
-        for userID in userIDs {
-            if let power = try? await session.container.profileRepository.powerProfile(userID: userID) {
-                let preferred = power.lanePower
-                    .sorted { $0.value > $1.value }
-                    .map(\.key)
-                map[userID] = Array(preferred.prefix(2))
-            }
-        }
-        return map
-    }
-}
-
-@MainActor
-final class ManualAdjustViewModel: ObservableObject {
-    @Published var blueRows: [ManualAdjustRow]
-    @Published var redRows: [ManualAdjustRow]
-    @Published var actionState: AsyncActionState = .idle
-
-    init(draft: ManualAdjustDraft) {
-        self.blueRows = draft.blueRows
-        self.redRows = draft.redRows
-    }
-
-    var blueTotal: Int { blueRows.map(\.score).reduce(0, +) }
-    var redTotal: Int { redRows.map(\.score).reduce(0, +) }
-
-    var balanceText: String {
-        let total = max(blueTotal + redTotal, 1)
-        let blue = Int((Double(blueTotal) / Double(total) * 100).rounded())
-        let red = max(0, 100 - blue)
-        return "블루 \(blue) : \(red) 레드"
-    }
-
-    var warningMessages: [String] {
-        var items: [String] = []
-        if blueTotal != redTotal {
-            let blue = Int((Double(blueTotal) / Double(max(blueTotal + redTotal, 1)) * 100).rounded())
-            let red = max(0, 100 - blue)
-            items.append("현재 \(blue > red ? "블루 팀 우세" : "레드 팀 우세") (\(blue):\(red))")
-        }
-        if let biggestGap = laneGapWarning {
-            items.append(biggestGap)
-        }
-        let offRoleCount = (blueRows + redRows).filter(\.isOffRole).count
-        if offRoleCount > 0 {
-            items.append("오프포지션 \(offRoleCount)명 발생")
-        }
-        return items
-    }
-
-    private var laneGapWarning: String? {
-        let pairs = Dictionary(uniqueKeysWithValues: blueRows.map { ($0.role, $0.score) })
-        let redPairs = Dictionary(uniqueKeysWithValues: redRows.map { ($0.role, $0.score) })
-        let gaps = Position.allCases.compactMap { role -> (Position, Int, Int, Int)? in
-            guard let left = pairs[role], let right = redPairs[role] else { return nil }
-            return (role, left, right, abs(left - right))
-        }
-        guard let largest = gaps.max(by: { $0.3 < $1.3 }), largest.3 >= 8 else { return nil }
-        return "\(largest.0.shortLabel) 라인 격차 큼 (\(largest.1) vs \(largest.2))"
-    }
-
-    func swap(_ row: ManualAdjustRow) {
-        if let index = blueRows.firstIndex(of: row), let target = redRows.first(where: { $0.role == row.role }) {
-            blueRows[index] = target
-            if let redIndex = redRows.firstIndex(of: target) {
-                redRows[redIndex] = row
-            }
-        } else if let index = redRows.firstIndex(of: row), let target = blueRows.first(where: { $0.role == row.role }) {
-            redRows[index] = target
-            if let blueIndex = blueRows.firstIndex(of: target) {
-                blueRows[blueIndex] = row
-            }
-        }
-    }
-
-    func saveLocalOnly() {
-        // TODO: InhouseMakerCoreServer에 수동 팀 조정 저장 endpoint가 추가되면 서버 저장으로 교체.
-        actionState = .success("서버 저장 API가 없어 현재 단계에서는 로컬 상태로만 반영됩니다.")
-    }
-}
-
-@MainActor
-final class MatchResultViewModel: ObservableObject {
-    enum Mode {
-        case quick
-        case detailed
-    }
-
-    struct KDAInput: Hashable {
-        var kills: String = "0"
-        var deaths: String = "0"
-        var assists: String = "0"
-
-        func validated() -> (Int, Int, Int) {
-            (Int(kills) ?? 0, Int(deaths) ?? 0, Int(assists) ?? 0)
-        }
-    }
-
-    @Published var state: ScreenLoadState<MatchDetailSnapshot> = .initial
-    @Published var actionState: AsyncActionState = .idle
-    @Published var mode: Mode = .quick
-    @Published var winningTeam: TeamSide = .blue
-    @Published var selectedMVPUserID: String?
-    @Published var laneResults: [String: TeamSide?] = ["TOP": .blue, "JGL": .red, "MID": .blue, "BOT": nil]
-    @Published var balanceFeeling: Int = 5
-    @Published var kdaInputs: [String: KDAInput] = [:]
-
-    private let session: AppSessionViewModel
-    let matchID: String
-
-    init(session: AppSessionViewModel, matchID: String) {
-        self.session = session
-        self.matchID = matchID
-    }
-
-    func load(force: Bool = false) async {
-        if !force, case .content = state { return }
-        state = .loading
-        do {
-            let match = try await session.container.matchRepository.detail(matchID: matchID)
-            let result = try? await session.container.matchRepository.result(matchID: matchID)
-            let cache = session.container.localStore.cachedResults[matchID]
-            let snapshot = MatchDetailSnapshot(match: match, result: result, cachedMetadata: cache)
-            state = .content(snapshot)
-
-            winningTeam = result?.winningTeam ?? cache?.winningTeam ?? .blue
-            selectedMVPUserID = cache?.mvpUserID ?? mvpCandidates.first?.userID
-            for player in match.players {
-                let existingStat = result?.players.first(where: { $0.userID == player.userID })
-                kdaInputs[player.userID] = KDAInput(
-                    kills: existingStat.map { String($0.kills) } ?? "0",
-                    deaths: existingStat.map { String($0.deaths) } ?? "0",
-                    assists: existingStat.map { String($0.assists) } ?? "0"
-                )
-            }
-        } catch let error as UserFacingError {
-            state = .error(error)
-        } catch {
-            state = .error(UserFacingError(title: "결과 입력 로딩 실패", message: "경기 결과 입력 화면을 준비하지 못했습니다."))
-        }
-    }
-
-    var mvpCandidates: [MatchPlayer] {
-        guard let snapshot = state.value else { return [] }
-        return snapshot.match.players.filter { $0.teamSide == winningTeam }
-    }
-
-    func submit() async {
-        guard let snapshot = state.value else { return }
-        guard let mvpUserID = selectedMVPUserID else {
-            actionState = .failure("MVP를 선택해주세요.")
-            return
-        }
-
-        actionState = .inProgress("결과를 저장하는 중입니다")
-        do {
-            let payload = QuickResultRequestDTO(
-                winningTeam: winningTeam,
-                mvpUserId: mvpUserID,
-                balanceRating: balanceFeeling,
-                players: makePlayerPayloads(match: snapshot.match)
-            )
-            let submission = try await session.container.matchRepository.submitQuickResult(matchID: matchID, payload: payload)
-            session.container.localStore.cacheResult(
-                matchID: matchID,
-                metadata: CachedResultMetadata(
-                    winningTeam: winningTeam,
-                    mvpUserID: mvpUserID,
-                    balanceRating: balanceFeeling,
-                    updatedAt: Date()
-                )
-            )
-            session.container.localStore.appendNotification(title: "결과 저장", body: "결과가 \(submission.status.title) 상태로 저장되었습니다.", symbol: "checkmark.circle.fill")
-            actionState = .success("결과가 저장되었습니다")
-            await load(force: true)
-        } catch let error as UserFacingError {
-            actionState = .failure(error.message)
-        } catch {
-            actionState = .failure("결과 저장에 실패했습니다")
-        }
-    }
-
-    func requestChange() async {
-        guard let resultID = state.value?.result?.id else {
-            actionState = .failure("수정 요청할 기존 결과가 없습니다.")
-            return
-        }
-        actionState = .inProgress("수정 요청을 전송하는 중입니다")
-        do {
-            _ = try await session.container.matchRepository.confirmResult(
-                matchID: matchID,
-                resultID: resultID,
-                action: .suggestChange,
-                comment: "클라이언트에서 수정 요청"
-            )
-            actionState = .success("수정 요청을 보냈습니다")
-            await load(force: true)
-        } catch let error as UserFacingError {
-            actionState = .failure(error.message)
-        } catch {
-            actionState = .failure("수정 요청에 실패했습니다")
-        }
-    }
-
-    private func makePlayerPayloads(match: Match) -> [QuickResultPlayerDTO] {
-        match.players.map { player in
-            let input = kdaInputs[player.userID] ?? KDAInput()
-            let values = input.validated()
-            return QuickResultPlayerDTO(
-                userId: player.userID,
-                kills: values.0,
-                deaths: values.1,
-                assists: values.2,
-                laneResult: laneResult(for: player),
-                contributionRating: player.userID == selectedMVPUserID ? 5 : nil
-            )
-        }
-    }
-
-    private func laneResult(for player: MatchPlayer) -> LaneResult {
-        guard let role = player.assignedRole, let side = player.teamSide else { return .unknown }
-        switch role {
-        case .top:
-            return laneOutcome(for: "TOP", side: side)
-        case .jungle:
-            return laneOutcome(for: "JGL", side: side)
-        case .mid:
-            return laneOutcome(for: "MID", side: side)
-        case .adc, .support:
-            return laneOutcome(for: "BOT", side: side)
-        case .fill:
-            return .unknown
-        }
-    }
-
-    private func laneOutcome(for key: String, side: TeamSide) -> LaneResult {
-        guard let winner = laneResults[key] else { return .even }
-        return winner == side ? .win : .lose
     }
 }
 
@@ -1276,7 +1783,12 @@ final class RiotAccountsViewModel: ObservableObject {
         }
         actionState = .inProgress("계정을 연결하는 중입니다")
         do {
-            _ = try await session.container.riotRepository.connect(gameName: gameName, tagLine: tagLine, region: region, isPrimary: isPrimary)
+            _ = try await session.container.riotRepository.connect(
+                gameName: gameName,
+                tagLine: tagLine,
+                region: region,
+                isPrimary: isPrimary
+            )
             actionState = .success("계정이 연결되었습니다")
             await load(force: true)
         } catch let error as UserFacingError {
@@ -1342,7 +1854,6 @@ final class RecruitDetailViewModel: ObservableObject {
         guard let post = state.value else { return nil }
         actionState = .inProgress("모집글 기반 내전을 생성하는 중입니다")
         do {
-            // TODO: 모집 지원/apply endpoint가 추가되면 상세 화면 CTA를 생성/지원 흐름으로 분리.
             let match = try await session.container.matchRepository.create(groupID: post.groupID, title: post.title)
             actionState = .success("내전이 생성되었습니다")
             return match
@@ -1355,8 +1866,6 @@ final class RecruitDetailViewModel: ObservableObject {
         }
     }
 }
-
-// MARK: - Shell
 
 struct AppShellView: View {
     @ObservedObject var session: AppSessionViewModel
@@ -1510,40 +2019,6 @@ struct AppShellView: View {
         profileViewModel.reset()
     }
 }
-
-// MARK: - Onboarding
-
-struct OnboardingView: View {
-    @ObservedObject var session: AppSessionViewModel
-
-    var body: some View {
-        AuthLandingView(session: session)
-    }
-}
-
-func topViewController(
-    from rootViewController: UIViewController? = UIApplication.shared.connectedScenes
-        .compactMap { $0 as? UIWindowScene }
-        .flatMap(\.windows)
-        .first(where: \.isKeyWindow)?
-        .rootViewController
-) -> UIViewController? {
-    if let navigationController = rootViewController as? UINavigationController {
-        return topViewController(from: navigationController.visibleViewController)
-    }
-
-    if let tabBarController = rootViewController as? UITabBarController {
-        return topViewController(from: tabBarController.selectedViewController)
-    }
-
-    if let presentedViewController = rootViewController?.presentedViewController {
-        return topViewController(from: presentedViewController)
-    }
-
-    return rootViewController
-}
-
-// MARK: - Screens
 
 struct HomeScreen: View {
     @ObservedObject var viewModel: HomeViewModel
@@ -1877,60 +2352,60 @@ struct GroupMainScreen: View {
     var body: some View {
         Group {
             switch viewModel.state {
-        case .initial, .loading:
-            LoadingStateView(title: "그룹을 불러오는 중입니다")
-                .task { await viewModel.load() }
-        case let .error(error):
-            ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-        case let .empty(message):
-            VStack(spacing: 0) {
-                StatusBarView()
-                EmptyStateView(title: "그룹", message: message, actionTitle: "그룹 생성") {
-                    showsCreateSheet = true
-                }
-            }
-            .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
-        case let .content(groups), let .refreshing(groups):
-            ScrollView(showsIndicators: false) {
+            case .initial, .loading:
+                LoadingStateView(title: "그룹을 불러오는 중입니다")
+                    .task { await viewModel.load() }
+            case let .error(error):
+                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+            case let .empty(message):
                 VStack(spacing: 0) {
-                    VStack(spacing: 16) {
-                        ForEach(groups) { group in
-                            Button {
-                                session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack {
-                                        Text(group.name)
-                                            .font(AppTypography.body(16, weight: .semibold))
-                                        Spacer()
-                                        if group.tags.contains("빡겜") {
-                                            tagBadge("빡겜", tint: AppPalette.accentGreen)
-                                        }
-                                    }
-                                    Text("멤버 \(group.memberCount)명 · \(group.tags.joined(separator: " · "))")
-                                        .font(AppTypography.body(13))
-                                        .foregroundStyle(AppPalette.textSecondary)
-                                    Text("최근 내전: \(group.recentMatches > 0 ? "\(group.recentMatches)회 진행" : "기록 없음")")
-                                        .font(AppTypography.body(12))
-                                        .foregroundStyle(group.recentMatches > 0 ? AppPalette.accentBlue : AppPalette.textMuted)
-                                }
-                                .padding(16)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(AppPalette.bgCard)
-                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                            }
-                            .buttonStyle(.plain)
-                        }
+                    StatusBarView()
+                    EmptyStateView(title: "그룹", message: message, actionTitle: "그룹 생성") {
+                        showsCreateSheet = true
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 8)
                 }
+                .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
+            case let .content(groups), let .refreshing(groups):
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 0) {
+                        VStack(spacing: 16) {
+                            ForEach(groups) { group in
+                                Button {
+                                    session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        HStack {
+                                            Text(group.name)
+                                                .font(AppTypography.body(16, weight: .semibold))
+                                            Spacer()
+                                            if group.tags.contains("빡겜") {
+                                                tagBadge("빡겜", tint: AppPalette.accentGreen)
+                                            }
+                                        }
+                                        Text("멤버 \(group.memberCount)명 · \(group.tags.joined(separator: " · "))")
+                                            .font(AppTypography.body(13))
+                                            .foregroundStyle(AppPalette.textSecondary)
+                                        Text("최근 내전: \(group.recentMatches > 0 ? "\(group.recentMatches)회 진행" : "기록 없음")")
+                                            .font(AppTypography.body(12))
+                                            .foregroundStyle(group.recentMatches > 0 ? AppPalette.accentBlue : AppPalette.textMuted)
+                                    }
+                                    .padding(16)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(AppPalette.bgCard)
+                                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 24)
+                        .padding(.top, 8)
+                    }
+                }
+                .refreshable { await viewModel.load(force: true) }
+                .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
+                .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
             }
-            .refreshable { await viewModel.load(force: true) }
-            .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
-            .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-        }
         }
         .navigationTitle("그룹")
         .toolbar {
@@ -2056,8 +2531,8 @@ struct GroupDetailScreen: View {
                             ForEach(Array(snapshot.members.prefix(6))) { member in
                                 PlayerCardView(
                                     name: member.nickname,
-                                    subtitle: member.role.rawValue.lowercased() + " · 파워 프로필 연동",
-                                    powerScore: 70
+                                    subtitle: "\(roleText(for: member.role)) · \(snapshot.powerProfiles[member.userID] == nil ? "파워 미연동" : "파워 프로필 연동")",
+                                    powerScore: Int(snapshot.powerProfiles[member.userID]?.overallPower.rounded() ?? 0)
                                 )
                             }
                         }
@@ -2128,248 +2603,270 @@ struct GroupDetailScreen: View {
             .background(AppPalette.bgTertiary)
             .clipShape(Capsule())
     }
-}
 
-struct MatchLobbyScreen: View {
-    @ObservedObject var viewModel: MatchLobbyViewModel
-    @ObservedObject var router: AppRouter
-    @State private var selectedMemberIDs: Set<String> = []
-    @State private var showsManageSheet = false
-
-    var body: some View {
-        screenScaffold(title: "내전 로비", onBack: router.pop, rightSystemImage: "ellipsis", onRightTap: { showsManageSheet = true }) {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "내전 로비를 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case .empty:
-                EmptyStateView(title: "내전 로비", message: "내전 로비가 없습니다.")
-            case let .content(snapshot), let .refreshing(snapshot):
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 16) {
-                        VStack(alignment: .center, spacing: 8) {
-                            HStack(alignment: .lastTextBaseline, spacing: 4) {
-                                Text("\(snapshot.match.acceptedCount)")
-                                    .font(AppTypography.heading(40, weight: .heavy))
-                                    .foregroundStyle(AppPalette.accentBlue)
-                                Text("/ 10")
-                                    .font(AppTypography.heading(24, weight: .semibold))
-                                    .foregroundStyle(AppPalette.textMuted)
-                            }
-                            Text(statusLabel(for: snapshot.match))
-                                .font(AppTypography.body(13))
-                                .foregroundStyle(AppPalette.textSecondary)
-                            ProgressView(value: Double(snapshot.match.acceptedCount), total: 10)
-                                .tint(AppPalette.accentBlue)
-                        }
-                        .padding(.horizontal, 24)
-
-                        HStack(spacing: 8) {
-                            FilterChipView(title: "빡겜", tint: AppPalette.accentBlue, isSelected: true)
-                            FilterChipView(title: snapshot.group.tags.first ?? "D4+", tint: AppPalette.textSecondary)
-                            FilterChipView(title: "포지션 균형", tint: AppPalette.textSecondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        VStack(alignment: .leading, spacing: 16) {
-                            Text("참가자 목록")
-                                .font(AppTypography.heading(15, weight: .bold))
-                            ForEach(snapshot.match.players) { player in
-                                PlayerCardView(
-                                    name: player.nickname,
-                                    subtitle: "\(player.assignedRole?.shortLabel ?? "포지션 미정") · \(player.participationStatus.rawValue.lowercased())",
-                                    powerScore: Int(snapshot.powerProfiles[player.userID]?.overallPower.rounded() ?? 0)
-                                )
-                            }
-
-                            if snapshot.match.players.count < 10 {
-                                Button {
-                                    showsManageSheet = true
-                                } label: {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: "person.badge.plus")
-                                        Text("\(10 - snapshot.match.players.count)명 더 필요 · 초대 또는 모집하기")
-                                            .font(AppTypography.body(13))
-                                    }
-                                    .foregroundStyle(AppPalette.textMuted)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 56)
-                                    .background(AppPalette.bgTertiary)
-                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.border, style: StrokeStyle(lineWidth: 1, dash: [6])))
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 24)
-                    }
-                    .padding(.top, 12)
-                }
-                VStack(spacing: 8) {
-                    let canAutoBalance = snapshot.match.acceptedCount == 10 || snapshot.match.status == .balanced
-                    HStack(spacing: 8) {
-                        if canAutoBalance {
-                            Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {
-                                Task {
-                                    let success = snapshot.match.status == .balanced ? true : await viewModel.prepareAutoBalance()
-                                    if success {
-                                        router.push(.teamBalance(groupID: viewModel.groupID, matchID: viewModel.matchID))
-                                    }
-                                }
-                            }
-                            .buttonStyle(PrimaryButtonStyle())
-                        } else {
-                            Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {
-                                Task {
-                                    let success = snapshot.match.status == .balanced ? true : await viewModel.prepareAutoBalance()
-                                    if success {
-                                        router.push(.teamBalance(groupID: viewModel.groupID, matchID: viewModel.matchID))
-                                    }
-                                }
-                            }
-                            .buttonStyle(SecondaryButtonStyle())
-                            .disabled(true)
-                        }
-
-                        Button("수동 배치") {
-                            router.push(.teamBalance(groupID: viewModel.groupID, matchID: viewModel.matchID))
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-                        .disabled(snapshot.match.acceptedCount < 10)
-                    }
-
-                    Text(bottomNote(for: snapshot.match))
-                        .font(AppTypography.body(11))
-                        .foregroundStyle(AppPalette.textMuted)
-                }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 16)
-                .background(AppPalette.bgSecondary)
-                .sheet(isPresented: $showsManageSheet) {
-                    NavigationStack {
-                        List {
-                            ForEach(snapshot.members) { member in
-                                let alreadyIncluded = snapshot.match.players.contains(where: { $0.userID == member.userID })
-                                Button {
-                                    if selectedMemberIDs.contains(member.userID) {
-                                        selectedMemberIDs.remove(member.userID)
-                                    } else {
-                                        selectedMemberIDs.insert(member.userID)
-                                    }
-                                } label: {
-                                    HStack {
-                                        VStack(alignment: .leading) {
-                                            Text(member.nickname)
-                                            Text(member.userID)
-                                                .font(.footnote)
-                                                .foregroundStyle(AppPalette.textSecondary)
-                                        }
-                                        Spacer()
-                                        if alreadyIncluded {
-                                            Text("참가 중")
-                                                .font(.footnote)
-                                                .foregroundStyle(AppPalette.textMuted)
-                                        } else if selectedMemberIDs.contains(member.userID) {
-                                            Image(systemName: "checkmark.circle.fill")
-                                                .foregroundStyle(AppPalette.accentBlue)
-                                        }
-                                    }
-                                }
-                                .disabled(alreadyIncluded)
-                            }
-                        }
-                        .toolbar {
-                            ToolbarItem(placement: .topBarLeading) { Button("닫기") { showsManageSheet = false } }
-                            ToolbarItem(placement: .topBarTrailing) {
-                                Button("추가") {
-                                    Task {
-                                        await viewModel.addPlayers(userIDs: Array(selectedMemberIDs))
-                                        selectedMemberIDs.removeAll()
-                                        showsManageSheet = false
-                                    }
-                                }
-                                .disabled(selectedMemberIDs.isEmpty)
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-    }
-
-    private func statusLabel(for match: Match) -> String {
-        switch match.status {
-        case .balanced:
-            return "팀 확정 완료 · 결과 입력 단계로 이동 가능"
-        case .locked:
-            return "10명 확정 · 자동 팀 생성 대기"
-        default:
-            return "참가자 모집 중 · TOP, JGL, SUP 필요"
-        }
-    }
-
-    private func bottomNote(for match: Match) -> String {
-        switch match.status {
-        case .balanced:
-            return "밸런스 결과가 생성되었습니다. 확인 후 결과 입력으로 이동하세요."
-        case .locked:
-            return "로스터가 잠겼습니다. 자동 팀 생성을 실행해주세요."
-        default:
-            return "10명이 모이면 자동 팀 생성이 활성화됩니다"
+    private func roleText(for role: GroupRole) -> String {
+        switch role {
+        case .owner:
+            return "방장"
+        case .admin:
+            return "운영진"
+        case .member:
+            return "멤버"
         }
     }
 }
 
-struct TeamBalanceScreen: View {
-    @ObservedObject var viewModel: TeamBalanceViewModel
+struct RecruitBoardScreen: View {
+    @ObservedObject var viewModel: RecruitBoardViewModel
+    @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
+    @State private var showsCreateSheet = false
+    @State private var createTitle = ""
+    @State private var createBody = ""
+    @State private var createPositions = "MID,SUP"
 
     var body: some View {
-        screenScaffold(title: "팀 밸런스 결과", onBack: router.pop) {
+        Group {
             switch viewModel.state {
             case .initial, .loading:
-                LoadingStateView(title: "추천 조합을 불러오는 중입니다")
+                LoadingStateView(title: "모집글을 불러오는 중입니다")
                     .task { await viewModel.load() }
             case let .error(error):
                 ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
             case let .empty(message):
-                EmptyStateView(title: "팀 밸런스 결과", message: message)
+                VStack(spacing: 0) {
+                    StatusBarView()
+                    EmptyStateView(title: "모집", message: message, actionTitle: "글 작성") {
+                        showsCreateSheet = true
+                    }
+                }
+                .sheet(isPresented: $showsCreateSheet) { createSheet }
             case let .content(snapshot), let .refreshing(snapshot):
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: 14) {
-                        summaryCard(candidate: viewModel.selectedCandidate)
-                        modeTabs(snapshot: snapshot)
-                        HStack(spacing: 8) {
-                            TeamColumnView(title: "블루 팀", tint: AppPalette.teamBlue, background: Color(hex: 0x0D1B2A), players: viewModel.rows(for: .blue))
-                            TeamColumnView(title: "레드 팀", tint: AppPalette.teamRed, background: Color(hex: 0x2A0D0D), players: viewModel.rows(for: .red))
+                    VStack(spacing: 0) {
+                        VStack(spacing: 16) {
+                            HStack(spacing: 4) {
+                                typeButton(.memberRecruit)
+                                typeButton(.opponentRecruit)
+                            }
+                            .padding(3)
+                            .background(AppPalette.bgSecondary)
+                            .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                            HStack(spacing: 8) {
+                                FilterChipView(title: "날짜", tint: AppPalette.textMuted)
+                                FilterChipView(title: "포지션", tint: AppPalette.textMuted)
+                                FilterChipView(title: "지역", tint: AppPalette.textMuted)
+                                FilterChipView(title: "성향", tint: AppPalette.textMuted)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                            ForEach(snapshot.posts) { post in
+                                Button {
+                                    session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        HStack {
+                                            Text(post.title)
+                                                .font(AppTypography.body(14, weight: .semibold))
+                                                .foregroundStyle(AppPalette.textPrimary)
+                                            Spacer()
+                                            if post.tags.contains("급구") {
+                                                Text("급구")
+                                                    .font(AppTypography.body(11, weight: .semibold))
+                                                    .foregroundStyle(AppPalette.bgPrimary)
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 3)
+                                                    .background(AppPalette.accentGreen)
+                                                    .clipShape(Capsule())
+                                            }
+                                        }
+
+                                        HStack(spacing: 8) {
+                                            Text(post.groupID)
+                                            if let scheduledAt = post.scheduledAt {
+                                                Text(scheduledAt.shortDateText)
+                                                    .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
+                                            }
+                                        }
+                                        .font(AppTypography.body(12))
+                                        .foregroundStyle(AppPalette.textSecondary)
+
+                                        HStack(spacing: 6) {
+                                            ForEach(post.requiredPositions, id: \.self) { value in
+                                                Text(value)
+                                                    .font(AppTypography.body(11))
+                                                    .foregroundStyle(AppPalette.accentBlue)
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 3)
+                                                    .background(AppPalette.bgTertiary)
+                                                    .clipShape(Capsule())
+                                            }
+                                            ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
+                                                Text(value)
+                                                    .font(AppTypography.body(11))
+                                                    .foregroundStyle(AppPalette.accentPurple)
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 3)
+                                                    .background(AppPalette.bgTertiary)
+                                                    .clipShape(Capsule())
+                                            }
+                                        }
+
+                                        Text(post.status == .open ? "모집 중" : post.status.rawValue)
+                                            .font(AppTypography.body(12, weight: .semibold))
+                                            .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
+                                    }
+                                    .padding(16)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(AppPalette.bgCard)
+                                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
-                        laneComparisonSection(candidate: viewModel.selectedCandidate)
+                        .padding(.horizontal, 24)
+                        .padding(.top, 8)
+                    }
+                }
+                .sheet(isPresented: $showsCreateSheet) { createSheet }
+                .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+            }
+        }
+        .navigationTitle("모집")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    showsCreateSheet = true
+                } label: {
+                    Image(systemName: "square.and.pencil")
+                }
+            }
+        }
+        .appNavigationBarStyle(.large)
+    }
+
+    private func typeButton(_ type: RecruitingPostType) -> some View {
+        Button(type.title) {
+            Task { await viewModel.switchType(type) }
+        }
+        .font(AppTypography.body(13, weight: viewModel.selectedType == type ? .semibold : .regular))
+        .foregroundStyle(viewModel.selectedType == type ? Color.white : AppPalette.textMuted)
+        .frame(maxWidth: .infinity)
+        .frame(height: 32)
+        .background(viewModel.selectedType == type ? AppPalette.accentBlue : .clear)
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private var createSheet: some View {
+        NavigationStack {
+            Form {
+                TextField("제목", text: $createTitle)
+                TextField("본문", text: $createBody, axis: .vertical)
+                TextField("포지션 (쉼표 구분)", text: $createPositions)
+                Text("모집글 생성은 실제 서버를 호출합니다. groupId는 로컬에 저장된 첫 그룹을 사용합니다.")
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) { Button("닫기") { showsCreateSheet = false } }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("등록") {
+                        let action: @MainActor () -> Void = {
+                            Task {
+                                guard let groupID = session.container.localStore.storedGroupIDs.first else {
+                                    viewModel.actionState = .failure("모집글을 연결할 그룹이 없습니다. 먼저 로그인 후 그룹을 생성해주세요.")
+                                    return
+                                }
+                                await viewModel.createPost(
+                                    groupID: groupID,
+                                    title: createTitle,
+                                    body: createBody,
+                                    tags: ["빡겜"],
+                                    positions: createPositions.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+                                )
+                                showsCreateSheet = false
+                            }
+                        }
+                        session.requireAuthentication(for: .recruitingWrite, perform: action)
+                    }
+                    .disabled(createTitle.count < 2)
+                }
+            }
+        }
+    }
+}
+
+struct RecruitDetailScreen: View {
+    @ObservedObject var viewModel: RecruitDetailViewModel
+    @ObservedObject var router: AppRouter
+
+    var body: some View {
+        screenScaffold(title: "모집 상세", onBack: router.pop) {
+            switch viewModel.state {
+            case .initial, .loading:
+                LoadingStateView(title: "모집 상세를 불러오는 중입니다")
+                    .task { await viewModel.load() }
+            case let .error(error):
+                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+            case .empty:
+                EmptyStateView(title: "모집 상세", message: "모집글을 찾을 수 없습니다.")
+            case let .content(post), let .refreshing(post):
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(post.title)
+                                .font(AppTypography.heading(18, weight: .bold))
+                            HStack(spacing: 12) {
+                                Text(post.groupID)
+                                if let scheduledAt = post.scheduledAt {
+                                    Text(scheduledAt.shortDateText)
+                                }
+                                Text(post.createdBy ?? "작성자 미상")
+                            }
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(AppPalette.textSecondary)
+                        }
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("모집 정보")
+                                .font(AppTypography.body(14, weight: .semibold))
+                            infoRow("필요 포지션", value: post.requiredPositions.joined(separator: ", "))
+                            infoRow("상태", value: post.status.rawValue)
+                            infoRow("분위기", value: post.tags.joined(separator: ", "))
+                            infoRow("예상 시간", value: post.scheduledAt?.shortDateText ?? "미정")
+                        }
+                        .padding(16)
+                        .background(AppPalette.bgCard)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("상세 설명")
+                                .font(AppTypography.heading(15, weight: .bold))
+                            Text(post.body ?? "상세 설명이 없습니다.")
+                                .font(AppTypography.body(13))
+                                .foregroundStyle(AppPalette.textSecondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                     .padding(16)
                 }
-                VStack(spacing: 8) {
-                    Button("이 조합으로 확정") {
-                        Task { await viewModel.confirmSelection(router: router) }
+                HStack(spacing: 8) {
+                    Button("참가 신청") {
+                        viewModel.actionState = .failure("실제 서버에 참가 신청 endpoint가 없어 현재 단계에서는 지원하지 않습니다.")
                     }
                     .buttonStyle(PrimaryButtonStyle())
 
-                    HStack(spacing: 8) {
-                        Button("다시 생성") {
-                            Task { await viewModel.reroll() }
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-
-                        Button("수동 조정") {
-                            if let draft = viewModel.draftForManualAdjust() {
-                                router.push(.manualAdjust(matchID: viewModel.matchID, draft: draft))
+                    Button("내전 생성") {
+                        Task {
+                            if let match = await viewModel.createMatch() {
+                                router.push(.matchLobby(groupID: post.groupID, matchID: match.id))
                             }
                         }
-                        .buttonStyle(SecondaryButtonStyle())
                     }
+                    .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
+                    .frame(maxWidth: 120)
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
@@ -2379,88 +2876,284 @@ struct TeamBalanceScreen: View {
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
     }
 
-    private func summaryCard(candidate: MatchCandidate?) -> some View {
-        let left = Int((candidate?.teamAPower ?? 51).rounded())
-        let right = Int((candidate?.teamBPower ?? 49).rounded())
-        return VStack(spacing: 12) {
-            HStack(spacing: 16) {
-                Text("\(left)")
-                    .font(AppTypography.heading(36, weight: .heavy))
-                    .foregroundStyle(AppPalette.teamBlue)
-                Text(":")
-                    .font(AppTypography.heading(28, weight: .bold))
-                    .foregroundStyle(AppPalette.textMuted)
-                Text("\(right)")
-                    .font(AppTypography.heading(36, weight: .heavy))
-                    .foregroundStyle(AppPalette.teamRed)
-            }
-            Text("예상 밸런스 · \(abs(left - right) <= 4 ? "접전 예상" : "격차 있음")")
-                .font(AppTypography.body(13))
-                .foregroundStyle(AppPalette.accentGreen)
+    private func infoRow(_ title: String, value: String) -> some View {
+        HStack {
+            Text(title)
+                .foregroundStyle(AppPalette.textSecondary)
+            Spacer()
+            Text(value)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(AppTypography.body(13))
+    }
+}
 
-            HStack(spacing: 8) {
-                tagChip("오프포지션 \(candidate?.offRoleCount ?? 0)명", tint: AppPalette.accentOrange)
-                tagChip(candidate?.type.designBadgeTitle ?? "균형형 추천", tint: AppPalette.accentBlue)
+struct HistoryScreen: View {
+    @ObservedObject var viewModel: HistoryViewModel
+    @ObservedObject var session: AppSessionViewModel
+    @ObservedObject var router: AppRouter
+
+    var body: some View {
+        Group {
+            switch viewModel.state {
+            case .initial, .loading:
+                LoadingStateView(title: "경기 기록을 불러오는 중입니다")
+                    .task { await viewModel.load() }
+            case let .error(error):
+                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+            case let .empty(message):
+                VStack(spacing: 0) {
+                    StatusBarView()
+                    EmptyStateView(title: "기록", message: message)
+                }
+            case let .content(content), let .refreshing(content):
+                historyContent(content)
             }
+        }
+        .navigationTitle("기록")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundStyle(AppPalette.textSecondary)
+            }
+        }
+        .appNavigationBarStyle(.large)
+    }
+
+    @ViewBuilder
+    private func historyContent(_ content: HistoryContentState) -> some View {
+        ScrollView(showsIndicators: false) {
+            VStack(spacing: 0) {
+                VStack(spacing: 16) {
+                    HStack(spacing: 8) {
+                        FilterChipView(title: "전체", tint: AppPalette.accentBlue, isSelected: true)
+                        FilterChipView(title: "최근", tint: AppPalette.textSecondary)
+                        FilterChipView(title: "로컬", tint: AppPalette.textSecondary)
+                        FilterChipView(title: "저장", tint: AppPalette.textSecondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    switch content {
+                    case let .authenticated(items):
+                        ForEach(items) { item in
+                            Button {
+                                router.push(.matchDetail(matchID: item.matchID))
+                            } label: {
+                                MatchCardView(
+                                    title: item.role.shortLabel,
+                                    dateText: item.scheduledAt.dottedDateText,
+                                    isWin: item.result == "WIN",
+                                    blueSummary: "블루 팀",
+                                    redSummary: "레드 팀",
+                                    detail: "KDA \(item.kda) · MMR \(Int(item.deltaMMR))"
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    case let .guest(items):
+                        guestHistoryHint
+
+                        ForEach(items) { item in
+                            MatchCardView(
+                                title: item.groupName,
+                                dateText: item.savedAt.dottedDateText,
+                                isWin: item.winningTeam == .blue,
+                                blueSummary: "승리 팀 \(item.winningTeam == .blue ? "블루" : "레드")",
+                                redSummary: "밸런스 \(item.balanceRating)/5",
+                                detail: "로컬 저장 · MVP \(item.mvpUserID)"
+                            )
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 8)
+            }
+        }
+    }
+
+    private var guestHistoryHint: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("게스트 기록")
+                .font(AppTypography.heading(15, weight: .bold))
+                .foregroundStyle(AppPalette.textPrimary)
+            Text("지금 보이는 기록은 이 기기에만 저장됩니다. 로그인하면 기록 저장과 기기 간 이어하기를 사용할 수 있어요.")
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("로그인하고 기록 동기화") {
+                session.requireAuthentication(for: .profileHistory)
+            }
+            .buttonStyle(SecondaryButtonStyle())
         }
         .padding(16)
-        .frame(maxWidth: .infinity)
-        .background(
-            LinearGradient(
-                colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary],
-                startPoint: .topLeading,
-                endPoint: .bottomTrailing
-            )
-        )
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .appPanel(background: AppPalette.bgCard, radius: 12)
     }
+}
 
-    private func modeTabs(snapshot: TeamBalanceSnapshot) -> some View {
-        HStack(spacing: 4) {
-            ForEach(viewModel.availableModes, id: \.self) { mode in
-                Button(mode.title) {
-                    viewModel.selectedMode = mode
+struct MatchDetailScreen: View {
+    @ObservedObject var viewModel: MatchDetailViewModel
+    @ObservedObject var router: AppRouter
+
+    var body: some View {
+        screenScaffold(title: "경기 상세", onBack: router.pop) {
+            switch viewModel.state {
+            case .initial, .loading:
+                LoadingStateView(title: "경기 상세를 불러오는 중입니다")
+                    .task { await viewModel.load() }
+            case let .error(error):
+                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+            case .empty:
+                EmptyStateView(title: "경기 상세", message: "경기 데이터를 찾을 수 없습니다.")
+            case let .content(snapshot), let .refreshing(snapshot):
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 14) {
+                        VStack(spacing: 10) {
+                            Text(snapshot.match.scheduledAt?.dottedDateText ?? Date().dottedDateText)
+                                .font(AppTypography.body(12))
+                                .foregroundStyle(AppPalette.textMuted)
+                            HStack(spacing: 16) {
+                                Text("블루")
+                                    .foregroundStyle(AppPalette.teamBlue)
+                                Text("VS")
+                                    .foregroundStyle(AppPalette.textSecondary)
+                                Text("레드")
+                                    .foregroundStyle(AppPalette.teamRed)
+                            }
+                            .font(AppTypography.heading(18, weight: .bold))
+                            if let result = snapshot.result {
+                                Text(result.resultStatus.title)
+                                    .font(AppTypography.body(12))
+                                    .foregroundStyle(AppPalette.accentGreen)
+                            }
+                            if let cache = snapshot.cachedMetadata {
+                                HStack(spacing: 16) {
+                                    overviewStat("예상 밸런스", value: "\(cache.balanceRating)/5")
+                                    overviewStat("승리 팀", value: cache.winningTeam.title)
+                                    overviewStat("MVP", value: mvpName(cache.mvpUserID, match: snapshot.match))
+                                }
+                            } else {
+                                Text("서버 결과 상세 응답에는 MVP와 체감 밸런스가 포함되지 않아, 클라이언트에서 저장한 값이 있을 때만 표시합니다.")
+                                    .font(AppTypography.body(12))
+                                    .foregroundStyle(AppPalette.textSecondary)
+                                    .multilineTextAlignment(.center)
+                            }
+                        }
+                        .padding(16)
+                        .frame(maxWidth: .infinity)
+                        .background(
+                            LinearGradient(colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
+
+                        if let result = snapshot.result {
+                            HStack(spacing: 8) {
+                                statsColumn(title: "블루 팀", tint: AppPalette.teamBlue, players: teamPlayers(side: .blue, match: snapshot.match, result: result))
+                                statsColumn(title: "레드 팀", tint: AppPalette.teamRed, players: teamPlayers(side: .red, match: snapshot.match, result: result))
+                            }
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("파워 변화량")
+                                .font(AppTypography.heading(14, weight: .bold))
+                            VStack(spacing: 6) {
+                                ForEach(snapshot.match.players) { player in
+                                    HStack {
+                                        Text(player.nickname)
+                                        Spacer()
+                                        Text(deltaText(for: player, snapshot: snapshot))
+                                            .foregroundStyle(deltaColor(for: player, snapshot: snapshot))
+                                    }
+                                    .font(AppTypography.body(13, weight: .semibold))
+                                }
+                            }
+                            .padding(14)
+                            .background(AppPalette.bgCard)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
+                    }
+                    .padding(16)
                 }
-                .font(AppTypography.body(13, weight: viewModel.selectedMode == mode ? .semibold : .regular))
-                .foregroundStyle(viewModel.selectedMode == mode ? Color.white : AppPalette.textMuted)
+
+                Button("같은 인원으로 재매칭") {
+                    Task {
+                        if let match = await viewModel.rematch() {
+                            router.push(.matchLobby(groupID: snapshot.match.groupID, matchID: match.id))
+                        }
+                    }
+                }
+                .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(AppPalette.bgSecondary)
+            }
+        }
+        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+    }
+
+    private func overviewStat(_ label: String, value: String) -> some View {
+        VStack(spacing: 4) {
+            Text(label)
+                .font(AppTypography.body(11))
+                .foregroundStyle(AppPalette.textSecondary)
+            Text(value)
+                .font(AppTypography.body(13, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+        }
+    }
+
+    private func statsColumn(title: String, tint: Color, players: [(MatchPlayer, MatchStat?)]) -> some View {
+        VStack(spacing: 0) {
+            Text(title)
+                .font(AppTypography.heading(12, weight: .bold))
+                .foregroundStyle(Color.white)
                 .frame(maxWidth: .infinity)
-                .frame(height: 32)
-                .background(viewModel.selectedMode == mode ? AppPalette.accentBlue : .clear)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .frame(height: 28)
+                .background(tint)
+            VStack(spacing: 0) {
+                ForEach(players, id: \.0.id) { player, stat in
+                    HStack {
+                        Text(player.assignedRole?.shortLabel ?? "-")
+                            .font(AppTypography.body(9, weight: .bold))
+                            .foregroundStyle(tint)
+                            .frame(width: 26, alignment: .leading)
+                        Text(player.nickname)
+                            .font(AppTypography.body(11, weight: .semibold))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        Text("\(stat?.kills ?? 0)/\(stat?.deaths ?? 0)/\(stat?.assists ?? 0)")
+                            .font(AppTypography.body(11, weight: .semibold))
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 7)
+                }
             }
+            .background(title.contains("블루") ? Color(hex: 0x0D1B2A) : Color(hex: 0x2A0D0D))
         }
-        .padding(3)
-        .background(AppPalette.bgSecondary)
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private func laneComparisonSection(candidate: MatchCandidate?) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("라인별 파워 비교")
-                .font(AppTypography.heading(14, weight: .bold))
-            ForEach([Position.top, .jungle, .mid, .adc, .support], id: \.self) { role in
-                let left = viewModel.rows(for: .blue).first(where: { $0.roleLabel == role.shortLabel })?.score ?? 50
-                let right = viewModel.rows(for: .red).first(where: { $0.roleLabel == role.shortLabel })?.score ?? 50
-                LaneComparisonBarView(
-                    label: role.shortLabel,
-                    leftValue: left,
-                    rightValue: right,
-                    leftColor: AppPalette.teamBlue,
-                    rightColor: AppPalette.teamRed
-                )
+    private func teamPlayers(side: TeamSide, match: Match, result: MatchResult) -> [(MatchPlayer, MatchStat?)] {
+        match.players
+            .filter { $0.teamSide == side }
+            .map { player in
+                (player, result.players.first(where: { $0.userID == player.userID }))
             }
-        }
     }
 
-    private func tagChip(_ title: String, tint: Color) -> some View {
-        Text(title)
-            .font(AppTypography.body(11))
-            .foregroundStyle(tint)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 4)
-            .background(AppPalette.bgTertiary)
-            .clipShape(Capsule())
+    private func deltaText(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> String {
+        guard let result = snapshot.result, let teamSide = player.teamSide else { return "±0" }
+        let confidence: Double = result.resultStatus == .confirmed ? 1 : result.resultStatus == .partial ? 0.5 : 0
+        let didWin = result.winningTeam == teamSide
+        let value = Int((didWin ? 18 : -18) * confidence)
+        return value >= 0 ? "+\(value)" : "\(value)"
+    }
+
+    private func deltaColor(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> Color {
+        deltaText(for: player, snapshot: snapshot).hasPrefix("+") ? AppPalette.accentGreen : AppPalette.accentRed
+    }
+
+    private func mvpName(_ userID: String, match: Match) -> String {
+        match.players.first(where: { $0.userID == userID })?.nickname ?? "미상"
     }
 }
 
@@ -2615,20 +3308,6 @@ struct TeamBalancePreviewScreen: View {
         }
         .padding(16)
         .appPanel(background: AppPalette.bgCard, radius: 12)
-    }
-
-    private func previewValidationCard(message: String, isValid: Bool) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: isValid ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(isValid ? AppPalette.accentGreen : AppPalette.accentOrange)
-            Text(message)
-                .font(AppTypography.body(11))
-                .foregroundStyle(AppPalette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .padding(12)
-        .appPanel(background: AppPalette.bgSecondary, radius: 10)
     }
 
     private func previewStatusCard(message: String) -> some View {
@@ -3048,898 +3727,6 @@ struct ResultPreviewScreen: View {
     }
 }
 
-struct ManualAdjustScreen: View {
-    let matchID: String
-    @ObservedObject var viewModel: ManualAdjustViewModel
-    let onBack: () -> Void
-
-    var body: some View {
-        screenScaffold(title: "수동 팀 조정", onBack: onBack) {
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(spacing: 8) {
-                            Image(systemName: "exclamationmark.triangle")
-                                .foregroundStyle(AppPalette.accentOrange)
-                            Text("밸런스 경고")
-                                .font(AppTypography.body(13, weight: .semibold))
-                                .foregroundStyle(AppPalette.accentOrange)
-                        }
-                        ForEach(viewModel.warningMessages, id: \.self) { warning in
-                            Text("• \(warning)")
-                                .font(AppTypography.body(12))
-                                .foregroundStyle(AppPalette.textSecondary)
-                        }
-                    }
-                    .padding(14)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color(hex: 0x2A1A0A))
-                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.accentOrange, lineWidth: 1))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-
-                    Text(viewModel.balanceText)
-                        .font(AppTypography.heading(18, weight: .bold))
-                        .foregroundStyle(AppPalette.teamBlue)
-
-                    Text("플레이어를 탭하면 같은 라인의 반대 팀 선수와 교체합니다")
-                        .font(AppTypography.body(12))
-                        .foregroundStyle(AppPalette.textMuted)
-
-                    HStack(spacing: 8) {
-                        manualColumn(title: "블루 팀", tint: AppPalette.teamBlue, rows: viewModel.blueRows)
-                        manualColumn(title: "레드 팀", tint: AppPalette.teamRed, rows: viewModel.redRows)
-                    }
-
-                    HStack(spacing: 8) {
-                        Image(systemName: "arrow.left.arrow.right")
-                            .foregroundStyle(AppPalette.accentPurple)
-                        Text("동일 라인 기준 즉시 스왑만 지원합니다.\n서버 저장 API가 없어 현재는 로컬 상태로만 유지됩니다.")
-                            .font(AppTypography.body(12))
-                            .foregroundStyle(AppPalette.textSecondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .padding(14)
-                    .background(AppPalette.bgCard)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
-                .padding(16)
-            }
-
-            VStack(spacing: 8) {
-                Button("변경 저장") {
-                    viewModel.saveLocalOnly()
-                }
-                .buttonStyle(PrimaryButtonStyle())
-
-                Button("자동 밸런스 복귀") {
-                    onBack()
-                }
-                .buttonStyle(SecondaryButtonStyle())
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 12)
-            .background(AppPalette.bgSecondary)
-        }
-        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-    }
-
-    private func manualColumn(title: String, tint: Color, rows: [ManualAdjustRow]) -> some View {
-        VStack(spacing: 0) {
-            Text(title)
-                .font(AppTypography.heading(12, weight: .bold))
-                .foregroundStyle(Color.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 28)
-                .background(tint)
-
-            VStack(spacing: 0) {
-                ForEach(rows) { row in
-                    Button {
-                        viewModel.swap(row)
-                    } label: {
-                        HStack(spacing: 4) {
-                            Text(row.role.shortLabel)
-                                .font(AppTypography.body(9, weight: .bold))
-                                .foregroundStyle(tint)
-                                .frame(width: 26, alignment: .leading)
-                            HStack(spacing: 4) {
-                                Text(row.name)
-                                    .font(AppTypography.body(11, weight: .semibold))
-                                    .foregroundStyle(row.isOffRole ? AppPalette.accentGold : AppPalette.textPrimary)
-                                if row.isOffRole {
-                                    Text("OFF")
-                                        .font(AppTypography.body(7, weight: .bold))
-                                        .foregroundStyle(AppPalette.bgPrimary)
-                                        .padding(.horizontal, 4)
-                                        .padding(.vertical, 1)
-                                        .background(AppPalette.accentOrange)
-                                        .clipShape(RoundedRectangle(cornerRadius: 3))
-                                }
-                            }
-                            Spacer()
-                            Text("\(row.score)")
-                                .font(AppTypography.heading(12, weight: .bold))
-                                .foregroundStyle(row.isOffRole ? AppPalette.accentGold : tint)
-                        }
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 7)
-                        .background(row.isOffRole ? tint.opacity(0.16) : .clear)
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .background(title.contains("블루") ? Color(hex: 0x0D1B2A) : Color(hex: 0x2A0D0D))
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-}
-
-struct MatchResultScreen: View {
-    @ObservedObject var viewModel: MatchResultViewModel
-    @ObservedObject var router: AppRouter
-
-    var body: some View {
-        screenScaffold(title: "경기 결과 입력", onBack: router.pop, rightSystemImage: nil) {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "결과 입력 화면을 준비하는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case .empty:
-                EmptyStateView(title: "경기 결과 입력", message: "결과를 입력할 매치가 없습니다.")
-            case let .content(snapshot), let .refreshing(snapshot):
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 14) {
-                        HStack(spacing: 4) {
-                            modeButton("간편 입력", isSelected: viewModel.mode == .quick) { viewModel.mode = .quick }
-                            modeButton("상세 입력", isSelected: viewModel.mode == .detailed) { viewModel.mode = .detailed }
-                        }
-                        .padding(3)
-                        .background(AppPalette.bgSecondary)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("승리 팀 선택")
-                                .font(AppTypography.heading(16, weight: .bold))
-                            HStack(spacing: 10) {
-                                teamSelectButton(title: "블루 팀 승리", icon: "crown.fill", tint: AppPalette.teamBlue, isSelected: viewModel.winningTeam == .blue) {
-                                    viewModel.winningTeam = .blue
-                                    viewModel.selectedMVPUserID = viewModel.mvpCandidates.first?.userID
-                                }
-                                teamSelectButton(title: "레드 팀 승리", icon: nil, tint: AppPalette.bgTertiary, isSelected: viewModel.winningTeam == .red) {
-                                    viewModel.winningTeam = .red
-                                    viewModel.selectedMVPUserID = viewModel.mvpCandidates.first?.userID
-                                }
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("MVP 선택")
-                                .font(AppTypography.heading(16, weight: .bold))
-                            HStack(spacing: 6) {
-                                ForEach(viewModel.mvpCandidates) { player in
-                                    Button {
-                                        viewModel.selectedMVPUserID = player.userID
-                                    } label: {
-                                        Text(player.nickname.replacingOccurrences(of: " ", with: "\n"))
-                                            .font(AppTypography.body(10, weight: viewModel.selectedMVPUserID == player.userID ? .semibold : .regular))
-                                            .foregroundStyle(viewModel.selectedMVPUserID == player.userID ? AppPalette.bgPrimary : AppPalette.textSecondary)
-                                            .multilineTextAlignment(.center)
-                                            .frame(maxWidth: .infinity)
-                                            .padding(.vertical, 8)
-                                            .background(viewModel.selectedMVPUserID == player.userID ? AppPalette.accentGold : AppPalette.bgTertiary)
-                                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("라인별 승패")
-                                .font(AppTypography.heading(16, weight: .bold))
-                            ForEach(["TOP", "JGL", "MID", "BOT"], id: \.self) { role in
-                                HStack(spacing: 8) {
-                                    Text(role)
-                                        .font(AppTypography.body(13, weight: .bold))
-                                        .frame(width: 36, alignment: .leading)
-                                    laneButton("블루 승", color: AppPalette.teamBlue, isSelected: viewModel.laneResults[role] == .blue) { viewModel.laneResults[role] = .blue }
-                                    laneButton("레드 승", color: AppPalette.teamRed, isSelected: viewModel.laneResults[role] == .red) { viewModel.laneResults[role] = .red }
-                                    laneButton("비슷", color: AppPalette.accentGold, isSelected: viewModel.laneResults[role] == nil) { viewModel.laneResults[role] = nil }
-                                }
-                                .frame(height: 36)
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("체감 밸런스")
-                                .font(AppTypography.heading(16, weight: .bold))
-                            HStack(spacing: 8) {
-                                feelingButton("한쪽 우세", value: 1)
-                                feelingButton("살짝 우세", value: 3)
-                                feelingButton("접전", value: 5)
-                            }
-                        }
-
-                        if viewModel.mode == .detailed {
-                            VStack(alignment: .leading, spacing: 8) {
-                                Text("상세 입력 (K / D / A)")
-                                    .font(AppTypography.heading(14, weight: .bold))
-                                ForEach(snapshot.match.players) { player in
-                                    HStack {
-                                        Text(player.nickname)
-                                            .font(AppTypography.body(12, weight: .semibold))
-                                            .frame(width: 110, alignment: .leading)
-                                        numberField("K", binding: binding(for: player.userID, keyPath: \.kills))
-                                        numberField("D", binding: binding(for: player.userID, keyPath: \.deaths))
-                                        numberField("A", binding: binding(for: player.userID, keyPath: \.assists))
-                                    }
-                                }
-                            }
-                        } else {
-                            Text("실제 서버의 quick result API는 K/D/A를 필수로 요구합니다. 현재 간편 입력에서는 미입력 값을 0/0/0으로 저장하고, 상세 입력 탭에서 직접 수정할 수 있습니다.")
-                                .font(AppTypography.body(11))
-                                .foregroundStyle(AppPalette.textSecondary)
-                        }
-
-                        let resultStatus = snapshot.result?.resultStatus ?? .partial
-                        ToastBanner(message: "기록 신뢰도: \(resultStatus.title)", tint: statusTint(resultStatus))
-                    }
-                    .padding(16)
-                }
-
-                HStack(spacing: 8) {
-                    Button("결과 저장") {
-                        Task { await viewModel.submit() }
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-
-                    Button("수정 요청") {
-                        Task { await viewModel.requestChange() }
-                    }
-                    .buttonStyle(SecondaryButtonStyle())
-                    .frame(maxWidth: 92)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .background(AppPalette.bgSecondary)
-            }
-        }
-        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-    }
-
-    private func modeButton(_ title: String, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(AppTypography.body(13, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? Color.white : AppPalette.textMuted)
-                .frame(maxWidth: .infinity)
-                .frame(height: 32)
-                .background(isSelected ? AppPalette.accentBlue : .clear)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func teamSelectButton(title: String, icon: String?, tint: Color, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                if let icon {
-                    Image(systemName: icon)
-                        .font(.system(size: 22, weight: .semibold))
-                }
-                Text(title)
-                    .font(AppTypography.body(14, weight: .bold))
-            }
-            .foregroundStyle(isSelected ? Color.white : AppPalette.textSecondary)
-            .frame(maxWidth: .infinity)
-            .frame(height: 72)
-            .background(isSelected ? tint : AppPalette.bgTertiary)
-            .overlay(
-                RoundedRectangle(cornerRadius: 12)
-                    .stroke(isSelected ? Color.white.opacity(0.25) : AppPalette.border, lineWidth: isSelected ? 2 : 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func laneButton(_ title: String, color: Color, isSelected: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(AppTypography.body(12, weight: isSelected ? .semibold : .regular))
-                .foregroundStyle(isSelected ? (color == AppPalette.accentGold ? AppPalette.bgPrimary : Color.white) : AppPalette.textMuted)
-                .frame(maxWidth: .infinity)
-                .frame(height: 36)
-                .background(isSelected ? color : AppPalette.bgTertiary)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(isSelected ? .clear : AppPalette.border, lineWidth: 1))
-                .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func feelingButton(_ title: String, value: Int) -> some View {
-        Button(title) {
-            viewModel.balanceFeeling = value
-        }
-        .font(AppTypography.body(12, weight: viewModel.balanceFeeling == value ? .semibold : .regular))
-        .foregroundStyle(viewModel.balanceFeeling == value ? (value == 5 ? AppPalette.bgPrimary : Color.white) : AppPalette.textSecondary)
-        .frame(maxWidth: .infinity)
-        .frame(height: 40)
-        .background(viewModel.balanceFeeling == value ? (value == 5 ? AppPalette.accentGreen : AppPalette.bgTertiary) : AppPalette.bgTertiary)
-        .overlay(RoundedRectangle(cornerRadius: 8).stroke(viewModel.balanceFeeling == value ? .clear : AppPalette.border, lineWidth: 1))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func binding(for userID: String, keyPath: WritableKeyPath<MatchResultViewModel.KDAInput, String>) -> Binding<String> {
-        Binding(
-            get: { viewModel.kdaInputs[userID]?[keyPath: keyPath] ?? "0" },
-            set: { newValue in
-                var current = viewModel.kdaInputs[userID] ?? .init()
-                current[keyPath: keyPath] = newValue
-                viewModel.kdaInputs[userID] = current
-            }
-        )
-    }
-
-    private func numberField(_ placeholder: String, binding: Binding<String>) -> some View {
-        TextField(placeholder, text: binding)
-            .keyboardType(.numberPad)
-            .textFieldStyle(.roundedBorder)
-            .frame(width: 52)
-    }
-
-    private func statusTint(_ status: ResultStatus) -> Color {
-        switch status {
-        case .partial: return AppPalette.accentGreen
-        case .confirmed: return AppPalette.accentBlue
-        case .disputed: return AppPalette.accentRed
-        }
-    }
-}
-
-struct HistoryScreen: View {
-    @ObservedObject var viewModel: HistoryViewModel
-    @ObservedObject var session: AppSessionViewModel
-    @ObservedObject var router: AppRouter
-
-    var body: some View {
-        Group {
-            switch viewModel.state {
-        case .initial, .loading:
-            LoadingStateView(title: "경기 기록을 불러오는 중입니다")
-                .task { await viewModel.load() }
-        case let .error(error):
-            ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-        case let .empty(message):
-            VStack(spacing: 0) {
-                StatusBarView()
-                EmptyStateView(title: "기록", message: message)
-            }
-        case let .content(content), let .refreshing(content):
-            historyContent(content)
-        }
-        }
-        .navigationTitle("기록")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Image(systemName: "slider.horizontal.3")
-                    .foregroundStyle(AppPalette.textSecondary)
-            }
-        }
-        .appNavigationBarStyle(.large)
-    }
-
-    @ViewBuilder
-    private func historyContent(_ content: HistoryContentState) -> some View {
-        ScrollView(showsIndicators: false) {
-            VStack(spacing: 0) {
-                VStack(spacing: 16) {
-                    HStack(spacing: 8) {
-                        FilterChipView(title: "전체", tint: AppPalette.accentBlue, isSelected: true)
-                        FilterChipView(title: "최근", tint: AppPalette.textSecondary)
-                        FilterChipView(title: "로컬", tint: AppPalette.textSecondary)
-                        FilterChipView(title: "저장", tint: AppPalette.textSecondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                    switch content {
-                    case let .authenticated(items):
-                        ForEach(items) { item in
-                            Button {
-                                router.push(.matchDetail(matchID: item.matchID))
-                            } label: {
-                                MatchCardView(
-                                    title: item.role.shortLabel,
-                                    dateText: item.scheduledAt.dottedDateText,
-                                    isWin: item.result == "WIN",
-                                    blueSummary: "블루 팀",
-                                    redSummary: "레드 팀",
-                                    detail: "KDA \(item.kda) · MMR \(Int(item.deltaMMR))"
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    case let .guest(items):
-                        guestHistoryHint
-
-                        ForEach(items) { item in
-                            MatchCardView(
-                                title: item.groupName,
-                                dateText: item.savedAt.dottedDateText,
-                                isWin: item.winningTeam == .blue,
-                                blueSummary: "승리 팀 \(item.winningTeam == .blue ? "블루" : "레드")",
-                                redSummary: "밸런스 \(item.balanceRating)/5",
-                                detail: "로컬 저장 · MVP \(item.mvpUserID)"
-                            )
-                        }
-                    }
-                }
-                .padding(.horizontal, 24)
-                .padding(.top, 8)
-            }
-        }
-    }
-
-    private var guestHistoryHint: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("게스트 기록")
-                .font(AppTypography.heading(15, weight: .bold))
-                .foregroundStyle(AppPalette.textPrimary)
-            Text("지금 보이는 기록은 이 기기에만 저장됩니다. 로그인하면 기록 저장과 기기 간 이어하기를 사용할 수 있어요.")
-                .font(AppTypography.body(12))
-                .foregroundStyle(AppPalette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Button("로그인하고 기록 동기화") {
-                session.requireAuthentication(for: .profileHistory)
-            }
-            .buttonStyle(SecondaryButtonStyle())
-        }
-        .padding(16)
-        .appPanel(background: AppPalette.bgCard, radius: 12)
-    }
-}
-
-struct MatchDetailScreen: View {
-    @ObservedObject var viewModel: MatchDetailViewModel
-    @ObservedObject var router: AppRouter
-
-    var body: some View {
-        screenScaffold(title: "경기 상세", onBack: router.pop) {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "경기 상세를 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case .empty:
-                EmptyStateView(title: "경기 상세", message: "경기 데이터를 찾을 수 없습니다.")
-            case let .content(snapshot), let .refreshing(snapshot):
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 14) {
-                        VStack(spacing: 10) {
-                            Text(snapshot.match.scheduledAt?.dottedDateText ?? Date().dottedDateText)
-                                .font(AppTypography.body(12))
-                                .foregroundStyle(AppPalette.textMuted)
-                            HStack(spacing: 16) {
-                                Text("블루")
-                                    .foregroundStyle(AppPalette.teamBlue)
-                                Text("VS")
-                                    .foregroundStyle(AppPalette.textSecondary)
-                                Text("레드")
-                                    .foregroundStyle(AppPalette.teamRed)
-                            }
-                            .font(AppTypography.heading(18, weight: .bold))
-                            if let result = snapshot.result {
-                                Text(result.resultStatus.title)
-                                    .font(AppTypography.body(12))
-                                    .foregroundStyle(AppPalette.accentGreen)
-                            }
-                            if let cache = snapshot.cachedMetadata {
-                                HStack(spacing: 16) {
-                                    overviewStat("예상 밸런스", value: "\(cache.balanceRating)/5")
-                                    overviewStat("승리 팀", value: cache.winningTeam.title)
-                                    overviewStat("MVP", value: mvpName(cache.mvpUserID, match: snapshot.match))
-                                }
-                            } else {
-                                Text("서버 결과 상세 응답에는 MVP와 체감 밸런스가 포함되지 않아, 클라이언트에서 저장한 값이 있을 때만 표시합니다.")
-                                    .font(AppTypography.body(12))
-                                    .foregroundStyle(AppPalette.textSecondary)
-                                    .multilineTextAlignment(.center)
-                            }
-                        }
-                        .padding(16)
-                        .frame(maxWidth: .infinity)
-                        .background(
-                            LinearGradient(colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary], startPoint: .topLeading, endPoint: .bottomTrailing)
-                        )
-                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-
-                        if let result = snapshot.result {
-                            HStack(spacing: 8) {
-                                statsColumn(title: "블루 팀", tint: AppPalette.teamBlue, players: teamPlayers(side: .blue, match: snapshot.match, result: result))
-                                statsColumn(title: "레드 팀", tint: AppPalette.teamRed, players: teamPlayers(side: .red, match: snapshot.match, result: result))
-                            }
-                        }
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("파워 변화량")
-                                .font(AppTypography.heading(14, weight: .bold))
-                            VStack(spacing: 6) {
-                                ForEach(snapshot.match.players) { player in
-                                    HStack {
-                                        Text(player.nickname)
-                                        Spacer()
-                                        Text(deltaText(for: player, snapshot: snapshot))
-                                            .foregroundStyle(deltaColor(for: player, snapshot: snapshot))
-                                    }
-                                    .font(AppTypography.body(13, weight: .semibold))
-                                }
-                            }
-                            .padding(14)
-                            .background(AppPalette.bgCard)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
-                    }
-                    .padding(16)
-                }
-
-                Button("같은 인원으로 재매칭") {
-                    Task {
-                        if let match = await viewModel.rematch() {
-                            router.push(.matchLobby(groupID: snapshot.match.groupID, matchID: match.id))
-                        }
-                    }
-                }
-                .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .background(AppPalette.bgSecondary)
-            }
-        }
-        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-    }
-
-    private func overviewStat(_ label: String, value: String) -> some View {
-        VStack(spacing: 4) {
-            Text(label)
-                .font(AppTypography.body(11))
-                .foregroundStyle(AppPalette.textSecondary)
-            Text(value)
-                .font(AppTypography.body(13, weight: .semibold))
-                .foregroundStyle(AppPalette.textPrimary)
-        }
-    }
-
-    private func statsColumn(title: String, tint: Color, players: [(MatchPlayer, MatchStat?)]) -> some View {
-        VStack(spacing: 0) {
-            Text(title)
-                .font(AppTypography.heading(12, weight: .bold))
-                .foregroundStyle(Color.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 28)
-                .background(tint)
-            VStack(spacing: 0) {
-                ForEach(players, id: \.0.id) { player, stat in
-                    HStack {
-                        Text(player.assignedRole?.shortLabel ?? "-")
-                            .font(AppTypography.body(9, weight: .bold))
-                            .foregroundStyle(tint)
-                            .frame(width: 26, alignment: .leading)
-                        Text(player.nickname)
-                            .font(AppTypography.body(11, weight: .semibold))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Text("\(stat?.kills ?? 0)/\(stat?.deaths ?? 0)/\(stat?.assists ?? 0)")
-                            .font(AppTypography.body(11, weight: .semibold))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 7)
-                }
-            }
-            .background(title.contains("블루") ? Color(hex: 0x0D1B2A) : Color(hex: 0x2A0D0D))
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func teamPlayers(side: TeamSide, match: Match, result: MatchResult) -> [(MatchPlayer, MatchStat?)] {
-        match.players
-            .filter { $0.teamSide == side }
-            .map { player in
-                (player, result.players.first(where: { $0.userID == player.userID }))
-            }
-    }
-
-    private func deltaText(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> String {
-        guard let result = snapshot.result, let teamSide = player.teamSide else { return "±0" }
-        let confidence: Double = result.resultStatus == .confirmed ? 1 : result.resultStatus == .partial ? 0.5 : 0
-        let didWin = result.winningTeam == teamSide
-        let value = Int((didWin ? 18 : -18) * confidence)
-        return value >= 0 ? "+\(value)" : "\(value)"
-    }
-
-    private func deltaColor(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> Color {
-        deltaText(for: player, snapshot: snapshot).hasPrefix("+") ? AppPalette.accentGreen : AppPalette.accentRed
-    }
-
-    private func mvpName(_ userID: String, match: Match) -> String {
-        match.players.first(where: { $0.userID == userID })?.nickname ?? "미상"
-    }
-}
-
-struct RecruitBoardScreen: View {
-    @ObservedObject var viewModel: RecruitBoardViewModel
-    @ObservedObject var session: AppSessionViewModel
-    @ObservedObject var router: AppRouter
-    @State private var showsCreateSheet = false
-    @State private var createTitle = ""
-    @State private var createBody = ""
-    @State private var createPositions = "MID,SUP"
-
-    var body: some View {
-        Group {
-            switch viewModel.state {
-        case .initial, .loading:
-            LoadingStateView(title: "모집글을 불러오는 중입니다")
-                .task { await viewModel.load() }
-        case let .error(error):
-            ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-        case let .empty(message):
-            VStack(spacing: 0) {
-                StatusBarView()
-                EmptyStateView(title: "모집", message: message, actionTitle: "글 작성") {
-                    showsCreateSheet = true
-                }
-            }
-            .sheet(isPresented: $showsCreateSheet) { createSheet }
-        case let .content(snapshot), let .refreshing(snapshot):
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 0) {
-                    VStack(spacing: 16) {
-                        HStack(spacing: 4) {
-                            typeButton(.memberRecruit)
-                            typeButton(.opponentRecruit)
-                        }
-                        .padding(3)
-                        .background(AppPalette.bgSecondary)
-                        .clipShape(RoundedRectangle(cornerRadius: 10))
-
-                        HStack(spacing: 8) {
-                            FilterChipView(title: "날짜", tint: AppPalette.textMuted)
-                            FilterChipView(title: "포지션", tint: AppPalette.textMuted)
-                            FilterChipView(title: "지역", tint: AppPalette.textMuted)
-                            FilterChipView(title: "성향", tint: AppPalette.textMuted)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        ForEach(snapshot.posts) { post in
-                            Button {
-                                session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
-                            } label: {
-                                VStack(alignment: .leading, spacing: 10) {
-                                    HStack {
-                                        Text(post.title)
-                                            .font(AppTypography.body(14, weight: .semibold))
-                                            .foregroundStyle(AppPalette.textPrimary)
-                                        Spacer()
-                                        if post.tags.contains("급구") {
-                                            Text("급구")
-                                                .font(AppTypography.body(11, weight: .semibold))
-                                                .foregroundStyle(AppPalette.bgPrimary)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 3)
-                                                .background(AppPalette.accentGreen)
-                                                .clipShape(Capsule())
-                                        }
-                                    }
-
-                                    HStack(spacing: 8) {
-                                        Text(post.groupID)
-                                        if let scheduledAt = post.scheduledAt {
-                                            Text(scheduledAt.shortDateText)
-                                                .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
-                                        }
-                                    }
-                                    .font(AppTypography.body(12))
-                                    .foregroundStyle(AppPalette.textSecondary)
-
-                                    HStack(spacing: 6) {
-                                        ForEach(post.requiredPositions, id: \.self) { value in
-                                            Text(value)
-                                                .font(AppTypography.body(11))
-                                                .foregroundStyle(AppPalette.accentBlue)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 3)
-                                                .background(AppPalette.bgTertiary)
-                                                .clipShape(Capsule())
-                                        }
-                                        ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
-                                            Text(value)
-                                                .font(AppTypography.body(11))
-                                                .foregroundStyle(AppPalette.accentPurple)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 3)
-                                                .background(AppPalette.bgTertiary)
-                                                .clipShape(Capsule())
-                                        }
-                                    }
-
-                                    Text(post.status == .open ? "모집 중" : post.status.rawValue)
-                                        .font(AppTypography.body(12, weight: .semibold))
-                                        .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
-                                }
-                                .padding(16)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(AppPalette.bgCard)
-                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-                    .padding(.horizontal, 24)
-                    .padding(.top, 8)
-                }
-            }
-            .sheet(isPresented: $showsCreateSheet) { createSheet }
-            .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-        }
-        }
-        .navigationTitle("모집")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showsCreateSheet = true
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                }
-            }
-        }
-        .appNavigationBarStyle(.large)
-    }
-
-    private func typeButton(_ type: RecruitingPostType) -> some View {
-        Button(type.title) {
-            Task { await viewModel.switchType(type) }
-        }
-        .font(AppTypography.body(13, weight: viewModel.selectedType == type ? .semibold : .regular))
-        .foregroundStyle(viewModel.selectedType == type ? Color.white : AppPalette.textMuted)
-        .frame(maxWidth: .infinity)
-        .frame(height: 32)
-        .background(viewModel.selectedType == type ? AppPalette.accentBlue : .clear)
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var createSheet: some View {
-        NavigationStack {
-            Form {
-                TextField("제목", text: $createTitle)
-                TextField("본문", text: $createBody, axis: .vertical)
-                TextField("포지션 (쉼표 구분)", text: $createPositions)
-                Text("모집글 생성은 실제 서버를 호출합니다. groupId는 로컬에 저장된 첫 그룹을 사용합니다.")
-                    .font(AppTypography.body(12))
-                    .foregroundStyle(AppPalette.textSecondary)
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("닫기") { showsCreateSheet = false } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("등록") {
-                        let action: @MainActor () -> Void = {
-                            Task {
-                                guard let groupID = session.container.localStore.storedGroupIDs.first else {
-                                    viewModel.actionState = .failure("모집글을 연결할 그룹이 없습니다. 먼저 로그인 후 그룹을 생성해주세요.")
-                                    return
-                                }
-                                await viewModel.createPost(
-                                    groupID: groupID,
-                                    title: createTitle,
-                                    body: createBody,
-                                    tags: ["빡겜"],
-                                    positions: createPositions.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                                )
-                                showsCreateSheet = false
-                            }
-                        }
-                        session.requireAuthentication(for: .recruitingWrite, perform: action)
-                    }
-                    .disabled(createTitle.count < 2)
-                }
-            }
-        }
-    }
-}
-
-struct RecruitDetailScreen: View {
-    @ObservedObject var viewModel: RecruitDetailViewModel
-    @ObservedObject var router: AppRouter
-
-    var body: some View {
-        screenScaffold(title: "모집 상세", onBack: router.pop) {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "모집 상세를 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case .empty:
-                EmptyStateView(title: "모집 상세", message: "모집글을 찾을 수 없습니다.")
-            case let .content(post), let .refreshing(post):
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 16) {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text(post.title)
-                                .font(AppTypography.heading(18, weight: .bold))
-                            HStack(spacing: 12) {
-                                Text(post.groupID)
-                                if let scheduledAt = post.scheduledAt {
-                                    Text(scheduledAt.shortDateText)
-                                }
-                                Text(post.createdBy ?? "작성자 미상")
-                            }
-                            .font(AppTypography.body(12))
-                            .foregroundStyle(AppPalette.textSecondary)
-                        }
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("모집 정보")
-                                .font(AppTypography.body(14, weight: .semibold))
-                            infoRow("필요 포지션", value: post.requiredPositions.joined(separator: ", "))
-                            infoRow("상태", value: post.status.rawValue)
-                            infoRow("분위기", value: post.tags.joined(separator: ", "))
-                            infoRow("예상 시간", value: post.scheduledAt?.shortDateText ?? "미정")
-                        }
-                        .padding(16)
-                        .background(AppPalette.bgCard)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text("상세 설명")
-                                .font(AppTypography.heading(15, weight: .bold))
-                            Text(post.body ?? "상세 설명이 없습니다.")
-                                .font(AppTypography.body(13))
-                                .foregroundStyle(AppPalette.textSecondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(16)
-                }
-                HStack(spacing: 8) {
-                    Button("참가 신청") {
-                        viewModel.actionState = .failure("실제 서버에 참가 신청 endpoint가 없어 현재 단계에서는 지원하지 않습니다.")
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-
-                    Button("내전 생성") {
-                        Task {
-                            if let match = await viewModel.createMatch() {
-                                router.push(.matchLobby(groupID: post.groupID, matchID: match.id))
-                            }
-                        }
-                    }
-                    .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
-                    .frame(maxWidth: 120)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 12)
-                .background(AppPalette.bgSecondary)
-            }
-        }
-        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-    }
-
-    private func infoRow(_ title: String, value: String) -> some View {
-        HStack {
-            Text(title)
-                .foregroundStyle(AppPalette.textSecondary)
-            Spacer()
-            Text(value)
-                .multilineTextAlignment(.trailing)
-        }
-        .font(AppTypography.body(13))
-    }
-}
-
 struct ProfileScreen: View {
     @ObservedObject var viewModel: ProfileViewModel
     @ObservedObject var session: AppSessionViewModel
@@ -4331,13 +4118,16 @@ struct RiotAccountsScreen: View {
                                         .padding(.vertical, 3)
                                         .background(account.isPrimary ? AppPalette.accentGold : AppPalette.bgTertiary)
                                         .clipShape(Capsule())
-                                    Text("\(account.riotGameName)#\(account.tagLine)")
+                                    Text(account.displayName)
                                         .font(AppTypography.body(14, weight: .semibold))
                                 }
                                 Text("\(account.region.uppercased()) · \(account.verificationStatus.title)")
                                     .font(AppTypography.body(12))
                                     .foregroundStyle(AppPalette.textSecondary)
-                                Text("마지막 동기화: \(account.lastSyncedAt?.shortDateText ?? "없음")")
+                                Text(account.syncStatusSummary)
+                                    .font(AppTypography.body(11))
+                                    .foregroundStyle(account.syncUIState.isFailure ? AppPalette.accentRed : AppPalette.textMuted)
+                                Text("마지막 동기화: \(account.syncStatusTimestamp?.shortDateText ?? "없음")")
                                     .font(AppTypography.body(11))
                                     .foregroundStyle(AppPalette.textMuted)
                             }
@@ -4379,7 +4169,6 @@ struct NotificationsScreen: View {
     let store: AppLocalStore
     let onBack: () -> Void
     @State private var notifications: [NotificationEntry] = []
-    // TODO: 서버 알림 API가 추가되면 localStore 기반 목록을 서버 fetch로 교체.
 
     var body: some View {
         screenScaffold(title: "알림", onBack: onBack, rightSystemImage: nil) {
@@ -4474,7 +4263,6 @@ struct SettingsScreen: View {
     @State private var isHistoryPublic = true
     @State private var notificationsEnabled = true
     @State private var showsProfileEdit = false
-    @State private var draftProfile = UserProfile(id: "", email: "", nickname: "", primaryPosition: .mid, secondaryPosition: .top, isFillAvailable: false, styleTags: ["빡겜"], mannerScore: 100, noshowCount: 0)
 
     var body: some View {
         screenScaffold(title: "설정", onBack: onBack, rightSystemImage: nil) {
@@ -4688,56 +4476,5 @@ struct ProfileEditSheet: View {
                 }
             }
         }
-    }
-}
-
-// MARK: - Helpers
-
-struct ScreenScaffold<Content: View>: View {
-    let title: String
-    var showBack: Bool = true
-    var rightSystemImage: String? = nil
-    var onBack: () -> Void
-    var onRightTap: (() -> Void)?
-    let content: Content
-
-    var body: some View {
-        VStack(spacing: 0) {
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        }
-        .navigationTitle(title)
-        .toolbar {
-            if let rightSystemImage {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button(action: { onRightTap?() }) {
-                        Image(systemName: rightSystemImage)
-                    }
-                }
-            }
-        }
-        .appNavigationBarStyle(.inline)
-    }
-}
-
-@ViewBuilder
-func screenScaffold<Content: View>(title: String, onBack: @escaping () -> Void, rightSystemImage: String? = nil, onRightTap: (() -> Void)? = nil, @ViewBuilder content: () -> Content) -> some View {
-    ScreenScaffold(title: title, rightSystemImage: rightSystemImage, onBack: onBack, onRightTap: onRightTap, content: content())
-}
-
-@ViewBuilder
-func actionBanner(_ state: AsyncActionState) -> some View {
-    switch state {
-    case .idle:
-        EmptyView()
-    case let .inProgress(message):
-        ToastBanner(message: message, tint: AppPalette.accentBlue)
-            .padding(16)
-    case let .success(message):
-        ToastBanner(message: message, tint: AppPalette.accentGreen)
-            .padding(16)
-    case let .failure(message):
-        ToastBanner(message: message, tint: AppPalette.accentRed)
-            .padding(16)
     }
 }

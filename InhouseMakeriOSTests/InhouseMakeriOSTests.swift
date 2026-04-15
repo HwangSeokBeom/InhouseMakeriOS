@@ -9,19 +9,66 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(Position.support.shortLabel, "SUP")
     }
 
+    func testAppConfigurationLoadsEnvironmentSpecificValues() {
+        let configuration = AppConfiguration.fromInfoDictionary([
+            "APP_ENV": "staging",
+            "API_BASE_URL": "https://staging.example.internal",
+            "GIDClientID": "staging-client-id",
+        ])
+
+        XCTAssertEqual(configuration.environment, .staging)
+        XCTAssertEqual(configuration.baseURL.absoluteString, "https://staging.example.internal")
+        XCTAssertEqual(configuration.googleClientID, "staging-client-id")
+    }
+
+    func testAppConfigurationFallsBackToSafeDefaults() {
+        let configuration = AppConfiguration.fromInfoDictionary([:])
+
+        XCTAssertEqual(configuration.environment, .dev)
+        XCTAssertEqual(configuration.baseURL.absoluteString, "http://127.0.0.1:3000")
+        XCTAssertEqual(configuration.googleClientID, "")
+    }
+
     func testResultStatusTitle() {
         XCTAssertEqual(ResultStatus.partial.title, "임시 기록")
         XCTAssertEqual(ResultStatus.confirmed.title, "확인됨")
     }
 
-    func testAuthProviderOnlyContainsAppleAndGoogle() {
-        XCTAssertEqual(AuthProvider.allCases, [.apple, .google])
-        XCTAssertNil(AuthProvider(serverValue: "EMAIL"))
+    func testAuthProviderIncludesEmailAsSupportedProvider() {
+        XCTAssertEqual(Set(AuthProvider.allCases), Set([.apple, .google, .email]))
+        XCTAssertEqual(AuthProvider(serverValue: "EMAIL"), .email)
+        XCTAssertEqual(AuthProvider(serverValue: "password"), .email)
     }
 
     func testAuthFlowStateDoesNotExposeEmailSubflows() {
         let labels = Mirror(reflecting: AuthFlowState()).children.compactMap(\.label)
         XCTAssertEqual(labels, ["entryState", "socialLoginState", "successTransitionState"])
+    }
+
+    func testEmailValidationUsesServiceLevelRules() {
+        XCTAssertEqual(EmailAuthValidator.validateEmail(" "), .invalid("이메일을 입력해 주세요"))
+        XCTAssertEqual(EmailAuthValidator.validateEmail("not-an-email"), .invalid("올바른 이메일 형식이 아닙니다"))
+        XCTAssertEqual(EmailAuthValidator.validateEmail("User@Example.com "), .valid("사용 가능한 이메일 형식입니다"))
+        XCTAssertEqual(EmailAuthValidator.normalizedEmail(" User@Example.com "), "user@example.com")
+    }
+
+    func testSignUpPasswordValidationRequiresLetterNumberAndSpecialCharacter() {
+        XCTAssertEqual(EmailAuthValidator.validatePasswordForSignUp("short"), .invalid("비밀번호는 8자 이상이어야 합니다"))
+        XCTAssertEqual(EmailAuthValidator.validatePasswordForSignUp("password12"), .invalid("영문, 숫자, 특수문자를 모두 포함해 주세요"))
+        XCTAssertEqual(EmailAuthValidator.validatePasswordForSignUp("Password1!"), .valid("사용 가능한 비밀번호입니다"))
+    }
+
+    func testNicknameValidationRestrictsLengthAndAllowedCharacters() {
+        XCTAssertEqual(EmailAuthValidator.validateNickname(" "), .invalid("닉네임을 입력해 주세요"))
+        XCTAssertEqual(EmailAuthValidator.validateNickname("a"), .invalid("닉네임은 2자 이상 12자 이하로 입력해 주세요"))
+        XCTAssertEqual(EmailAuthValidator.validateNickname("닉네임!"), .invalid("한글, 영문, 숫자만 사용할 수 있습니다"))
+        XCTAssertEqual(EmailAuthValidator.validateNickname("테스터12"), .valid("사용 가능한 닉네임 형식입니다"))
+    }
+
+    func testPasswordConfirmationValidationMatchesOriginalPassword() {
+        XCTAssertEqual(EmailAuthValidator.validatePasswordConfirmation(password: "Password1!", confirmation: ""), .invalid("비밀번호를 다시 입력해 주세요"))
+        XCTAssertEqual(EmailAuthValidator.validatePasswordConfirmation(password: "Password1!", confirmation: "Password2!"), .invalid("비밀번호가 일치하지 않습니다"))
+        XCTAssertEqual(EmailAuthValidator.validatePasswordConfirmation(password: "Password1!", confirmation: "Password1!"), .valid("비밀번호가 일치합니다"))
     }
 
     func testSocialTokenInvalidMapping() {
@@ -73,6 +120,25 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
     }
 
+    func testAuthProviderMismatchMappingSupportsEmailProvider() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Provider mismatch",
+            code: "AUTH_PROVIDER_MISMATCH",
+            statusCode: 409,
+            details: [
+                "provider": .string("EMAIL"),
+                "availableProviders": .array([.string("EMAIL"), .string("GOOGLE")]),
+                "email": .string("user@example.com"),
+            ]
+        )
+
+        XCTAssertEqual(
+            AuthErrorMapper.map(error),
+            .authProviderMismatch(email: "user@example.com", provider: .email, availableProviders: [.email, .google])
+        )
+    }
+
     func testAccountExistsWithAppleMapsToAppleConflict() {
         let error = UserFacingError(
             title: "서버 오류",
@@ -95,6 +161,64 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
 
         XCTAssertEqual(AuthErrorMapper.map(error).providerConflict?.suggestedProvider, .google)
+    }
+
+    func testAccountExistsWithEmailMapsToEmailConflict() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Conflict",
+            code: "ACCOUNT_EXISTS_WITH_EMAIL",
+            statusCode: 409,
+            details: ["email": .string("user@example.com")]
+        )
+
+        XCTAssertEqual(
+            AuthErrorMapper.map(error),
+            .authProviderMismatch(email: "user@example.com", provider: .email, availableProviders: [.email])
+        )
+    }
+
+    func testEmailAlreadyInUseMappingSupportsCurrentServerCode() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Email is already in use.",
+            code: "EMAIL_ALREADY_IN_USE",
+            statusCode: 409
+        )
+
+        XCTAssertEqual(AuthErrorMapper.map(error), .emailAlreadyInUse)
+    }
+
+    func testInvalidPayloadMappingExposesFieldIssues() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Payload is invalid.",
+            code: "INVALID_PAYLOAD",
+            statusCode: 400,
+            details: [
+                "validationErrors": .array([
+                    .object([
+                        "field": .string("email"),
+                        "message": .string("email must be an email"),
+                    ]),
+                    .object([
+                        "field": .string("nickname"),
+                        "message": .string("nickname should not be empty"),
+                    ]),
+                ]),
+            ]
+        )
+
+        XCTAssertEqual(
+            AuthErrorMapper.map(error),
+            .invalidPayload(
+                issues: [
+                    SignupValidationIssue(field: "email", message: "email must be an email"),
+                    SignupValidationIssue(field: "nickname", message: "nickname should not be empty"),
+                ],
+                message: "Payload is invalid."
+            )
+        )
     }
 
     func testAppleConflictMapsToActionableCopy() {
@@ -123,6 +247,19 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
     }
 
+    func testEmailConflictMapsToActionableCopy() {
+        let conflict = ProviderConflictError(
+            email: "user@example.com",
+            suggestedProvider: .email,
+            availableProviders: [.email]
+        )
+
+        XCTAssertEqual(
+            conflict.presentationError.message,
+            "이 계정은 이메일 로그인으로 이용할 수 있어요. 이메일로 로그인해 주세요."
+        )
+    }
+
     func testOfflineNetworkMapping() {
         XCTAssertEqual(AuthErrorMapper.map(URLError(.notConnectedToInternet)), .networkOffline)
     }
@@ -142,7 +279,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(AuthErrorMapper.map(error), .serverUnavailable)
     }
 
-    func testEmailAuthDisabledUsesSocialOnlyCopy() {
+    func testEmailAuthDisabledUsesEmailSpecificCopy() {
         let error = UserFacingError(
             title: "서버 오류",
             message: "Disabled",
@@ -153,11 +290,11 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(AuthErrorMapper.map(error), .emailAuthDisabled)
         XCTAssertEqual(
             AuthError.emailAuthDisabled.presentationError.message,
-            "이 앱에서는 Apple 또는 Google 로그인만 사용할 수 있어요."
+            "현재 이메일 회원가입이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요."
         )
     }
 
-    func testPasswordAuthDisabledUsesSocialOnlyCopy() {
+    func testPasswordAuthDisabledUsesEmailSpecificCopy() {
         let error = UserFacingError(
             title: "서버 오류",
             message: "Disabled",
@@ -168,7 +305,26 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(AuthErrorMapper.map(error), .passwordAuthDisabled)
         XCTAssertEqual(
             AuthError.passwordAuthDisabled.presentationError.message,
-            "이 앱에서는 Apple 또는 Google 로그인만 사용할 수 있어요."
+            "현재 이메일 로그인이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요."
+        )
+    }
+
+    func testUnsupportedProviderMappingUsesSupportedProviderCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Unsupported provider",
+            code: "UNSUPPORTED_PROVIDER",
+            statusCode: 400,
+            details: ["availableProviders": .array([.string("EMAIL"), .string("APPLE"), .string("GOOGLE")])]
+        )
+
+        XCTAssertEqual(
+            AuthErrorMapper.map(error),
+            .unsupportedProvider(provider: "UNSUPPORTED_PROVIDER", availableProviders: [.email, .apple, .google])
+        )
+        XCTAssertEqual(
+            AuthError.unsupportedProvider(provider: nil, availableProviders: [.email, .apple, .google]).presentationError.message,
+            "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
         )
     }
 
@@ -346,7 +502,13 @@ final class InhouseMakeriOSTests: XCTestCase {
                 case "/auth/refresh":
                     let payload = try JSONEncoder.app.encode(
                         AuthTokensDTO(
-                            user: AuthUserDTO(id: "u1", email: "user@example.com", nickname: "tester"),
+                            user: AuthUserDTO(
+                                id: "u1",
+                                email: "user@example.com",
+                                nickname: "tester",
+                                provider: "email",
+                                status: .active
+                            ),
                             accessToken: "refreshed-access",
                             refreshToken: "refreshed-refresh"
                         )
@@ -395,6 +557,220 @@ final class InhouseMakeriOSTests: XCTestCase {
 
         let clearedTokens = await tokenStore.loadTokens()
         XCTAssertNil(clearedTokens)
+    }
+
+    func testEmailSignUpRequestUsesExpectedEndpointAndPayload() async throws {
+        let tokenStore = makeTokenStore()
+        let repository = AuthRepository(
+            apiClient: APIClient(
+                configuration: makeConfiguration(),
+                tokenStore: tokenStore,
+                session: makeURLSession { request in
+                    XCTAssertEqual(request.url?.path, "/auth/signup/email")
+                    XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["email"] as? String, "user@example.com")
+                    XCTAssertEqual(payload["password"] as? String, "Password1!")
+                    XCTAssertEqual(payload["nickname"] as? String, "tester")
+                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
+                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
+                    XCTAssertEqual(payload["agreedToMarketing"] as? Bool, false)
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: "user@example.com",
+                            nickname: "tester",
+                            provider: "email",
+                            status: .active
+                        ),
+                        accessToken: "signup-access",
+                        refreshToken: "signup-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                }
+            ),
+            tokenStore: tokenStore
+        )
+
+        let tokens = try await repository.signUpWithEmail(
+            email: "user@example.com",
+            password: "Password1!",
+            nickname: "tester",
+            agreedToTerms: true,
+            agreedToPrivacy: true,
+            agreedToMarketing: false
+        )
+
+        XCTAssertEqual(tokens.user.email, "user@example.com")
+        XCTAssertEqual(tokens.user.provider, .email)
+        XCTAssertEqual(tokens.user.status, .active)
+        XCTAssertEqual(tokens.accessToken, "signup-access")
+        let persistedTokens = await tokenStore.loadTokens()
+        XCTAssertEqual(persistedTokens, tokens)
+    }
+
+    func testEmailLoginRequestUsesExpectedEndpointAndPayload() async throws {
+        let tokenStore = makeTokenStore()
+        let repository = AuthRepository(
+            apiClient: APIClient(
+                configuration: makeConfiguration(),
+                tokenStore: tokenStore,
+                session: makeURLSession { request in
+                    XCTAssertEqual(request.url?.path, "/auth/login/email")
+                    XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["email"] as? String, "user@example.com")
+                    XCTAssertEqual(payload["password"] as? String, "Password1!")
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: "user@example.com",
+                            nickname: "tester",
+                            provider: "email",
+                            status: .active
+                        ),
+                        accessToken: "login-access",
+                        refreshToken: "login-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                }
+            ),
+            tokenStore: tokenStore
+        )
+
+        let tokens = try await repository.loginWithEmail(email: "user@example.com", password: "Password1!")
+
+        XCTAssertEqual(tokens.accessToken, "login-access")
+        let persistedTokens = await tokenStore.loadTokens()
+        XCTAssertEqual(persistedTokens, tokens)
+    }
+
+    @MainActor
+    func testEmailSignUpSubmitAuthenticatesSessionAndPersistsTokens() async throws {
+        let tokenStore = makeTokenStore()
+        let expectedEmail = "newuser5678@example.com"
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/auth/signup/email":
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["email"] as? String, expectedEmail)
+                    XCTAssertEqual(payload["password"] as? String, "Password1!")
+                    XCTAssertEqual(payload["nickname"] as? String, "aa34")
+                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
+                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
+                    XCTAssertEqual(payload["agreedToMarketing"] as? Bool, false)
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: expectedEmail,
+                            nickname: "aa34",
+                            provider: "email",
+                            status: .active
+                        ),
+                        accessToken: "signup-access",
+                        refreshToken: "signup-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                case "/me":
+                    XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer signup-access")
+                    let profile = UserProfileDTO(
+                        id: "u1",
+                        email: expectedEmail,
+                        nickname: "aa34",
+                        primaryPosition: .mid,
+                        secondaryPosition: .top,
+                        isFillAvailable: true,
+                        styleTags: ["빡겜"],
+                        mannerScore: 100,
+                        noshowCount: 0
+                    )
+                    return (200, try JSONEncoder.app.encode(profile))
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        let viewModel = EmailSignUpViewModel(session: session)
+
+        viewModel.updateEmail(expectedEmail)
+        viewModel.updatePassword("Password1!")
+        viewModel.updatePasswordConfirmation("Password1!")
+        viewModel.updateNickname("aa34")
+        viewModel.toggleServiceTerms()
+        viewModel.togglePrivacyTerms()
+
+        XCTAssertTrue(viewModel.state.isSubmitEnabled)
+
+        await viewModel.submit()
+
+        let persistedTokens = await tokenStore.loadTokens()
+        XCTAssertEqual(persistedTokens?.accessToken, "signup-access")
+        XCTAssertEqual(persistedTokens?.refreshToken, "signup-refresh")
+        XCTAssertEqual(persistedTokens?.user.provider, .email)
+        XCTAssertEqual(persistedTokens?.user.status, .active)
+        XCTAssertEqual(session.authTokens?.accessToken, "signup-access")
+        XCTAssertEqual(session.profile?.email, expectedEmail)
+        XCTAssertNil(viewModel.state.formError)
+
+        switch session.state {
+        case let .authenticated(authenticatedSession):
+            XCTAssertEqual(authenticatedSession.authTokens.accessToken, "signup-access")
+            XCTAssertEqual(authenticatedSession.user.email, expectedEmail)
+        case .bootstrapping, .guest, .authenticating:
+            XCTFail("Expected authenticated state after email signup")
+        }
+    }
+
+    @MainActor
+    func testEmailSignUpSubmitShowsFieldErrorForDuplicateEmail() async {
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: makeTokenStore(),
+            urlSession: makeURLSession { request in
+                XCTAssertEqual(request.url?.path, "/auth/signup/email")
+                return (
+                    409,
+                    self.makeServerErrorData(
+                        statusCode: 409,
+                        code: "EMAIL_ALREADY_IN_USE",
+                        message: "Email is already in use.",
+                        provider: "email",
+                        details: [
+                            "email": .string("existing@example.com"),
+                            "availableProviders": .array([.string("email")]),
+                        ]
+                    )
+                )
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        let viewModel = EmailSignUpViewModel(session: session)
+
+        viewModel.updateEmail("existing@example.com")
+        viewModel.updatePassword("Password1!")
+        viewModel.updatePasswordConfirmation("Password1!")
+        viewModel.updateNickname("tester1")
+        viewModel.toggleServiceTerms()
+        viewModel.togglePrivacyTerms()
+
+        await viewModel.submit()
+
+        XCTAssertEqual(viewModel.state.emailValidation, .invalid("이미 가입된 이메일입니다"))
+        XCTAssertNil(viewModel.state.formError)
+        XCTAssertNil(session.authTokens)
     }
 
     func testGuestPreviewDraftsPersistAcrossLocalStoreRecreation() {
@@ -478,7 +854,7 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
-    func testBootstrapWithoutPersistedTokensTransitionsToGuest() async {
+    func testBootstrapWithoutPersistedTokensNormalizesFreshInstallToRequiredOnboarding() async {
         let tokenStore = makeTokenStore()
         await tokenStore.clear()
         let suiteName = "InhouseMakeriOSTests.bootstrap.\(UUID().uuidString)"
@@ -502,6 +878,130 @@ final class InhouseMakeriOSTests: XCTestCase {
         case .bootstrapping, .authenticating, .authenticated:
             XCTFail("Expected guest session on first launch without tokens")
         }
+
+        XCTAssertEqual(container.localStore.onboardingStatus, .pending)
+        XCTAssertTrue(session.shouldPresentOnboarding)
+        XCTAssertEqual(session.onboardingPresentationState, .required)
+    }
+
+    @MainActor
+    func testBootstrapMigratesLegacyLocalUsageToCompletedOnboarding() async {
+        let suiteName = "InhouseMakeriOSTests.bootstrap.legacy.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "legacy-group")
+        let session = AppSessionViewModel(
+            container: AppContainer(
+                configuration: makeConfiguration(),
+                tokenStore: makeTokenStore(),
+                localStore: localStore
+            )
+        )
+
+        await session.bootstrap()
+
+        switch session.state {
+        case .guest:
+            XCTAssertTrue(true)
+        case .bootstrapping, .authenticating, .authenticated:
+            XCTFail("Expected legacy install without tokens to land in guest")
+        }
+
+        XCTAssertEqual(localStore.onboardingStatus, .completed)
+        XCTAssertFalse(session.shouldPresentOnboarding)
+        XCTAssertEqual(session.onboardingPresentationState, .completed)
+    }
+
+    @MainActor
+    func testBootstrapAuthenticatedRestorePromotesPendingOnboardingToCompleted() async {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.bootstrap.authenticated.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setOnboardingStatus(.pending)
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/me":
+                    let payload = try JSONEncoder.app.encode(self.makeProfileDTO())
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+
+        await session.bootstrap()
+
+        switch session.state {
+        case let .authenticated(restoredSession):
+            XCTAssertEqual(restoredSession.user.id, "u1")
+        case .bootstrapping, .guest, .authenticating:
+            XCTFail("Expected authenticated session after successful restore")
+        }
+
+        XCTAssertEqual(localStore.onboardingStatus, .completed)
+        XCTAssertFalse(session.shouldPresentOnboarding)
+        XCTAssertEqual(session.onboardingPresentationState, .completed)
+    }
+
+    @MainActor
+    func testBootstrapFailedRestoreFallsBackToRequiredOnboardingForFreshInstall() async {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.bootstrap.restorefailure.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/me":
+                    return (401, self.makeServerErrorData(statusCode: 401, code: "TOKEN_EXPIRED", message: "Expired"))
+                case "/auth/refresh":
+                    return (401, self.makeServerErrorData(statusCode: 401, code: "AUTH_REQUIRED", message: "Refresh expired"))
+                case "/auth/logout":
+                    return (200, Data())
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+
+        await session.bootstrap()
+
+        switch session.state {
+        case .guest:
+            XCTAssertTrue(true)
+        case .bootstrapping, .authenticating, .authenticated:
+            XCTFail("Expected guest fallback after failed restore")
+        }
+
+        XCTAssertEqual(localStore.onboardingStatus, .pending)
+        XCTAssertTrue(session.shouldPresentOnboarding)
+        XCTAssertEqual(session.onboardingPresentationState, .required)
     }
 
     @MainActor
@@ -519,11 +1019,14 @@ final class InhouseMakeriOSTests: XCTestCase {
                 localStore: AppLocalStore(defaults: defaults)
             )
         )
-        session.restoreGuestSession()
+        await session.bootstrap()
         XCTAssertTrue(session.shouldPresentOnboarding)
 
         let didPublish = expectation(description: "session publishes onboarding completion")
+        var hasFulfilled = false
         let cancellable = session.objectWillChange.sink {
+            guard !hasFulfilled else { return }
+            hasFulfilled = true
             didPublish.fulfill()
         }
 
@@ -585,6 +1088,40 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testAuthPromptIsDeferredWhileGroupCreateModalIsActive() {
+        let session = AppSessionViewModel(container: AppContainer())
+
+        session.requestModalPresentation(.groupCreate)
+        session.requireAuthentication(for: .groupManagement)
+
+        XCTAssertNil(session.authPrompt)
+        XCTAssertEqual(session.activeModal, .groupCreate)
+
+        session.handleModalDismissed(.groupCreate)
+
+        XCTAssertEqual(session.authPrompt?.requirement, .groupManagement)
+    }
+
+    @MainActor
+    func testInteractiveAuthPromptDismissClearsPendingState() {
+        let session = AppSessionViewModel(container: AppContainer())
+        let router = AppRouter()
+
+        session.openProtectedRoute(.groupDetail("group-1"), requirement: .groupManagement, router: router)
+        session.syncAuthPromptPresentation(session.authPrompt)
+        XCTAssertEqual(session.activeModal, .loginPrompt)
+
+        session.authPrompt = nil
+        session.syncAuthPromptPresentation(nil)
+
+        XCTAssertNil(session.authPrompt)
+        XCTAssertNil(session.activeModal)
+
+        session.resumePendingAuthActionIfNeeded()
+        XCTAssertTrue(router.path.isEmpty)
+    }
+
+    @MainActor
     func testRequireReauthenticationTransitionsSessionToGuestAndPreservesPendingAction() async throws {
         let session = AppSessionViewModel(container: AppContainer())
         session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
@@ -597,6 +1134,40 @@ final class InhouseMakeriOSTests: XCTestCase {
         case .bootstrapping, .authenticating, .authenticated:
             XCTFail("Expected guest state while waiting for reauthentication")
         }
+    }
+
+    @MainActor
+    func testSignOutKeepsCompletedOnboardingHidden() async {
+        let suiteName = "InhouseMakeriOSTests.signout.onboarding.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setOnboardingStatus(.completed)
+        let session = AppSessionViewModel(
+            container: AppContainer(
+                configuration: makeConfiguration(),
+                tokenStore: makeTokenStore(),
+                localStore: localStore
+            )
+        )
+        let router = AppRouter()
+
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        await session.signOut(router: router)
+
+        switch session.state {
+        case .guest:
+            XCTAssertTrue(true)
+        case .bootstrapping, .authenticating, .authenticated:
+            XCTFail("Expected guest state after sign out")
+        }
+
+        XCTAssertEqual(localStore.onboardingStatus, .completed)
+        XCTAssertFalse(session.shouldPresentOnboarding)
+        XCTAssertEqual(session.onboardingPresentationState, .completed)
     }
 
     @MainActor
@@ -775,6 +1346,58 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testCompleteAuthenticatedSessionSuccessTransitionsToAuthenticatedWithEmailSignUp() async throws {
+        let session = AppSessionViewModel(container: AppContainer())
+        let tokens = makeTokens()
+        let profile = makeProfile()
+
+        let result = try await session.completeAuthenticatedSession(
+            tokens: tokens,
+            event: .emailSignUp,
+            loadProfile: { profile },
+            onSignOut: {}
+        )
+
+        XCTAssertEqual(result, profile)
+        XCTAssertEqual(session.authTokens, tokens)
+        XCTAssertEqual(session.profile, profile)
+
+        switch session.state {
+        case let .authenticated(authenticatedSession):
+            XCTAssertEqual(authenticatedSession.user, profile)
+            XCTAssertEqual(authenticatedSession.authTokens, tokens)
+        case .bootstrapping, .guest, .authenticating:
+            XCTFail("Expected authenticated state")
+        }
+    }
+
+    @MainActor
+    func testCompleteAuthenticatedSessionSuccessTransitionsToAuthenticatedWithEmailLogin() async throws {
+        let session = AppSessionViewModel(container: AppContainer())
+        let tokens = makeTokens()
+        let profile = makeProfile()
+
+        let result = try await session.completeAuthenticatedSession(
+            tokens: tokens,
+            event: .emailLogin,
+            loadProfile: { profile },
+            onSignOut: {}
+        )
+
+        XCTAssertEqual(result, profile)
+        XCTAssertEqual(session.authTokens, tokens)
+        XCTAssertEqual(session.profile, profile)
+
+        switch session.state {
+        case let .authenticated(authenticatedSession):
+            XCTAssertEqual(authenticatedSession.user, profile)
+            XCTAssertEqual(authenticatedSession.authTokens, tokens)
+        case .bootstrapping, .guest, .authenticating:
+            XCTFail("Expected authenticated state")
+        }
+    }
+
+    @MainActor
     func testCompleteAuthenticatedSessionFailureClearsSession() async {
         let session = AppSessionViewModel(container: AppContainer())
         let tokens = makeTokens()
@@ -804,6 +1427,64 @@ final class InhouseMakeriOSTests: XCTestCase {
         case .bootstrapping, .authenticating, .authenticated:
             XCTFail("Expected guest state")
         }
+    }
+
+    func testRiotGameNameValidationRejectsCombinedRiotID() {
+        XCTAssertEqual(
+            RiotAccountInputValidator.validateGameName("Hide on bush#KR1"),
+            .invalid("게임 이름과 태그라인을 나눠 입력해 주세요")
+        )
+        XCTAssertEqual(
+            RiotAccountInputValidator.validateGameName(String(repeating: "a", count: 33)),
+            .invalid("게임 이름은 32자 이하로 입력해 주세요")
+        )
+    }
+
+    func testRiotTagLineValidationNormalizesHashAndUppercasesInput() {
+        XCTAssertEqual(RiotAccountInputValidator.normalizedTagLine("#kr1 "), "KR1")
+        XCTAssertEqual(
+            RiotAccountInputValidator.validateTagLine("#KR1"),
+            .invalid("# 없이 KR1만 입력해 주세요")
+        )
+        XCTAssertEqual(
+            RiotAccountInputValidator.validateTagLine("kr1"),
+            .valid("예: KR1, KOR")
+        )
+    }
+
+    func testRiotSyncUIStateMapsFailureCodesToActionableStatuses() {
+        XCTAssertEqual(
+            makeRiotAccount(syncStatus: .failed, lastSyncErrorCode: "RIOT_RESOURCE_NOT_FOUND").syncUIState,
+            .accountNotFound
+        )
+        XCTAssertEqual(
+            makeRiotAccount(syncStatus: .failed, lastSyncErrorCode: "RIOT_CLIENT_ERROR").syncUIState,
+            .invalidInput
+        )
+        XCTAssertEqual(
+            makeRiotAccount(syncStatus: .failed, lastSyncErrorCode: "RIOT_AUTH_FAILED").syncUIState,
+            .serverConfiguration
+        )
+        XCTAssertEqual(
+            makeRiotAccount(syncStatus: .failed, lastSyncErrorCode: "RIOT_NETWORK_ERROR").syncUIState,
+            .failure
+        )
+    }
+
+    func testRiotSyncUIStateTracksPendingRunningAndSuccessTimestamps() {
+        let now = Date(timeIntervalSince1970: 1_713_081_600)
+
+        XCTAssertEqual(makeRiotAccount(syncStatus: .idle).syncUIState, .pending)
+        XCTAssertEqual(makeRiotAccount(syncStatus: .queued).syncUIState, .pending)
+        XCTAssertEqual(makeRiotAccount(syncStatus: .running).syncUIState, .syncing)
+
+        let succeeded = makeRiotAccount(
+            syncStatus: .succeeded,
+            lastSyncSucceededAt: now,
+            lastSyncedAt: now
+        )
+        XCTAssertEqual(succeeded.syncUIState, .success)
+        XCTAssertEqual(succeeded.syncStatusTimestamp, now)
     }
 
     private func makeTokens() -> AuthTokens {
@@ -865,6 +1546,47 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
     }
 
+    private func makeRiotAccount(
+        syncStatus: RiotSyncStatus,
+        lastSyncErrorCode: String? = nil,
+        lastSyncErrorMessage: String? = nil,
+        lastSyncRequestedAt: Date? = nil,
+        lastSyncSucceededAt: Date? = nil,
+        lastSyncFailedAt: Date? = nil,
+        lastSyncedAt: Date? = nil
+    ) -> RiotAccount {
+        RiotAccount(
+            id: "ra1",
+            riotGameName: "Hide on bush",
+            tagLine: "KR1",
+            region: "kr",
+            puuid: "puuid-1",
+            isPrimary: true,
+            verificationStatus: .claimed,
+            syncStatus: syncStatus,
+            lastSyncRequestedAt: lastSyncRequestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: lastSyncErrorCode,
+            lastSyncErrorMessage: lastSyncErrorMessage,
+            lastSyncedAt: lastSyncedAt
+        )
+    }
+
+    private func makeProfileDTO() -> UserProfileDTO {
+        UserProfileDTO(
+            id: "u1",
+            email: "user@example.com",
+            nickname: "tester",
+            primaryPosition: .mid,
+            secondaryPosition: .top,
+            isFillAvailable: true,
+            styleTags: ["빡겜"],
+            mannerScore: 100,
+            noshowCount: 0
+        )
+    }
+
     private func makeGroupSummaryDTO(id: String, name: String) -> GroupSummaryDTO {
         GroupSummaryDTO(
             id: id,
@@ -892,6 +1614,32 @@ final class InhouseMakeriOSTests: XCTestCase {
             requiredPositions: ["MID"],
             createdBy: "tester"
         )
+    }
+
+    private func requestBodyData(from request: URLRequest) -> Data? {
+        if let body = request.httpBody {
+            return body
+        }
+
+        guard let bodyStream = request.httpBodyStream else {
+            return nil
+        }
+
+        bodyStream.open()
+        defer { bodyStream.close() }
+
+        let bufferSize = 1024
+        var data = Data()
+        let buffer = UnsafeMutablePointer<UInt8>.allocate(capacity: bufferSize)
+        defer { buffer.deallocate() }
+
+        while bodyStream.hasBytesAvailable {
+            let readCount = bodyStream.read(buffer, maxLength: bufferSize)
+            guard readCount > 0 else { break }
+            data.append(buffer, count: readCount)
+        }
+
+        return data.isEmpty ? nil : data
     }
 }
 

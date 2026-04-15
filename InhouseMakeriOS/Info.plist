@@ -3,11 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>API_BASE_URL</key>
-	<string>http://127.0.0.1:3000</string>
+	<string>$(API_BASE_URL)</string>
+	<key>APP_ENV</key>
+	<string>$(APP_ENV)</string>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
-	<string>내전 메이커</string>
+	<string>$(APP_DISPLAY_NAME)</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -29,14 +31,14 @@
 			<string>Google</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
-				<string>com.googleusercontent.apps.742162085445-gfk77jd6n7ue8i1nln6ish1kbnne00oo</string>
+				<string>$(GOOGLE_REVERSED_CLIENT_ID)</string>
 			</array>
 		</dict>
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>GIDClientID</key>
-	<string>742162085445-gfk77jd6n7ue8i1nln6ish1kbnne00oo.apps.googleusercontent.com</string>
+	<string>$(GOOGLE_CLIENT_ID)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>UIApplicationSupportsIndirectInputEvents</key>

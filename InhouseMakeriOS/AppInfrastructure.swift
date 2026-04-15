@@ -1,24 +1,44 @@
 import Foundation
 import Security
 
+enum AppEnvironment: String, Equatable {
+    case dev
+    case staging
+    case production
+}
+
 struct AppConfiguration {
+    let environment: AppEnvironment
     let baseURL: URL
     let googleClientID: String
 
-    static func load() -> AppConfiguration {
-        let rawValue = Bundle.main.object(forInfoDictionaryKey: "API_BASE_URL") as? String
+    static func load(bundle: Bundle = .main) -> AppConfiguration {
+        fromInfoDictionary(bundle.infoDictionary ?? [:])
+    }
+
+    static func fromInfoDictionary(_ infoDictionary: [String: Any]) -> AppConfiguration {
+        let environment = AppEnvironment(
+            rawValue: stringValue(for: "APP_ENV", in: infoDictionary)?.lowercased() ?? ""
+        ) ?? .dev
+
+        let rawValue = stringValue(for: "API_BASE_URL", in: infoDictionary)
         let fallback = "http://127.0.0.1:3000"
         let url = URL(string: rawValue ?? fallback) ?? URL(string: fallback)!
-        let rawGoogleClientID = Bundle.main.object(forInfoDictionaryKey: "GIDClientID") as? String
-        let fallbackGoogleClientID = "742162085445-gfk77jd6n7ue8i1nln6ish1kbnne00oo.apps.googleusercontent.com"
+        let rawGoogleClientID = stringValue(for: "GIDClientID", in: infoDictionary)
         let googleClientID = (rawGoogleClientID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? rawGoogleClientID!.trimmingCharacters(in: .whitespacesAndNewlines)
-            : fallbackGoogleClientID
+            : ""
 
         return AppConfiguration(
+            environment: environment,
             baseURL: url,
             googleClientID: googleClientID
         )
+    }
+
+    private static func stringValue(for key: String, in infoDictionary: [String: Any]) -> String? {
+        (infoDictionary[key] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 
@@ -26,6 +46,7 @@ enum HTTPMethod: String {
     case get = "GET"
     case post = "POST"
     case patch = "PATCH"
+    case delete = "DELETE"
 }
 
 private enum LocalStoreKey {
@@ -34,9 +55,32 @@ private enum LocalStoreKey {
     static let cachedResults = "local.cached.results"
     static let notifications = "local.notifications"
     static let guestOnboardingCompleted = "local.guest.onboarding.completed"
+    static let onboardingStatus = "local.onboarding.status"
     static let recruitFilterType = "local.recruit.filter.type"
     static let teamBalancePreviewDraft = "local.team.balance.preview.draft"
     static let resultPreviewDraft = "local.result.preview.draft"
+}
+
+enum OnboardingStatus: String, Codable, Equatable {
+    case pending
+    case completed
+}
+
+enum OnboardingStatusNormalizationSource: String, Equatable {
+    case normalized
+    case legacyFlag
+    case restoredAuthenticatedSession
+    case legacyInstallFallback
+    case freshInstallDefault
+}
+
+struct OnboardingStatusNormalizationResult: Equatable {
+    let status: OnboardingStatus
+    let source: OnboardingStatusNormalizationSource
+
+    var didMigrate: Bool {
+        source != .normalized
+    }
 }
 
 final class AppLocalStore {
@@ -62,8 +106,17 @@ final class AppLocalStore {
         decode([NotificationEntry].self, forKey: LocalStoreKey.notifications) ?? []
     }
 
+    var onboardingStatus: OnboardingStatus? {
+        guard let rawValue = defaults.string(forKey: LocalStoreKey.onboardingStatus) else { return nil }
+        return OnboardingStatus(rawValue: rawValue)
+    }
+
+    var hasCompletedOnboarding: Bool {
+        onboardingStatus == .completed
+    }
+
     var hasCompletedGuestOnboarding: Bool {
-        defaults.bool(forKey: LocalStoreKey.guestOnboardingCompleted)
+        hasCompletedOnboarding
     }
 
     var recruitFilterType: RecruitingPostType {
@@ -131,8 +184,56 @@ final class AppLocalStore {
         save(Array(current.prefix(50)), forKey: LocalStoreKey.notifications)
     }
 
+    func resolveOnboardingStatus(
+        hasAuthenticatedSession: Bool
+    ) -> OnboardingStatusNormalizationResult {
+        if hasAuthenticatedSession {
+            if onboardingStatus == .completed {
+                return OnboardingStatusNormalizationResult(status: .completed, source: .normalized)
+            }
+
+            setOnboardingStatus(.completed)
+            return OnboardingStatusNormalizationResult(
+                status: .completed,
+                source: .restoredAuthenticatedSession
+            )
+        }
+
+        if let onboardingStatus {
+            return OnboardingStatusNormalizationResult(status: onboardingStatus, source: .normalized)
+        }
+
+        if let legacyFlag = defaults.object(forKey: LocalStoreKey.guestOnboardingCompleted) as? Bool {
+            let normalizedStatus: OnboardingStatus = legacyFlag ? .completed : .pending
+            setOnboardingStatus(normalizedStatus)
+            return OnboardingStatusNormalizationResult(status: normalizedStatus, source: .legacyFlag)
+        }
+
+        let normalizedStatus: OnboardingStatus
+        let source: OnboardingStatusNormalizationSource
+
+        if hasAuthenticatedSession {
+            normalizedStatus = .completed
+            source = .restoredAuthenticatedSession
+        } else if hasLegacyUsageData {
+            normalizedStatus = .completed
+            source = .legacyInstallFallback
+        } else {
+            normalizedStatus = .pending
+            source = .freshInstallDefault
+        }
+
+        setOnboardingStatus(normalizedStatus)
+        return OnboardingStatusNormalizationResult(status: normalizedStatus, source: source)
+    }
+
+    func setOnboardingStatus(_ status: OnboardingStatus) {
+        defaults.set(status.rawValue, forKey: LocalStoreKey.onboardingStatus)
+        defaults.set(status == .completed, forKey: LocalStoreKey.guestOnboardingCompleted)
+    }
+
     func setGuestOnboardingCompleted(_ completed: Bool) {
-        defaults.set(completed, forKey: LocalStoreKey.guestOnboardingCompleted)
+        setOnboardingStatus(completed ? .completed : .pending)
     }
 
     func setRecruitFilterType(_ type: RecruitingPostType) {
@@ -155,6 +256,18 @@ final class AppLocalStore {
     private func decode<T: Decodable>(_ type: T.Type, forKey key: String) -> T? {
         guard let data = defaults.data(forKey: key) else { return nil }
         return try? JSONDecoder.app.decode(type, from: data)
+    }
+
+    private var hasLegacyUsageData: Bool {
+        [
+            LocalStoreKey.groupIDs,
+            LocalStoreKey.recentMatches,
+            LocalStoreKey.cachedResults,
+            LocalStoreKey.notifications,
+            LocalStoreKey.recruitFilterType,
+            LocalStoreKey.teamBalancePreviewDraft,
+            LocalStoreKey.resultPreviewDraft,
+        ].contains { defaults.object(forKey: $0) != nil }
     }
 }
 
@@ -271,6 +384,7 @@ final class APIClient {
     private let configuration: AppConfiguration
     private let session: URLSession
     private let tokenStore: TokenStore
+    private let inFlightGetRequests = InFlightGETRequestStore()
 
     init(
         configuration: AppConfiguration,
@@ -299,7 +413,8 @@ final class APIClient {
             headers: headers,
             requiresAuth: requiresAuth
         )
-        let (data, response) = try await session.data(for: request)
+        debugLogRequest(request)
+        let (data, response) = try await dataForRequest(request, path: path, method: method)
         return try await decode(
             data: data,
             response: response,
@@ -361,6 +476,32 @@ final class APIClient {
         return request
     }
 
+    private func dataForRequest(
+        _ request: URLRequest,
+        path: String,
+        method: HTTPMethod
+    ) async throws -> (Data, URLResponse) {
+        guard method == .get, let dedupKey = dedupKey(for: request) else {
+            return try await session.data(for: request)
+        }
+
+        if let existingTask = await inFlightGetRequests.task(for: dedupKey) {
+            debugLogDedupBlocked(endpoint: debugEndpoint(for: request.url, fallbackPath: path))
+            return try await existingTask.value
+        }
+
+        let task = Task { try await session.data(for: request) }
+        await inFlightGetRequests.store(task: task, for: dedupKey)
+        do {
+            let result = try await task.value
+            await inFlightGetRequests.removeTask(for: dedupKey)
+            return result
+        } catch {
+            await inFlightGetRequests.removeTask(for: dedupKey)
+            throw error
+        }
+    }
+
     private func decode<Response: Decodable>(
         data: Data,
         response: URLResponse,
@@ -371,12 +512,21 @@ final class APIClient {
             throw APIClientError.invalidResponse
         }
 
+        debugLogResponse(path: originalRequest.path, statusCode: httpResponse.statusCode, data: data)
+
         switch httpResponse.statusCode {
         case 200 ... 299:
             if Response.self == EmptyResponse.self {
                 return EmptyResponse() as! Response
             }
-            return try JSONDecoder.app.decode(Response.self, from: data)
+            do {
+                let decoded = try JSONDecoder.app.decode(Response.self, from: data)
+                debugLogDecodeSuccess(path: originalRequest.path, responseType: Response.self)
+                return decoded
+            } catch {
+                debugLogDecodeFailure(path: originalRequest.path, data: data, error: error)
+                throw error
+            }
         case 401 where retryOnUnauthorized && originalRequest.requiresAuth:
             try await refreshTokens()
             return try await send(
@@ -389,7 +539,7 @@ final class APIClient {
                 retryOnUnauthorized: false
             )
         default:
-            throw mapError(data: data, statusCode: httpResponse.statusCode)
+            throw mapError(data: data, statusCode: httpResponse.statusCode, path: originalRequest.path)
         }
     }
 
@@ -421,9 +571,9 @@ final class APIClient {
         }
     }
 
-    private func mapError(data: Data, statusCode: Int) -> UserFacingError {
+    private func mapError(data: Data, statusCode: Int, path: String) -> UserFacingError {
         if let serverError = try? JSONDecoder.app.decode(ServerErrorResponse.self, from: data) {
-            return UserFacingError(
+            let mappedError = UserFacingError(
                 title: statusCode == 401 ? "인증 오류" : "서버 오류",
                 message: serverError.message.value,
                 code: serverError.code,
@@ -431,13 +581,133 @@ final class APIClient {
                 statusCode: serverError.statusCode,
                 details: serverError.details
             ).serverContractMapped
+            debugLogMappedError(path: path, error: mappedError)
+            return mappedError
         }
-        return UserFacingError(
+        let mappedError = UserFacingError(
             title: statusCode == 401 ? "인증 오류" : "네트워크 오류",
             message: "요청 처리 중 문제가 발생했습니다. 잠시 후 다시 시도해주세요.",
             code: statusCode == 429 ? "RATE_LIMITED" : nil,
             statusCode: statusCode
         ).serverContractMapped
+        debugLogMappedError(path: path, error: mappedError)
+        return mappedError
+    }
+
+    private func debugLogRequest(_ request: URLRequest) {
+#if DEBUG
+        guard let url = request.url, shouldDebugLog(path: url.path) else { return }
+        let body = request.httpBody.flatMap { String(data: $0, encoding: .utf8) } ?? "<empty>"
+        print("[APIClient] request \(request.httpMethod ?? "GET") \(url.absoluteString)")
+        print("[APIClient] requestBody \(body)")
+#endif
+    }
+
+    private func debugLogResponse(path: String, statusCode: Int, data: Data) {
+#if DEBUG
+        guard shouldDebugLog(path: path) else { return }
+        let body = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count) bytes>"
+        print("[APIClient] response \(path) status=\(statusCode)")
+        print("[APIClient] responseBody \(body)")
+#endif
+    }
+
+    private func debugLogDecodeSuccess<Response: Decodable>(path: String, responseType: Response.Type) {
+#if DEBUG
+        guard shouldDebugLog(path: path) else { return }
+        print("[APIClient] decodeSuccess \(path) type=\(String(describing: responseType))")
+#endif
+    }
+
+    private func debugLogDecodeFailure(path: String, data: Data, error: Error) {
+#if DEBUG
+        guard shouldDebugLog(path: path) else { return }
+        let body = String(data: data, encoding: .utf8) ?? "<non-utf8 \(data.count) bytes>"
+        print("[APIClient] decodeError \(path) error=\(error)")
+        if let summary = decodingErrorSummary(error) {
+            print("[APIClient] decodeErrorField \(path) \(summary)")
+        }
+        print("[APIClient] decodeErrorBody \(body)")
+#endif
+    }
+
+    private func debugLogDedupBlocked(endpoint: String) {
+#if DEBUG
+        print("[APIClient] dedup blocked endpoint=\(endpoint)")
+#endif
+    }
+
+    private func debugLogMappedError(path: String, error: UserFacingError) {
+#if DEBUG
+        guard shouldDebugLog(path: path) else { return }
+        print("[APIClient] mappedError \(path) title=\(error.title) code=\(error.code ?? "nil") status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+#endif
+    }
+
+    private func shouldDebugLog(path: String) -> Bool {
+        path == "/auth/signup/email"
+            || path == "/me"
+            || path == "/recruiting-posts"
+            || path.hasSuffix("/power-profile")
+            || path.hasSuffix("/inhouse-history")
+            || path.hasPrefix("/riot-accounts")
+    }
+
+    private func dedupKey(for request: URLRequest) -> String? {
+        guard let url = request.url else { return nil }
+        let authorization = request.value(forHTTPHeaderField: "Authorization") ?? ""
+        return "\(request.httpMethod ?? HTTPMethod.get.rawValue) \(url.absoluteString) auth=\(authorization)"
+    }
+
+    private func debugEndpoint(for url: URL?, fallbackPath: String) -> String {
+        guard let url else { return fallbackPath }
+        if let query = url.query, !query.isEmpty {
+            return "\(url.path)?\(query)"
+        }
+        return url.path
+    }
+
+    private func decodingErrorSummary(_ error: Error) -> String? {
+        guard let decodingError = error as? DecodingError else { return nil }
+        switch decodingError {
+        case let .typeMismatch(type, context):
+            return "kind=typeMismatch type=\(type) path=\(formatCodingPath(context.codingPath)) description=\(context.debugDescription)"
+        case let .valueNotFound(type, context):
+            return "kind=valueNotFound type=\(type) path=\(formatCodingPath(context.codingPath)) description=\(context.debugDescription)"
+        case let .keyNotFound(key, context):
+            return "kind=keyNotFound key=\(key.stringValue) path=\(formatCodingPath(context.codingPath)) description=\(context.debugDescription)"
+        case let .dataCorrupted(context):
+            return "kind=dataCorrupted path=\(formatCodingPath(context.codingPath)) description=\(context.debugDescription)"
+        @unknown default:
+            return "kind=unknown"
+        }
+    }
+
+    private func formatCodingPath(_ codingPath: [CodingKey]) -> String {
+        guard !codingPath.isEmpty else { return "<root>" }
+        return codingPath.map { key in
+            if let intValue = key.intValue {
+                return "[\(intValue)]"
+            }
+            return key.stringValue
+        }
+        .joined(separator: ".")
+    }
+}
+
+private actor InFlightGETRequestStore {
+    private var tasks: [String: Task<(Data, URLResponse), Error>] = [:]
+
+    func task(for key: String) -> Task<(Data, URLResponse), Error>? {
+        tasks[key]
+    }
+
+    func store(task: Task<(Data, URLResponse), Error>, for key: String) {
+        tasks[key] = task
+    }
+
+    func removeTask(for key: String) {
+        tasks.removeValue(forKey: key)
     }
 }
 
@@ -546,6 +816,8 @@ struct AuthUserDTO: Codable {
     let id: String
     let email: String
     let nickname: String
+    let provider: String
+    let status: AuthenticatedUserStatus
 }
 
 struct AuthTokensDTO: Codable {
@@ -555,7 +827,13 @@ struct AuthTokensDTO: Codable {
 
     func toDomain() -> AuthTokens {
         AuthTokens(
-            user: AuthUser(id: user.id, email: user.email, nickname: user.nickname),
+            user: AuthUser(
+                id: user.id,
+                email: user.email,
+                nickname: user.nickname,
+                provider: AuthProvider(serverValue: user.provider),
+                status: user.status
+            ),
             accessToken: accessToken,
             refreshToken: refreshToken
         )
@@ -572,6 +850,20 @@ struct GoogleLoginRequestDTO: Encodable {
     let accessToken: String?
     let email: String?
     let name: String?
+}
+
+struct EmailSignUpRequestDTO: Encodable {
+    let email: String
+    let password: String
+    let nickname: String
+    let agreedToTerms: Bool
+    let agreedToPrivacy: Bool
+    let agreedToMarketing: Bool
+}
+
+struct EmailLoginRequestDTO: Encodable {
+    let email: String
+    let password: String
 }
 
 struct LogoutRequestDTO: Encodable {
@@ -665,6 +957,12 @@ struct RiotAccountDTO: Codable {
     let puuid: String
     let isPrimary: Bool
     let verificationStatus: VerificationStatus
+    let syncStatus: RiotSyncStatus?
+    let lastSyncRequestedAt: Date?
+    let lastSyncSucceededAt: Date?
+    let lastSyncFailedAt: Date?
+    let lastSyncErrorCode: String?
+    let lastSyncErrorMessage: String?
     let lastSyncedAt: Date?
 
     func toDomain() -> RiotAccount {
@@ -676,6 +974,12 @@ struct RiotAccountDTO: Codable {
             puuid: puuid,
             isPrimary: isPrimary,
             verificationStatus: verificationStatus,
+            syncStatus: syncStatus ?? .idle,
+            lastSyncRequestedAt: lastSyncRequestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: lastSyncErrorCode,
+            lastSyncErrorMessage: lastSyncErrorMessage,
             lastSyncedAt: lastSyncedAt
         )
     }
@@ -690,6 +994,42 @@ struct CreateRiotAccountRequestDTO: Encodable {
     let tagLine: String
     let region: String
     let isPrimary: Bool
+}
+
+struct RiotAccountSyncAcceptedDTO: Codable {
+    let riotAccountId: String
+    let queued: Bool
+    let syncStatus: RiotSyncStatus
+
+    func toDomain() -> RiotAccountSyncAccepted {
+        RiotAccountSyncAccepted(
+            riotAccountId: riotAccountId,
+            queued: queued,
+            syncStatus: syncStatus
+        )
+    }
+}
+
+struct RiotAccountSyncStatusDTO: Codable {
+    let riotAccountId: String
+    let syncStatus: RiotSyncStatus
+    let lastSyncRequestedAt: Date?
+    let lastSyncSucceededAt: Date?
+    let lastSyncFailedAt: Date?
+    let lastSyncErrorCode: String?
+    let lastSyncErrorMessage: String?
+
+    func toDomain() -> RiotAccountSyncState {
+        RiotAccountSyncState(
+            riotAccountId: riotAccountId,
+            syncStatus: syncStatus,
+            lastSyncRequestedAt: lastSyncRequestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: lastSyncErrorCode,
+            lastSyncErrorMessage: lastSyncErrorMessage
+        )
+    }
 }
 
 struct GroupSummaryDTO: Codable {
@@ -1172,6 +1512,62 @@ final class AuthRepository {
         }
     }
 
+    func signUpWithEmail(
+        email: String,
+        password: String,
+        nickname: String,
+        agreedToTerms: Bool,
+        agreedToPrivacy: Bool,
+        agreedToMarketing: Bool
+    ) async throws -> AuthTokens {
+        do {
+            let response: AuthTokensDTO = try await apiClient.send(
+                path: "/auth/signup/email",
+                method: .post,
+                body: try apiClient.encodedBody(
+                    EmailSignUpRequestDTO(
+                        email: email,
+                        password: password,
+                        nickname: nickname,
+                        agreedToTerms: agreedToTerms,
+                        agreedToPrivacy: agreedToPrivacy,
+                        agreedToMarketing: agreedToMarketing
+                    )
+                ),
+                requiresAuth: false
+            )
+            let tokens = response.toDomain()
+            await tokenStore.save(tokens: tokens)
+            debugLogEmailSignUpSuccess(tokens)
+            return tokens
+        } catch {
+            let mappedError = AuthErrorMapper.map(error)
+            debugLogEmailSignUpFailure(mappedError)
+            throw mappedError
+        }
+    }
+
+    func loginWithEmail(email: String, password: String) async throws -> AuthTokens {
+        do {
+            let response: AuthTokensDTO = try await apiClient.send(
+                path: "/auth/login/email",
+                method: .post,
+                body: try apiClient.encodedBody(
+                    EmailLoginRequestDTO(
+                        email: email,
+                        password: password
+                    )
+                ),
+                requiresAuth: false
+            )
+            let tokens = response.toDomain()
+            await tokenStore.save(tokens: tokens)
+            return tokens
+        } catch {
+            throw AuthErrorMapper.map(error)
+        }
+    }
+
     func signOut() async {
         if let refreshToken = await tokenStore.loadTokens()?.refreshToken {
             let response: EmptyResponse? = try? await apiClient.send(
@@ -1183,6 +1579,20 @@ final class AuthRepository {
             _ = response
         }
         await tokenStore.clear()
+    }
+
+    private func debugLogEmailSignUpSuccess(_ tokens: AuthTokens) {
+#if DEBUG
+        print(
+            "[AuthRepository] signUpWithEmail success userId=\(tokens.user.id) provider=\(tokens.user.provider?.rawValue ?? "nil") status=\(tokens.user.status?.rawValue ?? "nil")"
+        )
+#endif
+    }
+
+    private func debugLogEmailSignUpFailure(_ error: AuthError) {
+#if DEBUG
+        print("[AuthRepository] signUpWithEmail mappedError=\(String(describing: error))")
+#endif
     }
 }
 
@@ -1261,10 +1671,25 @@ final class RiotRepository {
         return response.toDomain()
     }
 
-    func sync(accountID: String) async throws {
-        let _: EmptyResponse = try await apiClient.send(
+    func sync(accountID: String) async throws -> RiotAccountSyncAccepted {
+        let response: RiotAccountSyncAcceptedDTO = try await apiClient.send(
             path: "/riot-accounts/\(accountID)/sync",
             method: .post
+        )
+        return response.toDomain()
+    }
+
+    func syncStatus(accountID: String) async throws -> RiotAccountSyncState {
+        let response: RiotAccountSyncStatusDTO = try await apiClient.sendWithoutBody(
+            path: "/riot-accounts/\(accountID)/sync-status"
+        )
+        return response.toDomain()
+    }
+
+    func unlink(accountID: String) async throws {
+        let _: EmptyResponse = try await apiClient.send(
+            path: "/riot-accounts/\(accountID)",
+            method: .delete
         )
     }
 }

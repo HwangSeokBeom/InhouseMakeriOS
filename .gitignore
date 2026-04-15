@@ -16,6 +16,7 @@ build/
 # Swift Package Manager
 .swiftpm/
 .build/
+node_modules/
 
 # Package.resolved is committed for reproducible Xcode app builds.
 
@@ -33,6 +34,12 @@ fastlane/test_output/
 .env
 .env.*
 *.local
+!*.example
+!.env.example
+!.env.staging.example
+!.env.production.example
+InhouseMakeriOS/Configurations/Local/*.xcconfig
+server/dist/
 
 # Codex local state
 .codex-home/

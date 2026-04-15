@@ -1,0 +1,64 @@
+name: Server CI
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - staging
+      - main
+    paths:
+      - "server/**"
+      - "scripts/server/**"
+      - ".github/workflows/server-*.yml"
+  push:
+    branches:
+      - dev
+      - staging
+      - main
+    paths:
+      - "server/**"
+      - "scripts/server/**"
+      - ".github/workflows/server-*.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: server-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint-build-test:
+    if: ${{ hashFiles('server/package.json') != '' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          if [[ -f package-lock.json ]]; then
+            npm ci
+          else
+            echo "package-lock.json is missing. Falling back to npm install. Commit the lockfile before enabling production deploy."
+            npm install
+          fi
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test

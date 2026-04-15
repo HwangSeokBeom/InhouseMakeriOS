@@ -1,0 +1,119 @@
+require "fileutils"
+require "shellwords"
+
+default_platform(:ios)
+
+def release_build_number
+  ENV["BUILD_NUMBER_OVERRIDE"].to_s.strip.empty? ? (ENV["GITHUB_RUN_NUMBER"] || Time.now.strftime("%Y%m%d%H%M")) : ENV["BUILD_NUMBER_OVERRIDE"]
+end
+
+def ensure_ci_xcconfig(environment_name)
+  configured_path = ENV["CI_XCCONFIG_PATH"].to_s.strip
+  return configured_path unless configured_path.empty?
+
+  generated_path = File.join(Dir.pwd, "fastlane", ".generated", "#{environment_name}.xcconfig")
+  sh("bash scripts/ios/create_ci_xcconfig.sh #{environment_name.shellescape} #{generated_path.shellescape}")
+  generated_path
+end
+
+def app_store_connect_api_key_from_env
+  key_id = ENV.fetch("APP_STORE_CONNECT_API_KEY_ID")
+  issuer_id = ENV.fetch("APP_STORE_CONNECT_ISSUER_ID")
+  key_content = ENV.fetch("APP_STORE_CONNECT_API_KEY_CONTENT")
+
+  generated_dir = File.join(Dir.pwd, "fastlane", ".generated")
+  FileUtils.mkdir_p(generated_dir)
+
+  key_path = File.join(generated_dir, "AuthKey_#{key_id}.p8")
+  File.write(key_path, key_content)
+
+  api_key = app_store_connect_api_key(
+    key_id: key_id,
+    issuer_id: issuer_id,
+    key_filepath: key_path,
+    duration: 1200,
+    in_house: false
+  )
+
+  [api_key, key_path]
+end
+
+def release_xcargs(key_path)
+  [
+    "-allowProvisioningUpdates",
+    "-authenticationKeyPath #{key_path.shellescape}",
+    "-authenticationKeyID #{ENV.fetch('APP_STORE_CONNECT_API_KEY_ID').shellescape}",
+    "-authenticationKeyIssuerID #{ENV.fetch('APP_STORE_CONNECT_ISSUER_ID').shellescape}",
+  ].join(" ")
+end
+
+def build_release(environment_name:, scheme_name:, configuration_name:, output_name:)
+  api_key, key_path = app_store_connect_api_key_from_env
+  generated_xcconfig = ensure_ci_xcconfig(environment_name)
+  previous_xcconfig = ENV["XCODE_XCCONFIG_FILE"]
+
+  increment_build_number(
+    xcodeproj: "InhouseMakeriOS.xcodeproj",
+    build_number: release_build_number
+  )
+
+  ENV["XCODE_XCCONFIG_FILE"] = generated_xcconfig
+  begin
+    gym(
+      project: "InhouseMakeriOS.xcodeproj",
+      scheme: scheme_name,
+      configuration: configuration_name,
+      clean: true,
+      export_method: "app-store",
+      output_directory: File.join("build", "ios", environment_name),
+      output_name: output_name,
+      xcargs: release_xcargs(key_path),
+      build_path: File.join("build", "ios", environment_name, "archives"),
+      include_bitcode: false
+    )
+  ensure
+    ENV["XCODE_XCCONFIG_FILE"] = previous_xcconfig
+  end
+
+  api_key
+end
+
+platform :ios do
+  desc "Archive and upload the staging build to TestFlight"
+  lane :beta_staging do
+    sh("bash scripts/ios/validate_release_env.sh staging upload")
+
+    api_key = build_release(
+      environment_name: "staging",
+      scheme_name: "InhouseMakeriOS-Staging",
+      configuration_name: "Staging",
+      output_name: "InhouseMakeriOS-staging.ipa"
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      skip_waiting_for_build_processing: true,
+      changelog: ENV["FASTLANE_CHANGELOG"]
+    )
+  end
+
+  desc "Archive and upload the production build to App Store Connect"
+  lane :release_production do
+    sh("bash scripts/ios/validate_release_env.sh production upload")
+
+    api_key = build_release(
+      environment_name: "production",
+      scheme_name: "InhouseMakeriOS-Production",
+      configuration_name: "Production",
+      output_name: "InhouseMakeriOS-production.ipa"
+    )
+
+    upload_to_app_store(
+      api_key: api_key,
+      skip_metadata: true,
+      skip_screenshots: true,
+      submit_for_review: false,
+      automatic_release: false
+    )
+  end
+end

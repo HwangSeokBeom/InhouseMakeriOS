@@ -1,0 +1,3 @@
+#include "App.Shared.xcconfig"
+INHOUSE_APP_ENV = production
+INHOUSE_APP_DISPLAY_NAME = 내전 메이커

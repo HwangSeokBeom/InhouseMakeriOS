@@ -168,7 +168,7 @@ struct ManualAdjustFeatureView: View {
             .padding(.vertical, 12)
             .background(AppPalette.bgSecondary)
         }
-        .overlay(alignment: .bottom) { actionBanner(store.actionState) }
+        .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
     }
 
     private func manualColumn(title: String, tint: Color, rows: [ManualAdjustRow]) -> some View {
