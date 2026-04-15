@@ -22,6 +22,10 @@ enum AppRoute: Hashable {
     case notifications
     case riotAccounts
     case settings
+    case homeUpcomingMatches
+    case homeGroups
+    case powerDetail
+    case homeRecentMatches
     case groupDetail(String)
     case matchLobby(groupID: String, matchID: String)
     case teamBalance(groupID: String, matchID: String)
@@ -192,6 +196,7 @@ enum ServerContractErrorCode: Equatable {
     case accountExistsWithApple
     case accountExistsWithGoogle
     case authProviderMismatch
+    case accountNotFound
     case unsupportedProvider
     case emailAlreadyExists
     case nicknameAlreadyExists
@@ -224,6 +229,8 @@ enum ServerContractErrorCode: Equatable {
             return .accountExistsWithGoogle
         case let code where code.contains("AUTH_PROVIDER_MISMATCH"):
             return .authProviderMismatch
+        case let code where code.contains("ACCOUNT_NOT_FOUND") || code.contains("USER_NOT_FOUND") || code.contains("EMAIL_NOT_FOUND"):
+            return .accountNotFound
         case let code where code.contains("UNSUPPORTED_PROVIDER") || code.contains("UNSUPPORTED_AUTH_PROVIDER") || code.contains("UNSUPPORTED_LOGIN_METHOD"):
             return .unsupportedProvider
         case let code where code.contains("EMAIL_ALREADY_IN_USE") || code.contains("EMAIL_ALREADY_EXISTS") || code.contains("EMAIL_DUPLICATE") || code.contains("DUPLICATE_EMAIL") || code.contains("ACCOUNT_EXISTS_WITH_EMAIL"):
@@ -362,6 +369,15 @@ extension UserFacingError {
             return UserFacingError(
                 title: "로그인 방법 안내",
                 message: "이 계정은 다른 로그인 방식으로 연결되어 있어요. 올바른 로그인 방식으로 다시 시도해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .accountNotFound:
+            return UserFacingError(
+                title: "존재하지 않는 계정이에요",
+                message: "가입한 이메일인지 다시 확인해 주세요.",
                 code: self.code,
                 provider: provider,
                 statusCode: statusCode,

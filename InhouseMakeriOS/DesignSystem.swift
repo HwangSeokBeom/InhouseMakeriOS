@@ -172,7 +172,7 @@ struct TabNavigationHeader: View {
     }
 
     private var headerHeight: CGFloat {
-        subtitle == nil ? 44 : 50
+        subtitle == nil ? 38 : 44
     }
 
     var body: some View {
@@ -186,12 +186,12 @@ struct TabNavigationHeader: View {
 
                 VStack(spacing: titleSpacing) {
                     Text(title)
-                        .font(AppTypography.heading(21, weight: .semibold))
+                        .font(AppTypography.heading(18, weight: .semibold))
                         .foregroundStyle(AppPalette.textPrimary)
 
                     if let subtitle {
                         Text(subtitle)
-                            .font(AppTypography.body(11))
+                            .font(AppTypography.body(10))
                             .foregroundStyle(AppPalette.textSecondary)
                     }
                 }
@@ -199,16 +199,16 @@ struct TabNavigationHeader: View {
                 .multilineTextAlignment(.center)
             }
             .frame(height: headerHeight)
-            .padding(.horizontal, 16)
-            .padding(.top, 4)
-            .padding(.bottom, 6)
+            .padding(.horizontal, 18)
+            .padding(.top, 0)
+            .padding(.bottom, 4)
 
             Rectangle()
-                .fill(Color.white.opacity(0.035))
+                .fill(Color.white.opacity(0.018))
                 .frame(height: 0.5)
-                .padding(.horizontal, 16)
+                .padding(.horizontal, 18)
         }
-        .background(AppPalette.bgPrimary.opacity(0.985))
+        .background(AppPalette.bgPrimary)
     }
 
     @ViewBuilder
@@ -216,24 +216,24 @@ struct TabNavigationHeader: View {
         if let action {
             Button(action: action.action) {
                 Image(systemName: action.systemName)
-                    .font(.system(size: 16, weight: .semibold))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundStyle(AppPalette.textPrimary)
-                    .frame(width: 36, height: 36)
+                    .frame(width: 34, height: 34)
                     .background(
                         Circle()
-                            .fill(AppPalette.bgTertiary.opacity(0.72))
+                            .fill(AppPalette.bgSecondary.opacity(0.78))
                     )
                     .overlay(
                         Circle()
-                            .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                            .stroke(Color.white.opacity(0.045), lineWidth: 1)
                     )
             }
             .buttonStyle(.plain)
             .accessibilityLabel(action.accessibilityLabel)
-            .frame(width: 44, height: 36, alignment: .center)
+            .frame(width: 42, height: 34, alignment: .center)
         } else {
             Color.clear
-                .frame(width: 44, height: 36)
+                .frame(width: 42, height: 34)
         }
     }
 }
@@ -318,7 +318,7 @@ struct SectionHeaderView: View {
                         .font(AppTypography.body(13))
                         .foregroundStyle(AppPalette.textMuted)
                         .padding(.horizontal, 10)
-                        .frame(minWidth: 44, minHeight: 44, alignment: .trailing)
+                        .frame(minWidth: 68, minHeight: 44, alignment: .trailing)
                         .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
@@ -441,12 +441,12 @@ struct AppTabBar: View {
     let onSelect: (AppTab) -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
             ForEach(AppTab.allCases, id: \.self) { tab in
                 Button(action: { onSelect(tab) }) {
-                    VStack(spacing: 3) {
+                    VStack(spacing: 2) {
                         Image(systemName: tab.iconName)
-                            .font(.system(size: 18, weight: selectedTab == tab ? .semibold : .medium))
+                            .font(.system(size: 17, weight: selectedTab == tab ? .semibold : .medium))
                             .foregroundStyle(selectedTab == tab ? AppPalette.accentBlue : AppPalette.textMuted)
                             .frame(height: 20)
                         Text(tab.title)
@@ -455,13 +455,13 @@ struct AppTabBar: View {
                             .lineLimit(1)
                     }
                     .frame(maxWidth: .infinity)
-                    .frame(height: 52)
+                    .frame(height: 48)
                     .background(
-                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                            .fill(selectedTab == tab ? Color.white.opacity(0.045) : .clear)
+                        Capsule(style: .continuous)
+                            .fill(selectedTab == tab ? AppPalette.bgTertiary.opacity(0.9) : .clear)
                             .overlay(
-                                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                    .stroke(selectedTab == tab ? Color.white.opacity(0.05) : .clear, lineWidth: 1)
+                                Capsule(style: .continuous)
+                                    .stroke(selectedTab == tab ? Color.white.opacity(0.04) : .clear, lineWidth: 1)
                             )
                     )
                     .contentShape(Rectangle())
@@ -469,21 +469,34 @@ struct AppTabBar: View {
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.top, 8)
-        .padding(.bottom, 6)
+        .padding(.horizontal, 8)
+        .padding(.top, 7)
+        .padding(.bottom, 7)
         .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(AppPalette.bgSecondary.opacity(0.98))
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(AppPalette.bgSecondary.opacity(0.94))
                 .overlay(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .stroke(Color.white.opacity(0.05), lineWidth: 1)
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(0.02),
+                                    Color.white.opacity(0.008)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
                 )
-                .shadow(color: Color.black.opacity(0.1), radius: 10, x: 0, y: 4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .stroke(Color.white.opacity(0.045), lineWidth: 1)
+                )
+                .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 3)
         )
         .padding(.horizontal, 12)
-        .padding(.top, 6)
-        .padding(.bottom, 4)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
     }
 }
 

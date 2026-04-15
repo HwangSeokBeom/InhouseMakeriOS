@@ -182,6 +182,7 @@ enum AuthError: Error, Equatable {
     case accountExistsWithApple(email: String?)
     case accountExistsWithGoogle(email: String?)
     case authProviderMismatch(email: String?, provider: AuthProvider?, availableProviders: [AuthProvider])
+    case accountNotFound(email: String?)
     case unsupportedProvider(provider: String?, availableProviders: [AuthProvider])
     case authRequired
     case emailAlreadyInUse
@@ -213,7 +214,7 @@ enum AuthError: Error, Equatable {
                 suggestedProvider: suggestedProvider,
                 availableProviders: availableProviders.isEmpty ? [suggestedProvider] : availableProviders
             )
-        case .socialTokenInvalid, .unsupportedProvider, .authRequired, .emailAlreadyInUse, .nicknameAlreadyInUse, .invalidEmailFormat, .weakPassword, .requiredTermsNotAgreed, .invalidPayload, .invalidCredentials, .emailAuthDisabled, .passwordAuthDisabled, .networkOffline, .networkTimeout, .rateLimited, .serverUnavailable, .networkError, .unknown:
+        case .socialTokenInvalid, .accountNotFound, .unsupportedProvider, .authRequired, .emailAlreadyInUse, .nicknameAlreadyInUse, .invalidEmailFormat, .weakPassword, .requiredTermsNotAgreed, .invalidPayload, .invalidCredentials, .emailAuthDisabled, .passwordAuthDisabled, .networkOffline, .networkTimeout, .rateLimited, .serverUnavailable, .networkError, .unknown:
             return nil
         }
     }
@@ -231,6 +232,8 @@ enum AuthError: Error, Equatable {
                 return ProviderConflictError(email: nil, suggestedProvider: provider, availableProviders: availableProviders.isEmpty ? [provider] : availableProviders).presentationError
             }
             return PresentationError(title: "로그인 방법 안내", message: "이 계정은 다른 로그인 방식으로 연결되어 있어요. 올바른 로그인 방식으로 다시 시도해 주세요.")
+        case .accountNotFound:
+            return PresentationError(title: "존재하지 않는 계정이에요", message: "가입한 이메일인지 다시 확인해 주세요.")
         case let .unsupportedProvider(_, availableProviders):
             let supportedCopy = availableProviders.isEmpty
                 ? "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
@@ -309,6 +312,17 @@ enum AuthErrorMapper {
             return .socialTokenInvalid
         }
 
+        if userFacingError.serverContractCode == .accountNotFound {
+            return .accountNotFound(email: email)
+        }
+
+        if userFacingError.statusCode == 404,
+           (rawMessage.contains("not found") || rawMessage.contains("does not exist")),
+           rawMessage.contains("account") || rawMessage.contains("email") || rawMessage.contains("user")
+        {
+            return .accountNotFound(email: email)
+        }
+
         if userFacingError.normalizedCode.contains("ACCOUNT_EXISTS_WITH_EMAIL") {
             let resolvedProviders = availableProviders.isEmpty ? [.email] : availableProviders
             return .authProviderMismatch(
@@ -329,6 +343,8 @@ enum AuthErrorMapper {
                 provider: provider,
                 availableProviders: availableProviders
             )
+        case .accountNotFound:
+            return .accountNotFound(email: email)
         case .unsupportedProvider:
             return .unsupportedProvider(
                 provider: userFacingError.providerHint,
@@ -444,6 +460,17 @@ enum AuthSessionEvent {
     case login(AuthProvider)
     case emailSignUp
     case emailLogin
+
+    var debugName: String {
+        switch self {
+        case let .login(provider):
+            return "login.\(provider.rawValue.lowercased())"
+        case .emailSignUp:
+            return "emailSignUp"
+        case .emailLogin:
+            return "emailLogin"
+        }
+    }
 
     var title: String {
         switch self {
@@ -775,6 +802,7 @@ extension AppSessionViewModel {
         onSignOut: @escaping () async -> Void
     ) async throws -> UserProfile {
         beginAuthenticating()
+        debugLog("completeAuthenticatedSession started event=\(event.debugName) tokenUserId=\(tokens.user.id) tokenEmail=\(tokens.user.email)")
 
         do {
             let profile = try await loadProfile()
@@ -788,11 +816,14 @@ extension AppSessionViewModel {
             applyAuthenticatedSession(sessionData)
             completeGuestOnboarding(resetTabSelection: false)
             pendingAction?()
+            debugLog("completeAuthenticatedSession succeeded event=\(event.debugName) userId=\(profile.id) email=\(profile.email)")
             return profile
         } catch {
+            let mappedError = AuthErrorMapper.map(error)
+            debugLog("completeAuthenticatedSession failed event=\(event.debugName) mappedError=\(String(describing: mappedError))")
             await onSignOut()
             restoreGuestSession()
-            throw AuthErrorMapper.map(error)
+            throw mappedError
         }
     }
 }
@@ -1277,6 +1308,9 @@ final class EmailSignUpViewModel: ObservableObject {
         case .invalidCredentials:
             state.formError = PresentationError(title: "회원가입 정보를 확인해 주세요", message: "입력한 정보를 다시 확인한 뒤 다시 시도해 주세요.")
             return
+        case .accountNotFound:
+            state.formError = authError.presentationError
+            return
         case .socialTokenInvalid, .accountExistsWithApple, .accountExistsWithGoogle, .authProviderMismatch, .authRequired:
             state.formError = authError.presentationError
             return
@@ -1411,28 +1445,39 @@ final class EmailLoginViewModel: ObservableObject {
     }
 
     func submit() async {
+        let normalizedEmail = EmailAuthValidator.normalizedEmail(state.email)
+        debugLog("submitTapped email=\(normalizedEmail) passwordLength=\(state.password.count)")
         clearSubmissionFeedback()
         validateAll(force: true)
 
-        guard state.isSubmitEnabled else { return }
+        guard state.isSubmitEnabled else {
+            debugLog(
+                "submitBlocked email=\(normalizedEmail) emailValidation=\(String(describing: state.emailValidation)) passwordValidation=\(String(describing: state.passwordValidation))"
+            )
+            return
+        }
 
         state.submittingState = .loading("로그인 정보를 확인하고 있습니다")
+        debugLog("requestPrepared endpoint=/auth/login/email email=\(normalizedEmail) passwordLength=\(state.password.count)")
         do {
             let tokens = try await session.container.authRepository.loginWithEmail(
-                email: EmailAuthValidator.normalizedEmail(state.email),
+                email: normalizedEmail,
                 password: state.password
             )
+            debugLog("loginRequestSucceeded userId=\(tokens.user.id) email=\(tokens.user.email)")
             _ = try await session.completeAuthenticatedSession(tokens: tokens, event: .emailLogin)
+            debugLog("sessionBootstrapSucceeded userId=\(tokens.user.id) email=\(tokens.user.email)")
             state.submittingState = .idle
         } catch {
-            handleFailure(error)
+            handleFailure(error, attemptedEmail: normalizedEmail)
         }
     }
 
-    private func handleFailure(_ error: Error) {
+    private func handleFailure(_ error: Error, attemptedEmail: String) {
         state.submittingState = .idle
 
         let authError = AuthErrorMapper.map(error)
+        debugLog("loginFlowFailed email=\(attemptedEmail) mappedError=\(String(describing: authError))")
         if let providerConflict = authError.providerConflict {
             state.providerConflict = providerConflict
             state.formError = authError.presentationError
@@ -1440,9 +1485,13 @@ final class EmailLoginViewModel: ObservableObject {
         }
 
         switch authError {
+        case .accountNotFound:
+            state.emailValidation = .invalid("가입된 계정을 찾을 수 없습니다")
+            state.formError = authError.presentationError
+            return
         case .invalidCredentials:
-            state.passwordValidation = .invalid("이메일 또는 비밀번호를 다시 확인해 주세요")
-            state.formError = PresentationError(title: "로그인에 실패했어요", message: "이메일 또는 비밀번호를 다시 확인해 주세요.")
+            state.passwordValidation = .invalid("이메일 또는 비밀번호가 일치하지 않습니다")
+            state.formError = PresentationError(title: "로그인 정보를 다시 확인해 주세요", message: "이메일 또는 비밀번호가 일치하지 않습니다.")
             return
         case let .invalidEmailFormat(message):
             state.emailValidation = .invalid(message ?? "올바른 이메일 형식이 아닙니다")
@@ -1475,6 +1524,12 @@ final class EmailLoginViewModel: ObservableObject {
         }
 
         state.formError = PresentationError(title: "로그인에 실패했어요", message: "잠시 후 다시 시도해 주세요.")
+    }
+
+    private func debugLog(_ message: String) {
+#if DEBUG
+        print("[EmailLoginViewModel] \(message)")
+#endif
     }
 
     private func clearSubmissionFeedback() {

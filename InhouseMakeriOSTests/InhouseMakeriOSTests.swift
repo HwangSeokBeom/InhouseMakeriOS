@@ -309,6 +309,25 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
     }
 
+    func testAccountNotFoundMappingUsesSpecificCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Account not found",
+            code: "ACCOUNT_NOT_FOUND",
+            statusCode: 404,
+            details: ["email": .string("missing@example.com")]
+        )
+
+        XCTAssertEqual(
+            AuthErrorMapper.map(error),
+            .accountNotFound(email: "missing@example.com")
+        )
+        XCTAssertEqual(
+            AuthError.accountNotFound(email: nil).presentationError.message,
+            "가입한 이메일인지 다시 확인해 주세요."
+        )
+    }
+
     func testUnsupportedProviderMappingUsesSupportedProviderCopy() {
         let error = UserFacingError(
             title: "서버 오류",
@@ -649,6 +668,94 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(tokens.accessToken, "login-access")
         let persistedTokens = await tokenStore.loadTokens()
         XCTAssertEqual(persistedTokens, tokens)
+    }
+
+    @MainActor
+    func testEmailLoginSubmitAuthenticatesSessionAndPersistsTokens() async throws {
+        let tokenStore = makeTokenStore()
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/auth/login/email":
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["email"] as? String, "user@example.com")
+                    XCTAssertEqual(payload["password"] as? String, "Password1!")
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: "user@example.com",
+                            nickname: "tester",
+                            provider: "email",
+                            status: .active
+                        ),
+                        accessToken: "login-access",
+                        refreshToken: "login-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                case "/me":
+                    return (200, try JSONEncoder.app.encode(self.makeProfileDTO()))
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        let viewModel = EmailLoginViewModel(session: session)
+
+        viewModel.updateEmail("User@Example.com ")
+        viewModel.updatePassword("Password1!")
+
+        await viewModel.submit()
+
+        XCTAssertEqual(session.authTokens?.accessToken, "login-access")
+        XCTAssertEqual(session.profile?.email, "user@example.com")
+        XCTAssertNil(viewModel.state.formError)
+
+        switch session.state {
+        case let .authenticated(authenticatedSession):
+            XCTAssertEqual(authenticatedSession.authTokens.accessToken, "login-access")
+            XCTAssertEqual(authenticatedSession.user.email, "user@example.com")
+        case .bootstrapping, .guest, .authenticating:
+            XCTFail("Expected authenticated state after email login")
+        }
+    }
+
+    @MainActor
+    func testEmailLoginSubmitShowsFieldErrorForMissingAccount() async {
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: makeTokenStore(),
+            urlSession: makeURLSession { request in
+                XCTAssertEqual(request.url?.path, "/auth/login/email")
+                return (
+                    404,
+                    self.makeServerErrorData(
+                        statusCode: 404,
+                        code: "ACCOUNT_NOT_FOUND",
+                        message: "Account not found.",
+                        provider: "email",
+                        details: ["email": .string("missing@example.com")]
+                    )
+                )
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        let viewModel = EmailLoginViewModel(session: session)
+
+        viewModel.updateEmail("missing@example.com")
+        viewModel.updatePassword("Password1!")
+
+        await viewModel.submit()
+
+        XCTAssertEqual(viewModel.state.emailValidation, .invalid("가입된 계정을 찾을 수 없습니다"))
+        XCTAssertEqual(viewModel.state.formError?.title, "존재하지 않는 계정이에요")
+        XCTAssertEqual(viewModel.state.formError?.message, "가입한 이메일인지 다시 확인해 주세요.")
+        XCTAssertNil(session.authTokens)
     }
 
     @MainActor
@@ -1496,7 +1603,11 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     private func makeConfiguration() -> AppConfiguration {
-        AppConfiguration(baseURL: URL(string: "http://localhost:3000")!, googleClientID: "test-google-client-id")
+        AppConfiguration(
+            environment: .dev,
+            baseURL: URL(string: "http://localhost:3000")!,
+            googleClientID: "test-google-client-id"
+        )
     }
 
     private func makeServerErrorData(

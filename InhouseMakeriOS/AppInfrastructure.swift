@@ -646,6 +646,7 @@ final class APIClient {
 
     private func shouldDebugLog(path: String) -> Bool {
         path == "/auth/signup/email"
+            || path == "/auth/login/email"
             || path == "/me"
             || path == "/recruiting-posts"
             || path.hasSuffix("/power-profile")
@@ -1548,6 +1549,7 @@ final class AuthRepository {
     }
 
     func loginWithEmail(email: String, password: String) async throws -> AuthTokens {
+        debugLogEmailLoginRequest(email: email, password: password)
         do {
             let response: AuthTokensDTO = try await apiClient.send(
                 path: "/auth/login/email",
@@ -1562,9 +1564,12 @@ final class AuthRepository {
             )
             let tokens = response.toDomain()
             await tokenStore.save(tokens: tokens)
+            debugLogEmailLoginSuccess(tokens)
             return tokens
         } catch {
-            throw AuthErrorMapper.map(error)
+            let mappedError = AuthErrorMapper.map(error)
+            debugLogEmailLoginFailure(mappedError)
+            throw mappedError
         }
     }
 
@@ -1592,6 +1597,26 @@ final class AuthRepository {
     private func debugLogEmailSignUpFailure(_ error: AuthError) {
 #if DEBUG
         print("[AuthRepository] signUpWithEmail mappedError=\(String(describing: error))")
+#endif
+    }
+
+    private func debugLogEmailLoginRequest(email: String, password: String) {
+#if DEBUG
+        print("[AuthRepository] loginWithEmail requestBody email=\(email) password=\(password)")
+#endif
+    }
+
+    private func debugLogEmailLoginSuccess(_ tokens: AuthTokens) {
+#if DEBUG
+        print(
+            "[AuthRepository] loginWithEmail success userId=\(tokens.user.id) provider=\(tokens.user.provider?.rawValue ?? "nil") status=\(tokens.user.status?.rawValue ?? "nil")"
+        )
+#endif
+    }
+
+    private func debugLogEmailLoginFailure(_ error: AuthError) {
+#if DEBUG
+        print("[AuthRepository] loginWithEmail mappedError=\(String(describing: error))")
 #endif
     }
 }

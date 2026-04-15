@@ -129,7 +129,7 @@ final class AppSessionViewModel: ObservableObject {
         self.container = container
     }
 
-    private func debugLog(_ message: String) {
+    func debugLog(_ message: String) {
         #if DEBUG
         print("[AppSession] \(message)")
         #endif
@@ -1035,11 +1035,14 @@ fileprivate enum PowerViewStateBuilder {
     static func groupGuide() -> GroupPowerGuideViewState {
         GroupPowerGuideViewState(
             title: "그룹 파워 vs 홈 파워",
-            message: "여기 표시되는 파워는 마지막 내전 참여 시점의 스냅샷이에요. 각 멤버의 최신 종합 파워는 프로필에서 확인할 수 있어요."
+            message: "그룹 화면에서는 마지막 내전 기준 스냅샷을 우선 보여주고, 스냅샷이 없으면 최신 종합 파워를 대신 보여줘요. 최신 종합 파워는 프로필에서 확인할 수 있어요."
         )
     }
 
     static func groupMember(member: GroupMember, powerProfile: PowerProfile?) -> GroupMemberPowerRowViewState {
+        // TODO: Replace this latest-profile fallback with group-scoped snapshot power when the
+        // group members API exposes fields such as snapshotPower, snapshotTimestamp, and
+        // preferredPositions. The current response only gives us the member identity + role.
         let source: GroupMemberPowerSource = powerProfile == nil ? .unavailable : .liveFallback
         let powerText = powerProfile.map { String(Int($0.overallPower.rounded())) } ?? "--"
         let powerLabel: String
@@ -1580,6 +1583,151 @@ fileprivate final class PowerDetailViewModel: ObservableObject {
     }
 }
 
+fileprivate struct HomeUpcomingMatchItem: Hashable, Identifiable {
+    let match: Match
+    let groupName: String
+
+    var id: String { match.id }
+}
+
+@MainActor
+fileprivate final class HomeUpcomingMatchesViewModel: ObservableObject {
+    @Published private(set) var state: ScreenLoadState<[HomeUpcomingMatchItem]> = .initial
+
+    private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "home_upcoming_matches")
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+    }
+
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
+
+        state = .loading
+
+        let contexts = session.container.localStore.recentMatches
+        guard !contexts.isEmpty else {
+            state = .empty("추적 중인 예정된 내전이 없습니다.")
+            didSucceed = true
+            return
+        }
+
+        var items: [HomeUpcomingMatchItem] = []
+        for context in contexts {
+            guard let match = try? await session.container.matchRepository.detail(matchID: context.matchID) else { continue }
+            if [.confirmed, .disputed, .closed].contains(match.status) {
+                continue
+            }
+            items.append(HomeUpcomingMatchItem(match: match, groupName: context.groupName))
+        }
+
+        items.sort { lhs, rhs in
+            let leftDate = lhs.match.scheduledAt ?? .distantFuture
+            let rightDate = rhs.match.scheduledAt ?? .distantFuture
+            if leftDate == rightDate {
+                return lhs.groupName < rhs.groupName
+            }
+            return leftDate < rightDate
+        }
+
+        state = items.isEmpty
+            ? .empty("예정된 내전으로 표시할 항목이 없습니다.")
+            : .content(items)
+        didSucceed = true
+    }
+}
+
+@MainActor
+fileprivate final class HomeGroupsViewModel: ObservableObject {
+    @Published private(set) var state: ScreenLoadState<[GroupSummary]> = .initial
+
+    private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "home_groups")
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+    }
+
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
+
+        state = .loading
+
+        do {
+            let groups: [GroupSummary]
+            if session.isGuest {
+                groups = try await session.container.groupRepository.listPublic()
+            } else {
+                let trackedIDs = session.container.localStore.storedGroupIDs
+                groups = trackedIDs.isEmpty ? [] : try await session.container.groupRepository.details(groupIDs: trackedIDs)
+            }
+
+            state = groups.isEmpty
+                ? .empty(session.isGuest ? "표시할 공개 그룹이 없습니다." : "참여 중인 그룹이 없습니다.")
+                : .content(groups)
+            didSucceed = true
+        } catch let error as UserFacingError {
+            if session.isAuthenticated {
+                session.handleProtectedLoadError(
+                    error,
+                    requirement: .groupManagement,
+                    state: &state,
+                    fallbackMessage: "로그인 후 그룹 목록을 다시 확인할 수 있어요."
+                )
+            } else {
+                state = .error(error)
+            }
+        } catch {
+            state = .error(UserFacingError(title: "그룹 목록 로딩 실패", message: "그룹 목록을 불러오지 못했습니다."))
+        }
+    }
+}
+
+@MainActor
+fileprivate final class HomeRecentMatchesViewModel: ObservableObject {
+    @Published private(set) var state: ScreenLoadState<[MatchHistoryItem]> = .initial
+
+    private let session: AppSessionViewModel
+    private let initialLoadTracker = InitialLoadTracker(screen: "home_recent_matches")
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+    }
+
+    func load(force: Bool = false, trigger: String = "unknown") async {
+        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        var didSucceed = false
+        defer { initialLoadTracker.finish(success: didSucceed) }
+
+        guard let userID = session.currentUserID else {
+            state = .empty("로그인 후 최근 경기 전체 목록을 확인할 수 있어요.")
+            didSucceed = true
+            return
+        }
+
+        state = .loading
+        do {
+            let items = try await session.container.profileRepository.history(userID: userID, limit: 30)
+            state = items.isEmpty ? .empty("최근 경기 기록이 없습니다.") : .content(items)
+            didSucceed = true
+        } catch let error as UserFacingError {
+            session.handleProtectedLoadError(
+                error,
+                requirement: .profileHistory,
+                state: &state,
+                fallbackMessage: "로그인 후 최근 경기 전체 목록을 다시 확인할 수 있어요."
+            )
+        } catch {
+            state = .error(UserFacingError(title: "최근 경기 로딩 실패", message: "최근 경기 목록을 불러오지 못했습니다."))
+        }
+    }
+}
+
 // MARK: - Restored Shell View Models
 
 @MainActor
@@ -1746,11 +1894,87 @@ final class RiotAccountsViewModel: ObservableObject {
     @Published var state: ScreenLoadState<RiotAccountSnapshot> = .initial
     @Published var actionState: AsyncActionState = .idle
     @Published var syncInProgressIDs: Set<String> = []
+    @Published var unlinkInProgressIDs: Set<String> = []
+    @Published var isConnecting = false
 
     private let session: AppSessionViewModel
 
     init(session: AppSessionViewModel) {
         self.session = session
+    }
+
+    private var currentAccounts: [RiotAccount] {
+        state.value?.accounts ?? []
+    }
+
+    private func setAccounts(_ accounts: [RiotAccount]) {
+        let snapshot = RiotAccountSnapshot(accounts: accounts, syncInProgressIDs: syncInProgressIDs)
+        state = accounts.isEmpty ? .empty("연결된 Riot 계정이 없습니다.") : .content(snapshot)
+    }
+
+    private func updateAccount(id: String, transform: (RiotAccount) -> RiotAccount) {
+        let updatedAccounts = currentAccounts.map { account in
+            account.id == id ? transform(account) : account
+        }
+        guard updatedAccounts != currentAccounts else { return }
+        setAccounts(updatedAccounts)
+    }
+
+    private func observeSyncStatusesIfNeeded(for accounts: [RiotAccount]) {
+        for account in accounts where account.syncStatus.isInFlight && !syncInProgressIDs.contains(account.id) {
+            syncInProgressIDs.insert(account.id)
+            Task { [weak self] in
+                await self?.pollSyncStatus(for: account.id, showCompletionBanner: false)
+            }
+        }
+    }
+
+    private func pollSyncStatus(for accountID: String, showCompletionBanner: Bool) async {
+        defer { syncInProgressIDs.remove(accountID) }
+
+        for attempt in 0..<6 {
+            if attempt > 0 {
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+            }
+
+            guard session.isAuthenticated else { return }
+
+            do {
+                let syncState = try await session.container.riotRepository.syncStatus(accountID: accountID)
+                var updatedAccount: RiotAccount?
+                updateAccount(id: accountID) { account in
+                    let nextAccount = account.withSyncStatus(syncState)
+                    updatedAccount = nextAccount
+                    return nextAccount
+                }
+
+                guard let updatedAccount else { return }
+                if !syncState.syncStatus.isInFlight {
+                    if showCompletionBanner {
+                        if updatedAccount.syncUIState.isFailure {
+                            actionState = .failure(updatedAccount.syncStatusSummary)
+                        } else {
+                            actionState = .success("동기화가 완료되었습니다")
+                        }
+                    }
+                    return
+                }
+            } catch let error as UserFacingError {
+                if showCompletionBanner {
+                    actionState = .failure(error.message)
+                }
+                return
+            } catch {
+                if showCompletionBanner {
+                    actionState = .failure("동기화 상태를 확인하지 못했습니다")
+                }
+                return
+            }
+        }
+
+        if showCompletionBanner {
+            actionState = .success("동기화 요청이 접수되었습니다. 잠시 후 상태를 다시 확인해 주세요.")
+        }
     }
 
     func load(force: Bool = false) async {
@@ -1762,8 +1986,8 @@ final class RiotAccountsViewModel: ObservableObject {
         state = .loading
         do {
             let accounts = try await session.container.riotRepository.list()
-            let snapshot = RiotAccountSnapshot(accounts: accounts, syncInProgressIDs: syncInProgressIDs)
-            state = accounts.isEmpty ? .empty("연결된 Riot 계정이 없습니다.") : .content(snapshot)
+            setAccounts(accounts)
+            observeSyncStatusesIfNeeded(for: accounts)
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
                 error,
@@ -1776,25 +2000,34 @@ final class RiotAccountsViewModel: ObservableObject {
         }
     }
 
-    func connect(gameName: String, tagLine: String, region: String, isPrimary: Bool) async {
+    func connect(gameName: String, tagLine: String, region: String, isPrimary: Bool) async -> Bool {
         guard session.isAuthenticated else {
             actionState = .failure("로그인 후 Riot 계정을 연결할 수 있어요.")
-            return
+            return false
         }
+
+        let normalizedGameName = RiotAccountInputValidator.normalizedGameName(gameName)
+        let normalizedTagLine = RiotAccountInputValidator.normalizedTagLine(tagLine)
+        isConnecting = true
+        defer { isConnecting = false }
+
         actionState = .inProgress("계정을 연결하는 중입니다")
         do {
             _ = try await session.container.riotRepository.connect(
-                gameName: gameName,
-                tagLine: tagLine,
-                region: region,
+                gameName: normalizedGameName,
+                tagLine: normalizedTagLine,
+                region: region.lowercased(),
                 isPrimary: isPrimary
             )
             actionState = .success("계정이 연결되었습니다")
             await load(force: true)
+            return true
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
+            return false
         } catch {
             actionState = .failure("계정 연결에 실패했습니다")
+            return false
         }
     }
 
@@ -1806,16 +2039,49 @@ final class RiotAccountsViewModel: ObservableObject {
         syncInProgressIDs.insert(id)
         actionState = .inProgress("동기화를 요청하는 중입니다")
         do {
-            try await session.container.riotRepository.sync(accountID: id)
+            let requestedAt = Date()
+            let accepted = try await session.container.riotRepository.sync(accountID: id)
+            updateAccount(id: id) { account in
+                account.withSyncAccepted(accepted, requestedAt: requestedAt)
+            }
             session.container.localStore.appendNotification(title: "Riot 동기화 요청", body: "Riot 계정 동기화가 큐에 등록되었습니다.", symbol: "arrow.clockwise")
             actionState = .success("동기화 요청을 보냈습니다")
+            await pollSyncStatus(for: id, showCompletionBanner: true)
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
+            syncInProgressIDs.remove(id)
         } catch {
             actionState = .failure("동기화 요청에 실패했습니다")
+            syncInProgressIDs.remove(id)
         }
-        syncInProgressIDs.remove(id)
-        await load(force: true)
+    }
+
+    func unlink(account: RiotAccount) async {
+        guard session.isAuthenticated else {
+            actionState = .failure("로그인 후 Riot 계정 연결을 해제할 수 있어요.")
+            return
+        }
+        guard !unlinkInProgressIDs.contains(account.id) else { return }
+
+        let previousAccounts = currentAccounts
+        unlinkInProgressIDs.insert(account.id)
+        syncInProgressIDs.remove(account.id)
+        setAccounts(previousAccounts.filter { $0.id != account.id })
+        actionState = .inProgress("계정 연결을 해제하는 중입니다")
+
+        do {
+            try await session.container.riotRepository.unlink(accountID: account.id)
+            actionState = .success("계정 연결이 해제되었습니다")
+            await load(force: true)
+        } catch let error as UserFacingError {
+            setAccounts(previousAccounts)
+            session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
+        } catch {
+            setAccounts(previousAccounts)
+            actionState = .failure("계정 연결 해제에 실패했습니다")
+        }
+
+        unlinkInProgressIDs.remove(account.id)
     }
 }
 
@@ -1889,27 +2155,26 @@ struct AppShellView: View {
 
     var body: some View {
         NavigationStack(path: $router.path) {
-            VStack(spacing: 0) {
-                rootContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                AppTabBar(selectedTab: session.selectedTab) { tab in
-                    session.selectedTab = tab
-                    Task {
-                        await loadSelectedTab()
+            rootContent
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    AppTabBar(selectedTab: session.selectedTab) { tab in
+                        session.selectedTab = tab
+                        Task {
+                            await loadSelectedTab()
+                        }
                     }
                 }
-            }
-            .navigationDestination(for: AppRoute.self) { route in
-                destinationView(route)
-            }
-            .sheet(item: $session.authPrompt) { prompt in
-                AuthGateSheet(session: session, prompt: prompt)
-            }
-            .task(id: session.dataScopeKey) {
-                resetViewModelsForSessionChange()
-                await loadSelectedTab(force: true)
-            }
+                .navigationDestination(for: AppRoute.self) { route in
+                    destinationView(route)
+                }
+                .sheet(item: $session.authPrompt) { prompt in
+                    AuthGateSheet(session: session, prompt: prompt)
+                }
+                .task(id: session.dataScopeKey) {
+                    resetViewModelsForSessionChange()
+                    await loadSelectedTab(force: true)
+                }
         }
     }
 
@@ -1938,6 +2203,30 @@ struct AppShellView: View {
             RiotAccountsScreen(viewModel: RiotAccountsViewModel(session: session), session: session, onBack: router.pop)
         case .settings:
             SettingsScreen(session: session, router: router, onBack: router.pop)
+        case .homeUpcomingMatches:
+            HomeUpcomingMatchesScreen(
+                viewModel: HomeUpcomingMatchesViewModel(session: session),
+                router: router,
+                onBack: router.pop
+            )
+        case .homeGroups:
+            HomeGroupsScreen(
+                viewModel: HomeGroupsViewModel(session: session),
+                session: session,
+                router: router,
+                onBack: router.pop
+            )
+        case .powerDetail:
+            PowerDetailScreen(
+                viewModel: PowerDetailViewModel(session: session),
+                onBack: router.pop
+            )
+        case .homeRecentMatches:
+            HomeRecentMatchesScreen(
+                viewModel: HomeRecentMatchesViewModel(session: session),
+                router: router,
+                onBack: router.pop
+            )
         case let .groupDetail(groupID):
             GroupDetailScreen(viewModel: GroupDetailViewModel(session: session, groupID: groupID), router: router)
         case let .matchLobby(groupID, matchID):
@@ -2026,23 +2315,24 @@ struct HomeScreen: View {
     @ObservedObject var router: AppRouter
 
     var body: some View {
-        content
-            .task { await viewModel.load() }
-            .navigationTitle("내전 메이커")
-            .toolbar {
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    Button {
-                        session.openProtectedRoute(.notifications, requirement: .notifications, router: router)
-                    } label: {
-                        Image(systemName: "bell")
-                    }
+        TabRootScaffold(
+            title: "내전 메이커",
+            leadingAction: notificationsHeaderAction,
+            trailingAction: searchHeaderAction
+        ) {
+            content
+                .task { await viewModel.load() }
+        }
+    }
 
-                    Button {} label: {
-                        Image(systemName: "magnifyingglass")
-                    }
-                }
-            }
-            .appNavigationBarStyle(.large)
+    private var notificationsHeaderAction: TabHeaderAction {
+        TabHeaderAction(systemName: "bell", accessibilityLabel: "알림") {
+            session.openProtectedRoute(.notifications, requirement: .notifications, router: router)
+        }
+    }
+
+    private var searchHeaderAction: TabHeaderAction {
+        TabHeaderAction(systemName: "magnifyingglass", accessibilityLabel: "검색") {}
     }
 
     @ViewBuilder
@@ -2118,88 +2408,100 @@ struct HomeScreen: View {
                             }
                         }
 
-                        SectionHeaderView(title: "예정된 내전") {}
-                        if let match = currentMatch {
-                            Button {
-                                router.push(.matchLobby(groupID: match.groupID, matchID: match.id))
-                            } label: {
-                                VStack(alignment: .leading, spacing: 8) {
-                                    HStack {
-                                        Text(groups.first(where: { $0.id == match.groupID })?.name ?? "롤내전모임")
-                                            .font(AppTypography.body(14, weight: .semibold))
-                                        Spacer()
-                                        Text(match.scheduledAt?.shortDateText ?? "예정 미정")
-                                            .font(AppTypography.body(12, weight: .semibold))
-                                            .foregroundStyle(AppPalette.accentBlue)
-                                    }
-                                    Text("\(match.acceptedCount)/10명 모집 중 · TOP, SUP 필요")
-                                        .font(AppTypography.body(11))
-                                        .foregroundStyle(AppPalette.textSecondary)
-                                    ProgressView(value: Double(match.acceptedCount), total: 10)
-                                        .tint(AppPalette.accentBlue)
-                                }
-                                .padding(16)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(AppPalette.bgCard)
-                                .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
-                                .clipShape(RoundedRectangle(cornerRadius: 12))
-                            }
-                            .buttonStyle(.plain)
-                        }
-
-                        SectionHeaderView(title: "최근 참여 그룹")
-                        HStack(spacing: 10) {
-                            ForEach(Array(groups.prefix(2))) { group in
+                        homeContentSection(title: "예정된 내전") {
+                            openHomeSection(.homeUpcomingMatches, section: "예정된 내전", destination: "전체 예정 내전 목록")
+                        } content: {
+                            if let match = currentMatch {
                                 Button {
-                                    session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                    router.push(.matchLobby(groupID: match.groupID, matchID: match.id))
                                 } label: {
                                     VStack(alignment: .leading, spacing: 8) {
-                                        Text(group.name)
-                                            .font(AppTypography.body(13, weight: .semibold))
-                                            .foregroundStyle(AppPalette.textPrimary)
-                                            .lineLimit(1)
-                                        Text("\(group.memberCount)명 · \(group.tags.first ?? "서울")")
-                                            .font(AppTypography.body(10))
-                                            .foregroundStyle(AppPalette.textMuted)
-                                        Text(group.description ?? "최근 내전 준비 중")
-                                            .font(AppTypography.body(10))
+                                        HStack {
+                                            Text(groups.first(where: { $0.id == match.groupID })?.name ?? "롤내전모임")
+                                                .font(AppTypography.body(14, weight: .semibold))
+                                            Spacer()
+                                            Text(match.scheduledAt?.shortDateText ?? "예정 미정")
+                                                .font(AppTypography.body(12, weight: .semibold))
+                                                .foregroundStyle(AppPalette.accentBlue)
+                                        }
+                                        Text("\(match.acceptedCount)/10명 모집 중 · TOP, SUP 필요")
+                                            .font(AppTypography.body(11))
                                             .foregroundStyle(AppPalette.textSecondary)
-                                            .lineLimit(2)
+                                        ProgressView(value: Double(match.acceptedCount), total: 10)
+                                            .tint(AppPalette.accentBlue)
                                     }
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 14)
+                                    .padding(16)
                                     .frame(maxWidth: .infinity, alignment: .leading)
-                                    .appPanel(background: AppPalette.bgCard, radius: 12)
+                                    .background(AppPalette.bgCard)
+                                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
+                                    .clipShape(RoundedRectangle(cornerRadius: 12))
                                 }
                                 .buttonStyle(.plain)
                             }
                         }
 
+                        homeContentSection(title: "최근 참여 그룹") {
+                            openHomeSection(.homeGroups, section: "최근 참여 그룹", destination: "전체 그룹/참여 그룹 목록")
+                        } content: {
+                            HStack(spacing: 10) {
+                                ForEach(Array(groups.prefix(2))) { group in
+                                    Button {
+                                        session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 8) {
+                                            Text(group.name)
+                                                .font(AppTypography.body(13, weight: .semibold))
+                                                .foregroundStyle(AppPalette.textPrimary)
+                                                .lineLimit(1)
+                                            Text("\(group.memberCount)명 · \(group.tags.first ?? "서울")")
+                                                .font(AppTypography.body(10))
+                                                .foregroundStyle(AppPalette.textMuted)
+                                            Text(group.description ?? "최근 내전 준비 중")
+                                                .font(AppTypography.body(10))
+                                                .foregroundStyle(AppPalette.textSecondary)
+                                                .lineLimit(2)
+                                        }
+                                        .padding(.horizontal, 12)
+                                        .padding(.vertical, 14)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .appPanel(background: AppPalette.bgCard, radius: 12)
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                        }
+
                         switch contentState {
                         case let .authenticated(snapshot):
-                            SectionHeaderView(title: "내 파워 프로필")
-                            powerSummaryCard(profile: snapshot.profile, power: snapshot.power)
+                            homeContentSection(title: "내 파워 프로필", trailing: "상세 보기 >") {
+                                openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
+                            } content: {
+                                powerSummaryCard(profile: snapshot.profile, power: snapshot.power)
+                            }
 
-                            SectionHeaderView(title: "최근 경기")
-                            if let latestHistory = snapshot.latestHistory {
-                                MatchCardView(
-                                    title: snapshot.groups.first?.name ?? "롤내전모임",
-                                    dateText: latestHistory.scheduledAt.dottedDateText,
-                                    isWin: latestHistory.result == "WIN",
-                                    blueSummary: "블루 팀",
-                                    redSummary: "레드 팀",
-                                    detail: "KDA \(latestHistory.kda) · MMR \(Int(latestHistory.deltaMMR))"
-                                )
-                            } else {
-                                guestBenefitCard(
-                                    title: "아직 계정 기록이 없어요",
-                                    message: "경기 결과를 저장하면 최근 내전 성적이 여기에 쌓입니다.",
-                                    buttonTitle: "결과 입력하러 가기"
-                                ) {
-                                    if let match = currentMatch {
-                                        router.push(.matchResult(matchID: match.id))
-                                    } else {
-                                        router.push(.resultPreview)
+                            homeContentSection(title: "최근 경기") {
+                                openHomeSection(.homeRecentMatches, section: "최근 경기", destination: "최근 경기 전체 목록")
+                            } content: {
+                                if let latestHistory = snapshot.latestHistory {
+                                    MatchCardView(
+                                        title: snapshot.groups.first?.name ?? "롤내전모임",
+                                        dateText: latestHistory.scheduledAt.dottedDateText,
+                                        isWin: latestHistory.result == "WIN",
+                                        blueSummary: "블루 팀",
+                                        redSummary: "레드 팀",
+                                        detail: "KDA \(latestHistory.kda) · MMR \(Int(latestHistory.deltaMMR))"
+                                    )
+                                } else {
+                                    guestBenefitCard(
+                                        title: "아직 계정 기록이 없어요",
+                                        message: "경기 결과를 저장하면 최근 내전 성적이 여기에 쌓입니다.",
+                                        buttonTitle: "결과 입력하러 가기"
+                                    ) {
+                                        if let match = currentMatch {
+                                            router.push(.matchResult(matchID: match.id))
+                                        } else {
+                                            router.push(.resultPreview)
+                                        }
                                     }
                                 }
                             }
@@ -2265,6 +2567,13 @@ struct HomeScreen: View {
         .buttonStyle(.plain)
     }
 
+    private func openHomeSection(_ route: AppRoute, section: String, destination: String) {
+        #if DEBUG
+        print("[HomeSectionMore] section=\(section) destination=\(destination)")
+        #endif
+        router.push(route)
+    }
+
     private func groups(for content: HomeContentState) -> [GroupSummary] {
         switch content {
         case let .guest(snapshot):
@@ -2283,31 +2592,79 @@ struct HomeScreen: View {
         }
     }
 
-    private func powerSummaryCard(profile: UserProfile, power: PowerProfile?) -> some View {
-        HStack(spacing: 18) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("\(Int((power?.overallPower ?? 76).rounded()))")
-                    .font(AppTypography.heading(40, weight: .heavy))
-                    .foregroundStyle(AppPalette.accentBlue)
-                Text("종합 파워")
-                    .font(AppTypography.body(11))
-                    .foregroundStyle(AppPalette.textMuted)
-                Text(profile.nickname)
-                    .font(AppTypography.body(12, weight: .semibold))
-                    .foregroundStyle(AppPalette.textSecondary)
-            }
-
-            VStack(alignment: .leading, spacing: 7) {
-                statRow(label: "최근 폼", value: Int((power?.formScore ?? 76).rounded()), tint: AppPalette.textPrimary)
-                statRow(label: "안정성", value: Int((power?.stability ?? 82).rounded()), tint: AppPalette.textSecondary)
-                statRow(label: "캐리 기여", value: Int((power?.carry ?? 71).rounded()), tint: AppPalette.textSecondary)
-                statRow(label: "팀 기여도", value: Int((power?.teamContribution ?? 85).rounded()), tint: AppPalette.textSecondary)
-                statRow(label: "내전 MMR", value: Int((power?.inhouseMMR ?? 1420).rounded()), tint: AppPalette.accentGold)
-            }
+    private func homeContentSection<Content: View>(
+        title: String,
+        trailing: String = "더보기",
+        onTap: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            SectionHeaderView(title: title, trailing: trailing, onTap: onTap)
+            content()
         }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+
+    private func powerSummaryCard(profile: UserProfile, power: PowerProfile?) -> some View {
+        let overview = PowerViewStateBuilder.home(power: power).overview
+
+        return Button {
+            openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
+        } label: {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .top) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(overview.scoreText)
+                            .font(AppTypography.heading(42, weight: .heavy))
+                            .foregroundStyle(AppPalette.accentBlue)
+                        Text(overview.scoreLabel)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.textMuted)
+                    }
+
+                    Spacer(minLength: 16)
+
+                    VStack(alignment: .trailing, spacing: 8) {
+                        if let delta = overview.change {
+                            powerHomeDeltaBadge(delta, caption: overview.changeCaptionText)
+                        }
+
+                        if let percentileText = overview.percentileText {
+                            Text(percentileText)
+                                .font(AppTypography.body(11, weight: .semibold))
+                                .foregroundStyle(AppPalette.accentGold)
+                        }
+                    }
+                }
+
+                Text(overview.isPlaceholder ? "\(profile.nickname)님의 경기 결과가 쌓이면 파워가 계산돼요." : overview.insightText)
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 6) {
+                    Text("상세 보기")
+                        .font(AppTypography.body(13, weight: .semibold))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                }
+                .foregroundStyle(AppPalette.textPrimary)
+            }
+            .padding(18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                LinearGradient(
+                    colors: [Color(hex: 0x16284C), Color(hex: 0x111824)],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+        .buttonStyle(.plain)
     }
 
     private func guestBenefitCard(title: String, message: String, buttonTitle: String, action: @escaping () -> Void) -> some View {
@@ -2327,15 +2684,833 @@ struct HomeScreen: View {
         .appPanel(background: AppPalette.bgCard, radius: 12)
     }
 
-    private func statRow(label: String, value: Int, tint: Color) -> some View {
-        HStack {
-            Text(label)
+    private func powerHomeDeltaBadge(_ delta: PowerDeltaViewState, caption: String?) -> some View {
+        HStack(spacing: 4) {
+            if let symbolName = delta.symbolName {
+                Image(systemName: symbolName)
+                    .font(.system(size: 9, weight: .bold))
+            }
+            Text(delta.text)
+                .font(AppTypography.body(11, weight: .semibold))
+            if let caption {
+                Text(caption)
+                    .font(AppTypography.body(10, weight: .medium))
+            }
+        }
+        .foregroundStyle(delta.tone.color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(delta.tone.badgeBackground)
+        .clipShape(Capsule())
+    }
+}
+
+fileprivate struct PowerMetricBar: View {
+    let progress: Double
+    let tint: Color
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .leading) {
+                Capsule(style: .continuous)
+                    .fill(AppPalette.border.opacity(0.88))
+                Capsule(style: .continuous)
+                    .fill(tint)
+                    .frame(width: max(16, geometry.size.width * max(0.08, min(progress, 1))))
+            }
+        }
+        .frame(height: 4)
+    }
+}
+
+fileprivate struct PowerSection<Content: View>: View {
+    let title: String
+    let spacing: CGFloat
+    let content: Content
+
+    init(title: String, spacing: CGFloat = 10, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.spacing = spacing
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: spacing) {
+            Text(title)
+                .font(AppTypography.heading(17, weight: .bold))
+                .foregroundStyle(AppPalette.textPrimary)
+            content
+        }
+    }
+}
+
+fileprivate struct GroupPowerGuideCard: View {
+    let guide: GroupPowerGuideViewState
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle.fill")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(AppPalette.accentBlue)
+                Text(guide.title)
+                    .font(AppTypography.body(13, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+            }
+
+            Text(guide.message)
                 .font(AppTypography.body(12))
                 .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(hex: 0x101B31))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(AppPalette.accentBlue.opacity(0.72), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+fileprivate struct GroupPowerMemberRow: View {
+    let row: GroupMemberPowerRowViewState
+
+    private var powerColor: Color {
+        switch row.source {
+        case .snapshot:
+            return AppPalette.accentBlue
+        case .liveFallback:
+            return AppPalette.accentBlue
+        case .unavailable:
+            return AppPalette.textMuted
+        }
+    }
+
+    private var labelColor: Color {
+        switch row.source {
+        case .snapshot:
+            return AppPalette.textMuted
+        case .liveFallback:
+            return AppPalette.textMuted
+        case .unavailable:
+            return AppPalette.textMuted
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Circle()
+                .fill(AppPalette.bgElevated)
+                .frame(width: 36, height: 36)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.name)
+                    .font(AppTypography.body(14, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text(row.subtitle)
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .lineLimit(1)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text(row.powerText)
+                    .font(AppTypography.heading(20, weight: .bold))
+                    .foregroundStyle(powerColor)
+                Text(row.powerLabel)
+                    .font(AppTypography.body(10))
+                    .foregroundStyle(labelColor)
+            }
+        }
+        .padding(.horizontal, 12)
+        .frame(height: 56)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+fileprivate struct DimmedBottomSheet<Content: View>: View {
+    let title: String
+    let onDismiss: () -> Void
+    var maxHeightRatio: CGFloat = 0.72
+    let content: Content
+
+    @GestureState private var dragOffset: CGFloat = 0
+
+    init(
+        title: String,
+        onDismiss: @escaping () -> Void,
+        maxHeightRatio: CGFloat = 0.72,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.onDismiss = onDismiss
+        self.maxHeightRatio = maxHeightRatio
+        self.content = content()
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .bottom) {
+                Color.black.opacity(0.62)
+                    .ignoresSafeArea()
+                    .onTapGesture(perform: dismiss)
+
+                VStack(spacing: 0) {
+                    Capsule(style: .continuous)
+                        .fill(Color.white.opacity(0.18))
+                        .frame(width: 38, height: 5)
+                        .padding(.top, 10)
+                        .padding(.bottom, 14)
+
+                    HStack {
+                        Text(title)
+                            .font(AppTypography.heading(18, weight: .bold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                        Spacer()
+                        Button(action: dismiss) {
+                            Image(systemName: "xmark")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(AppPalette.textMuted)
+                                .frame(width: 28, height: 28)
+                                .background(AppPalette.bgTertiary.opacity(0.92))
+                                .clipShape(Circle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 14)
+
+                    ScrollView(showsIndicators: false) {
+                        content
+                            .padding(.horizontal, 20)
+                            .padding(.bottom, 24)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(
+                    maxHeight: min(geometry.size.height - 20, max(320, geometry.size.height * maxHeightRatio)),
+                    alignment: .top
+                )
+                .background(AppPalette.bgSecondary)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(Color.white.opacity(0.06), lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .padding(.horizontal, 10)
+                .padding(.bottom, 10)
+                .offset(y: dragOffset)
+                .gesture(
+                    DragGesture(minimumDistance: 10)
+                        .updating($dragOffset) { value, state, _ in
+                            if value.translation.height > 0 {
+                                state = value.translation.height
+                            }
+                        }
+                        .onEnded { value in
+                            if value.translation.height > 120 {
+                                dismiss()
+                            }
+                        }
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+    }
+
+    private func dismiss() {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+            onDismiss()
+        }
+    }
+}
+
+fileprivate struct HomeUpcomingMatchesScreen: View {
+    @StateObject private var viewModel: HomeUpcomingMatchesViewModel
+    @ObservedObject var router: AppRouter
+    let onBack: () -> Void
+
+    init(viewModel: HomeUpcomingMatchesViewModel, router: AppRouter, onBack: @escaping () -> Void) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.router = router
+        self.onBack = onBack
+    }
+
+    var body: some View {
+        screenScaffold(title: "예정된 내전", onBack: onBack, rightSystemImage: nil) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "예정된 내전을 불러오는 중입니다")
+                        .task { await viewModel.load(trigger: "screen_appear") }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: "retry") } }
+                case let .empty(message):
+                    EmptyStateView(title: "예정된 내전", message: message)
+                case let .content(items), let .refreshing(items):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 12) {
+                            ForEach(items) { item in
+                                Button {
+                                    #if DEBUG
+                                    print("[HomeSectionMore] itemTap=예정된 내전 matchID=\(item.match.id)")
+                                    #endif
+                                    router.push(.matchLobby(groupID: item.match.groupID, matchID: item.match.id))
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        HStack(spacing: 10) {
+                                            Text(item.groupName)
+                                                .font(AppTypography.body(15, weight: .semibold))
+                                                .foregroundStyle(AppPalette.textPrimary)
+                                            Spacer()
+                                            Text(item.match.scheduledAt?.shortDateText ?? "예정 미정")
+                                                .font(AppTypography.body(12, weight: .semibold))
+                                                .foregroundStyle(AppPalette.accentBlue)
+                                        }
+
+                                        HStack(spacing: 10) {
+                                            upcomingMatchBadge(item.match.status.title, tint: item.match.status.tint)
+                                            Text("\(item.match.acceptedCount)/10명 참여")
+                                                .font(AppTypography.body(12))
+                                                .foregroundStyle(AppPalette.textSecondary)
+                                        }
+
+                                        ProgressView(value: Double(item.match.acceptedCount), total: 10)
+                                            .tint(AppPalette.accentBlue)
+                                    }
+                                    .padding(16)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .appPanel(background: AppPalette.bgCard, radius: 12)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(24)
+                    }
+                }
+            }
+        }
+    }
+
+    private func upcomingMatchBadge(_ title: String, tint: Color) -> some View {
+        Text(title)
+            .font(AppTypography.body(11, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+            .background(AppPalette.bgTertiary)
+            .clipShape(Capsule())
+    }
+}
+
+fileprivate struct HomeGroupsScreen: View {
+    @StateObject private var viewModel: HomeGroupsViewModel
+    @ObservedObject var session: AppSessionViewModel
+    @ObservedObject var router: AppRouter
+    let onBack: () -> Void
+
+    init(
+        viewModel: HomeGroupsViewModel,
+        session: AppSessionViewModel,
+        router: AppRouter,
+        onBack: @escaping () -> Void
+    ) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.session = session
+        self.router = router
+        self.onBack = onBack
+    }
+
+    var body: some View {
+        screenScaffold(title: "참여 그룹", onBack: onBack, rightSystemImage: nil) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "그룹 목록을 불러오는 중입니다")
+                        .task { await viewModel.load(trigger: "screen_appear") }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: "retry") } }
+                case let .empty(message):
+                    EmptyStateView(title: "참여 그룹", message: message)
+                case let .content(groups), let .refreshing(groups):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 12) {
+                            ForEach(groups) { group in
+                                Button {
+                                    #if DEBUG
+                                    print("[HomeSectionMore] itemTap=최근 참여 그룹 groupID=\(group.id)")
+                                    #endif
+                                    session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                } label: {
+                                    VStack(alignment: .leading, spacing: 10) {
+                                        HStack {
+                                            Text(group.name)
+                                                .font(AppTypography.body(16, weight: .semibold))
+                                                .foregroundStyle(AppPalette.textPrimary)
+                                            Spacer()
+                                            if let firstTag = group.tags.first {
+                                                Text(firstTag)
+                                                    .font(AppTypography.body(11, weight: .semibold))
+                                                    .foregroundStyle(AppPalette.accentGreen)
+                                                    .padding(.horizontal, 8)
+                                                    .padding(.vertical, 3)
+                                                    .background(AppPalette.bgTertiary)
+                                                    .clipShape(Capsule())
+                                            }
+                                        }
+                                        Text("멤버 \(group.memberCount)명 · 최근 내전 \(group.recentMatches)회")
+                                            .font(AppTypography.body(12))
+                                            .foregroundStyle(AppPalette.textSecondary)
+                                        if let description = group.description, !description.isEmpty {
+                                            Text(description)
+                                                .font(AppTypography.body(12))
+                                                .foregroundStyle(AppPalette.textMuted)
+                                                .lineLimit(2)
+                                        }
+                                    }
+                                    .padding(16)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .appPanel(background: AppPalette.bgCard, radius: 12)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(24)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fileprivate struct PowerDetailScreen: View {
+    @StateObject private var viewModel: PowerDetailViewModel
+    let onBack: () -> Void
+    @State private var showsCalculationSheet = false
+
+    init(viewModel: PowerDetailViewModel, onBack: @escaping () -> Void) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.onBack = onBack
+    }
+
+    var body: some View {
+        screenScaffold(title: "파워 상세", onBack: onBack, rightSystemImage: nil) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "파워 프로필을 불러오는 중입니다")
+                        .task { await viewModel.load(trigger: "screen_appear") }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: "retry") } }
+                case let .empty(message):
+                    EmptyStateView(title: "파워 상세", message: message)
+                case let .content(detail), let .refreshing(detail):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 18) {
+                            overviewCard(detail.overview)
+                            insightCard(detail.overview.insightText)
+
+                            PowerSection(title: "파워 구성 요소", spacing: 8) {
+                                VStack(spacing: 8) {
+                                    ForEach(detail.overview.components) { component in
+                                        componentRow(component)
+                                    }
+                                }
+                            }
+
+                            PowerSection(title: "최근 변화 내역", spacing: 8) {
+                                VStack(spacing: 8) {
+                                    ForEach(detail.timeline) { item in
+                                        timelineRow(item)
+                                    }
+                                }
+                            }
+
+                            PowerSection(title: "파워 올리는 방법", spacing: 8) {
+                                VStack(spacing: 8) {
+                                    ForEach(detail.tips) { tip in
+                                        tipRow(tip)
+                                    }
+                                }
+                            }
+
+                            Button {
+                                withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+                                    showsCalculationSheet = true
+                                }
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Image(systemName: "sparkles.rectangle.stack")
+                                        .font(.system(size: 14, weight: .semibold))
+                                    Text("파워 계산 방식 자세히 보기")
+                                        .font(AppTypography.body(14, weight: .semibold))
+                                }
+                                .foregroundStyle(AppPalette.accentBlue)
+                                .frame(maxWidth: .infinity)
+                                .frame(height: 48)
+                                .background(AppPalette.bgCard)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                        .stroke(AppPalette.border, lineWidth: 1)
+                                )
+                                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+
+                            PowerSection(title: "자주 묻는 질문", spacing: 8) {
+                                VStack(spacing: 8) {
+                                    ForEach(detail.faqs) { faq in
+                                        faqRow(faq)
+                                    }
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        .padding(.bottom, 24)
+                    }
+                }
+            }
+        }
+        .overlay {
+            if showsCalculationSheet {
+                let sheetState = (viewModel.state.value?.calculationSheet) ?? PowerViewStateBuilder.calculationSheet()
+                DimmedBottomSheet(
+                    title: sheetState.title,
+                    onDismiss: { showsCalculationSheet = false },
+                    maxHeightRatio: 0.66
+                ) {
+                    calculationSheetContent(sheetState)
+                }
+            }
+        }
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsCalculationSheet)
+    }
+
+    private func overviewCard(_ overview: PowerOverviewViewState) -> some View {
+        VStack(spacing: 12) {
+            Text(overview.scoreText)
+                .font(AppTypography.heading(54, weight: .heavy))
+                .foregroundStyle(AppPalette.accentBlue)
+            Text(overview.scoreLabel)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textMuted)
+            if let tierText = overview.tierText {
+                Text(tierText)
+                    .font(AppTypography.body(11, weight: .semibold))
+                    .foregroundStyle(AppPalette.bgPrimary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(AppPalette.accentBlue)
+                    .clipShape(Capsule())
+            }
+            HStack(spacing: 8) {
+                if let delta = overview.change {
+                    deltaBadge(delta, caption: overview.changeCaptionText)
+                }
+                if let percentileText = overview.percentileText {
+                    Text(percentileText)
+                        .font(AppTypography.body(11, weight: .semibold))
+                        .foregroundStyle(AppPalette.accentGold)
+                }
+            }
+            .frame(maxWidth: .infinity)
+            Text(overview.supportingText)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .multilineTextAlignment(.center)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 24)
+        .frame(maxWidth: .infinity)
+        .background(
+            LinearGradient(
+                colors: [Color(hex: 0x152748), Color(hex: 0x101826)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+    }
+
+    private func insightCard(_ insightText: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "lightbulb.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(AppPalette.accentGold)
+                .frame(width: 18, height: 18)
+            Text(insightText)
+                .font(AppTypography.body(12, weight: .medium))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func componentRow(_ component: PowerComponentRowViewState) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(component.tone.color)
+                    .frame(width: 7, height: 7)
+                Text(component.title)
+                    .font(AppTypography.body(13, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Spacer()
+                Text(component.scoreText)
+                    .font(AppTypography.body(18, weight: .bold))
+                    .foregroundStyle(component.tone.color)
+                if let delta = component.delta {
+                    Text(delta.text)
+                        .font(AppTypography.body(11, weight: .semibold))
+                        .foregroundStyle(delta.tone.color)
+                }
+            }
+            PowerMetricBar(progress: component.progress, tint: component.tone.color)
+            Text(component.description)
+                .font(AppTypography.body(11))
+                .foregroundStyle(AppPalette.textSecondary)
+        }
+        .padding(14)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func timelineRow(_ item: PowerTimelineItemViewState) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Circle()
+                .fill(item.tone.color)
+                .frame(width: 8, height: 8)
+                .padding(.top, 6)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(item.title)
+                        .font(AppTypography.body(13, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                    Spacer()
+                    Text(item.metricText)
+                        .font(AppTypography.body(11, weight: .semibold))
+                        .foregroundStyle(item.tone.color)
+                }
+                Text(item.description)
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func tipRow(_ tip: PowerTipItemViewState) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            ZStack {
+                Circle()
+                    .fill(tip.tone.badgeBackground)
+                    .frame(width: 30, height: 30)
+                Image(systemName: tip.symbolName)
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(tip.tone.color)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(tip.title)
+                    .font(AppTypography.body(13, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text(tip.description)
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
+            }
             Spacer()
-            Text("\(value)")
-                .font(AppTypography.body(12, weight: .semibold))
-                .foregroundStyle(tint)
+        }
+        .padding(14)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func faqRow(_ faq: PowerFAQItemViewState) -> some View {
+        HStack(spacing: 12) {
+            Text(faq.question)
+                .font(AppTypography.body(13, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(AppPalette.textMuted)
+        }
+        .padding(14)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func calculationSheetContent(_ state: PowerCalculationSheetViewState) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(state.summaryText)
+                    .font(AppTypography.body(14, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text(state.highlightText)
+                    .font(AppTypography.body(12, weight: .medium))
+                    .foregroundStyle(AppPalette.textPrimary)
+            }
+            .padding(16)
+            .background(AppPalette.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+            Text("구성 요소별 설명")
+                .font(AppTypography.heading(16, weight: .bold))
+                .foregroundStyle(AppPalette.textPrimary)
+
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(state.factors) { factor in
+                    HStack(alignment: .top, spacing: 12) {
+                        Circle()
+                            .fill(factor.tone.color)
+                            .frame(width: 8, height: 8)
+                            .padding(.top, 6)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(factor.title)
+                                .font(AppTypography.body(13, weight: .semibold))
+                                .foregroundStyle(AppPalette.textPrimary)
+                            Text(factor.description)
+                                .font(AppTypography.body(12))
+                                .foregroundStyle(AppPalette.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(state.noteTitle)
+                    .font(AppTypography.body(13, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                ForEach(state.notes, id: \.self) { note in
+                    Text(note)
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(16)
+            .background(AppPalette.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        }
+    }
+
+    private func deltaBadge(_ delta: PowerDeltaViewState, caption: String? = nil) -> some View {
+        HStack(spacing: 4) {
+            if let symbolName = delta.symbolName {
+                Image(systemName: symbolName)
+                    .font(.system(size: 10, weight: .bold))
+            }
+            Text(delta.text)
+                .font(AppTypography.body(11, weight: .semibold))
+            if let caption {
+                Text(caption)
+                    .font(AppTypography.body(10, weight: .medium))
+            }
+        }
+        .foregroundStyle(delta.tone.color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(delta.tone.badgeBackground)
+        .clipShape(Capsule())
+    }
+}
+
+fileprivate struct HomeRecentMatchesScreen: View {
+    @StateObject private var viewModel: HomeRecentMatchesViewModel
+    @ObservedObject var router: AppRouter
+    let onBack: () -> Void
+
+    init(viewModel: HomeRecentMatchesViewModel, router: AppRouter, onBack: @escaping () -> Void) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.router = router
+        self.onBack = onBack
+    }
+
+    var body: some View {
+        screenScaffold(title: "최근 경기", onBack: onBack, rightSystemImage: nil) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "최근 경기 목록을 불러오는 중입니다")
+                        .task { await viewModel.load(trigger: "screen_appear") }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: "retry") } }
+                case let .empty(message):
+                    EmptyStateView(title: "최근 경기", message: message)
+                case let .content(items), let .refreshing(items):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 12) {
+                            ForEach(items) { item in
+                                Button {
+                                    #if DEBUG
+                                    print("[HomeSectionMore] itemTap=최근 경기 matchID=\(item.matchID)")
+                                    #endif
+                                    router.push(.matchDetail(matchID: item.matchID))
+                                } label: {
+                                    MatchCardView(
+                                        title: item.role.shortLabel,
+                                        dateText: item.scheduledAt.dottedDateText,
+                                        isWin: item.result == "WIN",
+                                        blueSummary: "블루 팀",
+                                        redSummary: "레드 팀",
+                                        detail: "KDA \(item.kda) · MMR \(Int(item.deltaMMR))"
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(24)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fileprivate extension MatchStatus {
+    var title: String {
+        switch self {
+        case .draft: return "드래프트"
+        case .recruiting: return "모집 중"
+        case .locked: return "확정 대기"
+        case .balanced: return "밸런스 완료"
+        case .inProgress: return "진행 중"
+        case .resultPending: return "결과 대기"
+        case .confirmed: return "확정"
+        case .disputed: return "이의 제기"
+        case .closed: return "종료"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .draft: return AppPalette.textMuted
+        case .recruiting: return AppPalette.accentBlue
+        case .locked: return AppPalette.accentGold
+        case .balanced: return AppPalette.accentGreen
+        case .inProgress: return AppPalette.accentPurple
+        case .resultPending: return AppPalette.accentOrange
+        case .confirmed: return AppPalette.accentGreen
+        case .disputed: return AppPalette.accentRed
+        case .closed: return AppPalette.textMuted
         }
     }
 }
@@ -2350,74 +3525,70 @@ struct GroupMainScreen: View {
     @State private var newGroupTags = "빡겜,서울"
 
     var body: some View {
-        Group {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "그룹을 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case let .empty(message):
-                VStack(spacing: 0) {
-                    StatusBarView()
-                    EmptyStateView(title: "그룹", message: message, actionTitle: "그룹 생성") {
-                        showsCreateSheet = true
-                    }
-                }
-                .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
-            case let .content(groups), let .refreshing(groups):
-                ScrollView(showsIndicators: false) {
+        TabRootScaffold(title: AppTab.match.title, trailingAction: createGroupHeaderAction) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "그룹을 불러오는 중입니다")
+                        .task { await viewModel.load() }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                case let .empty(message):
                     VStack(spacing: 0) {
-                        VStack(spacing: 16) {
-                            ForEach(groups) { group in
-                                Button {
-                                    session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 10) {
-                                        HStack {
-                                            Text(group.name)
-                                                .font(AppTypography.body(16, weight: .semibold))
-                                            Spacer()
-                                            if group.tags.contains("빡겜") {
-                                                tagBadge("빡겜", tint: AppPalette.accentGreen)
-                                            }
-                                        }
-                                        Text("멤버 \(group.memberCount)명 · \(group.tags.joined(separator: " · "))")
-                                            .font(AppTypography.body(13))
-                                            .foregroundStyle(AppPalette.textSecondary)
-                                        Text("최근 내전: \(group.recentMatches > 0 ? "\(group.recentMatches)회 진행" : "기록 없음")")
-                                            .font(AppTypography.body(12))
-                                            .foregroundStyle(group.recentMatches > 0 ? AppPalette.accentBlue : AppPalette.textMuted)
-                                    }
-                                    .padding(16)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(AppPalette.bgCard)
-                                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
-                                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                                }
-                                .buttonStyle(.plain)
-                            }
+                        StatusBarView()
+                        EmptyStateView(title: "그룹", message: message, actionTitle: "그룹 생성") {
+                            showsCreateSheet = true
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.top, 8)
                     }
+                case let .content(groups), let .refreshing(groups):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 0) {
+                            VStack(spacing: 16) {
+                                ForEach(groups) { group in
+                                    Button {
+                                        session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 10) {
+                                            HStack {
+                                                Text(group.name)
+                                                    .font(AppTypography.body(16, weight: .semibold))
+                                                Spacer()
+                                                if group.tags.contains("빡겜") {
+                                                    tagBadge("빡겜", tint: AppPalette.accentGreen)
+                                                }
+                                            }
+                                            Text("멤버 \(group.memberCount)명 · \(group.tags.joined(separator: " · "))")
+                                                .font(AppTypography.body(13))
+                                                .foregroundStyle(AppPalette.textSecondary)
+                                            Text("최근 내전: \(group.recentMatches > 0 ? "\(group.recentMatches)회 진행" : "기록 없음")")
+                                                .font(AppTypography.body(12))
+                                                .foregroundStyle(group.recentMatches > 0 ? AppPalette.accentBlue : AppPalette.textMuted)
+                                        }
+                                        .padding(16)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(AppPalette.bgCard)
+                                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
+                                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal, 24)
+                            .padding(.top, 8)
+                        }
+                    }
+                    .refreshable { await viewModel.load(force: true) }
                 }
-                .refreshable { await viewModel.load(force: true) }
-                .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
-                .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
             }
         }
-        .navigationTitle("그룹")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showsCreateSheet = true
-                } label: {
-                    Image(systemName: "plus")
-                }
-            }
+        .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
+        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+    }
+
+    private var createGroupHeaderAction: TabHeaderAction {
+        TabHeaderAction(systemName: "plus", accessibilityLabel: "그룹 생성") {
+            showsCreateSheet = true
         }
-        .appNavigationBarStyle(.large)
     }
 
     private var groupCreationSheet: some View {
@@ -2473,6 +3644,7 @@ struct GroupDetailScreen: View {
     @ObservedObject var router: AppRouter
     @State private var inviteUserID = ""
     @State private var showsInviteSheet = false
+    @State private var showsPowerGuideSheet = false
 
     var body: some View {
         screenScaffold(title: "롤내전모임", onBack: router.pop) {
@@ -2485,6 +3657,13 @@ struct GroupDetailScreen: View {
             case .empty:
                 EmptyStateView(title: "그룹", message: "표시할 그룹이 없습니다.")
             case let .content(snapshot), let .refreshing(snapshot):
+                let guide = PowerViewStateBuilder.groupGuide()
+                let memberRows = snapshot.members.map { member in
+                    PowerViewStateBuilder.groupMember(
+                        member: member,
+                        powerProfile: snapshot.powerProfiles[member.userID]
+                    )
+                }
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 18) {
                         VStack(alignment: .leading, spacing: 8) {
@@ -2526,14 +3705,33 @@ struct GroupDetailScreen: View {
                         }
 
                         VStack(alignment: .leading, spacing: 10) {
-                            Text("멤버 (\(snapshot.members.count))")
-                                .font(AppTypography.heading(16, weight: .bold))
-                            ForEach(Array(snapshot.members.prefix(6))) { member in
-                                PlayerCardView(
-                                    name: member.nickname,
-                                    subtitle: "\(roleText(for: member.role)) · \(snapshot.powerProfiles[member.userID] == nil ? "파워 미연동" : "파워 프로필 연동")",
-                                    powerScore: Int(snapshot.powerProfiles[member.userID]?.overallPower.rounded() ?? 0)
-                                )
+                            HStack {
+                                Text("멤버 (\(snapshot.members.count))")
+                                    .font(AppTypography.heading(16, weight: .bold))
+                                    .foregroundStyle(AppPalette.textPrimary)
+                                Spacer()
+                                Button {
+                                    withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+                                        showsPowerGuideSheet = true
+                                    }
+                                } label: {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "info.circle")
+                                            .font(.system(size: 12, weight: .semibold))
+                                        Text("파워 기준 안내")
+                                            .font(AppTypography.body(12, weight: .semibold))
+                                    }
+                                    .foregroundStyle(AppPalette.accentBlue)
+                                }
+                                .buttonStyle(.plain)
+                            }
+
+                            GroupPowerGuideCard(guide: guide)
+
+                            VStack(spacing: 8) {
+                                ForEach(memberRows) { row in
+                                    GroupPowerMemberRow(row: row)
+                                }
                             }
                         }
 
@@ -2581,6 +3779,34 @@ struct GroupDetailScreen: View {
             }
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .overlay {
+            if showsPowerGuideSheet {
+                let guide = PowerViewStateBuilder.groupGuide()
+                DimmedBottomSheet(
+                    title: guide.title,
+                    onDismiss: { showsPowerGuideSheet = false },
+                    maxHeightRatio: 0.42
+                ) {
+                    VStack(alignment: .leading, spacing: 16) {
+                        GroupPowerGuideCard(guide: guide)
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("안내")
+                                .font(AppTypography.body(13, weight: .semibold))
+                                .foregroundStyle(AppPalette.textPrimary)
+                            Text("그룹 화면에 보이는 값은 멤버 구성이 바뀌지 않도록 비교 기준을 유지하기 위한 그룹 기준 파워예요. 그룹 스냅샷이 아직 없으면 최신 종합 파워로 대체되고, 홈과 프로필에서는 개인 최신 종합 파워를 확인할 수 있어요.")
+                                .font(AppTypography.body(12))
+                                .foregroundStyle(AppPalette.textSecondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .padding(16)
+                        .background(AppPalette.bgCard)
+                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                    }
+                }
+            }
+        }
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsPowerGuideSheet)
     }
 
     private func statBlock(_ value: String, label: String) -> some View {
@@ -2603,17 +3829,6 @@ struct GroupDetailScreen: View {
             .background(AppPalette.bgTertiary)
             .clipShape(Capsule())
     }
-
-    private func roleText(for role: GroupRole) -> String {
-        switch role {
-        case .owner:
-            return "방장"
-        case .admin:
-            return "운영진"
-        case .member:
-            return "멤버"
-        }
-    }
 }
 
 struct RecruitBoardScreen: View {
@@ -2626,125 +3841,120 @@ struct RecruitBoardScreen: View {
     @State private var createPositions = "MID,SUP"
 
     var body: some View {
-        Group {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "모집글을 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case let .empty(message):
-                VStack(spacing: 0) {
-                    StatusBarView()
-                    EmptyStateView(title: "모집", message: message, actionTitle: "글 작성") {
-                        showsCreateSheet = true
-                    }
-                }
-                .sheet(isPresented: $showsCreateSheet) { createSheet }
-            case let .content(snapshot), let .refreshing(snapshot):
-                ScrollView(showsIndicators: false) {
+        TabRootScaffold(title: AppTab.recruit.title, trailingAction: createRecruitHeaderAction) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "모집글을 불러오는 중입니다")
+                        .task { await viewModel.load() }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                case let .empty(message):
                     VStack(spacing: 0) {
-                        VStack(spacing: 16) {
-                            HStack(spacing: 4) {
-                                typeButton(.memberRecruit)
-                                typeButton(.opponentRecruit)
-                            }
-                            .padding(3)
-                            .background(AppPalette.bgSecondary)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
-
-                            HStack(spacing: 8) {
-                                FilterChipView(title: "날짜", tint: AppPalette.textMuted)
-                                FilterChipView(title: "포지션", tint: AppPalette.textMuted)
-                                FilterChipView(title: "지역", tint: AppPalette.textMuted)
-                                FilterChipView(title: "성향", tint: AppPalette.textMuted)
-                            }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-
-                            ForEach(snapshot.posts) { post in
-                                Button {
-                                    session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 10) {
-                                        HStack {
-                                            Text(post.title)
-                                                .font(AppTypography.body(14, weight: .semibold))
-                                                .foregroundStyle(AppPalette.textPrimary)
-                                            Spacer()
-                                            if post.tags.contains("급구") {
-                                                Text("급구")
-                                                    .font(AppTypography.body(11, weight: .semibold))
-                                                    .foregroundStyle(AppPalette.bgPrimary)
-                                                    .padding(.horizontal, 8)
-                                                    .padding(.vertical, 3)
-                                                    .background(AppPalette.accentGreen)
-                                                    .clipShape(Capsule())
-                                            }
-                                        }
-
-                                        HStack(spacing: 8) {
-                                            Text(post.groupID)
-                                            if let scheduledAt = post.scheduledAt {
-                                                Text(scheduledAt.shortDateText)
-                                                    .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
-                                            }
-                                        }
-                                        .font(AppTypography.body(12))
-                                        .foregroundStyle(AppPalette.textSecondary)
-
-                                        HStack(spacing: 6) {
-                                            ForEach(post.requiredPositions, id: \.self) { value in
-                                                Text(value)
-                                                    .font(AppTypography.body(11))
-                                                    .foregroundStyle(AppPalette.accentBlue)
-                                                    .padding(.horizontal, 8)
-                                                    .padding(.vertical, 3)
-                                                    .background(AppPalette.bgTertiary)
-                                                    .clipShape(Capsule())
-                                            }
-                                            ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
-                                                Text(value)
-                                                    .font(AppTypography.body(11))
-                                                    .foregroundStyle(AppPalette.accentPurple)
-                                                    .padding(.horizontal, 8)
-                                                    .padding(.vertical, 3)
-                                                    .background(AppPalette.bgTertiary)
-                                                    .clipShape(Capsule())
-                                            }
-                                        }
-
-                                        Text(post.status == .open ? "모집 중" : post.status.rawValue)
-                                            .font(AppTypography.body(12, weight: .semibold))
-                                            .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
-                                    }
-                                    .padding(16)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(AppPalette.bgCard)
-                                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
-                                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                                }
-                                .buttonStyle(.plain)
-                            }
+                        StatusBarView()
+                        EmptyStateView(title: "모집", message: message, actionTitle: "글 작성") {
+                            showsCreateSheet = true
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.top, 8)
+                    }
+                case let .content(snapshot), let .refreshing(snapshot):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 0) {
+                            VStack(spacing: 16) {
+                                HStack(spacing: 4) {
+                                    typeButton(.memberRecruit)
+                                    typeButton(.opponentRecruit)
+                                }
+                                .padding(3)
+                                .background(AppPalette.bgSecondary)
+                                .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                                HStack(spacing: 8) {
+                                    FilterChipView(title: "날짜", tint: AppPalette.textMuted)
+                                    FilterChipView(title: "포지션", tint: AppPalette.textMuted)
+                                    FilterChipView(title: "지역", tint: AppPalette.textMuted)
+                                    FilterChipView(title: "성향", tint: AppPalette.textMuted)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                ForEach(snapshot.posts) { post in
+                                    Button {
+                                        session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
+                                    } label: {
+                                        VStack(alignment: .leading, spacing: 10) {
+                                            HStack {
+                                                Text(post.title)
+                                                    .font(AppTypography.body(14, weight: .semibold))
+                                                    .foregroundStyle(AppPalette.textPrimary)
+                                                Spacer()
+                                                if post.tags.contains("급구") {
+                                                    Text("급구")
+                                                        .font(AppTypography.body(11, weight: .semibold))
+                                                        .foregroundStyle(AppPalette.bgPrimary)
+                                                        .padding(.horizontal, 8)
+                                                        .padding(.vertical, 3)
+                                                        .background(AppPalette.accentGreen)
+                                                        .clipShape(Capsule())
+                                                }
+                                            }
+
+                                            HStack(spacing: 8) {
+                                                Text(post.groupID)
+                                                if let scheduledAt = post.scheduledAt {
+                                                    Text(scheduledAt.shortDateText)
+                                                        .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
+                                                }
+                                            }
+                                            .font(AppTypography.body(12))
+                                            .foregroundStyle(AppPalette.textSecondary)
+
+                                            HStack(spacing: 6) {
+                                                ForEach(post.requiredPositions, id: \.self) { value in
+                                                    Text(value)
+                                                        .font(AppTypography.body(11))
+                                                        .foregroundStyle(AppPalette.accentBlue)
+                                                        .padding(.horizontal, 8)
+                                                        .padding(.vertical, 3)
+                                                        .background(AppPalette.bgTertiary)
+                                                        .clipShape(Capsule())
+                                                }
+                                                ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
+                                                    Text(value)
+                                                        .font(AppTypography.body(11))
+                                                        .foregroundStyle(AppPalette.accentPurple)
+                                                        .padding(.horizontal, 8)
+                                                        .padding(.vertical, 3)
+                                                        .background(AppPalette.bgTertiary)
+                                                        .clipShape(Capsule())
+                                                }
+                                            }
+                                            Text(post.status == .open ? "모집 중" : post.status.rawValue)
+                                                .font(AppTypography.body(12, weight: .semibold))
+                                                .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
+                                        }
+                                        .padding(16)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .background(AppPalette.bgCard)
+                                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
+                                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(.horizontal, 24)
+                            .padding(.top, 8)
+                        }
                     }
                 }
-                .sheet(isPresented: $showsCreateSheet) { createSheet }
-                .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
             }
         }
-        .navigationTitle("모집")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    showsCreateSheet = true
-                } label: {
-                    Image(systemName: "square.and.pencil")
-                }
-            }
+        .sheet(isPresented: $showsCreateSheet) { createSheet }
+        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+    }
+
+    private var createRecruitHeaderAction: TabHeaderAction {
+        TabHeaderAction(systemName: "square.and.pencil", accessibilityLabel: "모집글 작성") {
+            showsCreateSheet = true
         }
-        .appNavigationBarStyle(.large)
     }
 
     private func typeButton(_ type: RecruitingPostType) -> some View {
@@ -2894,30 +4104,24 @@ struct HistoryScreen: View {
     @ObservedObject var router: AppRouter
 
     var body: some View {
-        Group {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "경기 기록을 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case let .empty(message):
-                VStack(spacing: 0) {
-                    StatusBarView()
-                    EmptyStateView(title: "기록", message: message)
+        TabRootScaffold(title: AppTab.history.title) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "경기 기록을 불러오는 중입니다")
+                        .task { await viewModel.load() }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                case let .empty(message):
+                    VStack(spacing: 0) {
+                        StatusBarView()
+                        EmptyStateView(title: "기록", message: message)
+                    }
+                case let .content(content), let .refreshing(content):
+                    historyContent(content)
                 }
-            case let .content(content), let .refreshing(content):
-                historyContent(content)
             }
         }
-        .navigationTitle("기록")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Image(systemName: "slider.horizontal.3")
-                    .foregroundStyle(AppPalette.textSecondary)
-            }
-        }
-        .appNavigationBarStyle(.large)
     }
 
     @ViewBuilder
@@ -3733,46 +4937,43 @@ struct ProfileScreen: View {
     @ObservedObject var router: AppRouter
 
     var body: some View {
-        Group {
-            switch viewModel.state {
-            case .initial, .loading:
-                LoadingStateView(title: "프로필을 불러오는 중입니다")
-                    .task { await viewModel.load() }
-            case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case let .empty(message):
-                VStack(spacing: 0) {
-                    StatusBarView()
-                    EmptyStateView(title: "프로필", message: message)
-                }
-            case let .content(content), let .refreshing(content):
-                ScrollView(showsIndicators: false) {
+        TabRootScaffold(title: AppTab.profile.title, trailingAction: settingsHeaderAction) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "프로필을 불러오는 중입니다")
+                        .task { await viewModel.load() }
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                case let .empty(message):
                     VStack(spacing: 0) {
-                        VStack(spacing: 20) {
-                            switch content {
-                            case let .authenticated(snapshot):
-                                authenticatedProfileContent(snapshot)
-                            case let .guest(snapshot):
-                                guestProfileContent(snapshot)
+                        StatusBarView()
+                        EmptyStateView(title: "프로필", message: message)
+                    }
+                case let .content(content), let .refreshing(content):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 0) {
+                            VStack(spacing: 20) {
+                                switch content {
+                                case let .authenticated(snapshot):
+                                    authenticatedProfileContent(snapshot)
+                                case let .guest(snapshot):
+                                    guestProfileContent(snapshot)
+                                }
                             }
+                            .padding(.horizontal, 24)
+                            .padding(.top, 8)
                         }
-                        .padding(.horizontal, 24)
-                        .padding(.top, 8)
                     }
                 }
             }
         }
-        .navigationTitle("프로필")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    router.push(.settings)
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-            }
+    }
+
+    private var settingsHeaderAction: TabHeaderAction {
+        TabHeaderAction(systemName: "gearshape", accessibilityLabel: "설정") {
+            router.push(.settings)
         }
-        .appNavigationBarStyle(.large)
     }
 
     @ViewBuilder
@@ -4029,9 +5230,11 @@ struct RiotAccountsScreen: View {
     @ObservedObject var session: AppSessionViewModel
     let onBack: () -> Void
     @State private var gameName = ""
-    @State private var tagLine = "KR1"
-    @State private var region = "kr"
+    @State private var tagLine = ""
     @State private var isPrimary = true
+    @State private var hasAttemptedSubmit = false
+    @State private var pendingUnlinkAccount: RiotAccount?
+    @FocusState private var focusedField: RiotAccountInputField?
 
     var body: some View {
         screenScaffold(title: "Riot 계정 관리", onBack: onBack, rightSystemImage: nil) {
@@ -4052,6 +5255,54 @@ struct RiotAccountsScreen: View {
             }
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .alert(
+            "이 라이엇 계정 연결을 해제할까요?",
+            isPresented: Binding(
+                get: { pendingUnlinkAccount != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingUnlinkAccount = nil
+                    }
+                }
+            ),
+            presenting: pendingUnlinkAccount
+        ) { account in
+            Button("취소", role: .cancel) {
+                pendingUnlinkAccount = nil
+            }
+            Button("해제", role: .destructive) {
+                pendingUnlinkAccount = nil
+                Task { await viewModel.unlink(account: account) }
+            }
+        } message: { account in
+            Text(unlinkConfirmationMessage(for: account, accounts: managedAccounts))
+        }
+    }
+
+    private var managedAccounts: [RiotAccount] {
+        viewModel.state.value?.accounts ?? []
+    }
+
+    private var normalizedGameName: String {
+        RiotAccountInputValidator.normalizedGameName(gameName)
+    }
+
+    private var normalizedTagLine: String {
+        RiotAccountInputValidator.normalizedTagLine(tagLine)
+    }
+
+    private var gameNameValidationState: FieldValidationState {
+        let shouldValidate = hasAttemptedSubmit || !gameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return shouldValidate ? RiotAccountInputValidator.validateGameName(gameName) : .idle
+    }
+
+    private var tagLineValidationState: FieldValidationState {
+        let shouldValidate = hasAttemptedSubmit || !tagLine.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        return shouldValidate ? RiotAccountInputValidator.validateTagLine(tagLine) : .idle
+    }
+
+    private var canSubmitConnection: Bool {
+        !viewModel.isConnecting
     }
 
     private var guestContent: some View {
@@ -4075,77 +5326,190 @@ struct RiotAccountsScreen: View {
     private func formContent(accounts: [RiotAccount]) -> some View {
         ScrollView(showsIndicators: false) {
             VStack(spacing: 20) {
-                HStack(spacing: 10) {
-                    Image(systemName: "info.circle")
-                        .foregroundStyle(AppPalette.accentBlue)
-                    Text("Riot API 데이터는 참고용이며, 내전 기록이 핵심 지표입니다.")
-                        .font(AppTypography.body(12))
-                        .foregroundStyle(AppPalette.textSecondary)
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "info.circle")
+                            .foregroundStyle(AppPalette.accentBlue)
+                        Text("Riot API 데이터는 참고용이며, 내전 기록이 핵심 지표입니다.")
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(AppPalette.textSecondary)
+                    }
+
+                    Text("입력 예시: Hide on bush#KR1")
+                        .font(AppTypography.body(12, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+
+                    Text("게임 이름과 태그라인을 나눠 입력해 주세요. KR1은 태그라인이며, 플랫폼 코드를 따로 입력하지 않습니다.")
+                        .font(AppTypography.body(11))
+                        .foregroundStyle(AppPalette.textMuted)
                 }
                 .padding(14)
                 .background(Color(hex: 0x1A2744))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 14) {
                     Text("새 계정 추가")
                         .font(AppTypography.heading(16, weight: .bold))
-                    HStack(spacing: 8) {
-                        TextField("Riot ID", text: $gameName)
-                            .textFieldStyle(.roundedBorder)
-                        TextField("태그", text: $tagLine)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 80)
+
+                    HStack(alignment: .top, spacing: 12) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("게임 이름")
+                                .font(AppTypography.body(13, weight: .semibold))
+                            TextField("예: Hide on bush", text: $gameName)
+                                .textFieldStyle(.roundedBorder)
+                                .textInputAutocapitalization(.never)
+                                .autocorrectionDisabled(true)
+                                .submitLabel(.next)
+                                .focused($focusedField, equals: .gameName)
+                                .onSubmit { focusedField = .tagLine }
+                            validationMessage(
+                                state: gameNameValidationState,
+                                helperText: "Riot ID의 # 앞부분을 입력해 주세요."
+                            )
+                        }
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("태그라인")
+                                .font(AppTypography.body(13, weight: .semibold))
+                            TextField("예: KR1", text: $tagLine)
+                                .textFieldStyle(.roundedBorder)
+                                .textInputAutocapitalization(.characters)
+                                .autocorrectionDisabled(true)
+                                .submitLabel(.done)
+                                .focused($focusedField, equals: .tagLine)
+                                .onSubmit { submitConnection() }
+                            validationMessage(
+                                state: tagLineValidationState,
+                                helperText: "# 없이 KR1처럼 입력해 주세요."
+                            )
+                        }
+                        .frame(width: 124)
                     }
+
                     Toggle("대표 계정으로 설정", isOn: $isPrimary)
                         .tint(AppPalette.accentBlue)
-                    Button("연결하기") {
-                        Task { await viewModel.connect(gameName: gameName, tagLine: tagLine, region: region, isPrimary: isPrimary) }
+
+                    Button {
+                        submitConnection()
+                    } label: {
+                        HStack(spacing: 8) {
+                            if viewModel.isConnecting {
+                                ProgressView()
+                                    .tint(AppPalette.bgPrimary)
+                            }
+                            Text(viewModel.isConnecting ? "연결 중" : "연결하기")
+                        }
+                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(PrimaryButtonStyle())
+                    .disabled(!canSubmitConnection)
+                    .opacity(canSubmitConnection ? 1 : 0.72)
                 }
 
                 VStack(alignment: .leading, spacing: 12) {
                     Text("연결된 계정")
                         .font(AppTypography.heading(16, weight: .bold))
-                    ForEach(accounts) { account in
-                        HStack(spacing: 12) {
-                            VStack(alignment: .leading, spacing: 4) {
-                                HStack(spacing: 8) {
-                                    Text(account.isPrimary ? "대표" : "참고")
-                                        .font(AppTypography.body(11, weight: .semibold))
-                                        .foregroundStyle(account.isPrimary ? AppPalette.bgPrimary : AppPalette.textSecondary)
-                                        .padding(.horizontal, 8)
-                                        .padding(.vertical, 3)
-                                        .background(account.isPrimary ? AppPalette.accentGold : AppPalette.bgTertiary)
-                                        .clipShape(Capsule())
-                                    Text(account.displayName)
-                                        .font(AppTypography.body(14, weight: .semibold))
-                                }
-                                Text("\(account.region.uppercased()) · \(account.verificationStatus.title)")
-                                    .font(AppTypography.body(12))
-                                    .foregroundStyle(AppPalette.textSecondary)
-                                Text(account.syncStatusSummary)
-                                    .font(AppTypography.body(11))
-                                    .foregroundStyle(account.syncUIState.isFailure ? AppPalette.accentRed : AppPalette.textMuted)
-                                Text("마지막 동기화: \(account.syncStatusTimestamp?.shortDateText ?? "없음")")
-                                    .font(AppTypography.body(11))
-                                    .foregroundStyle(AppPalette.textMuted)
-                            }
-                            Spacer()
-                            Button(viewModel.syncInProgressIDs.contains(account.id) ? "동기화 중" : "Sync") {
-                                Task { await viewModel.sync(id: account.id) }
-                            }
-                            .buttonStyle(.bordered)
-                            .tint(AppPalette.accentBlue)
-                            .disabled(viewModel.syncInProgressIDs.contains(account.id))
+
+                    if accounts.isEmpty {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("연결된 Riot 계정이 없습니다")
+                                .font(AppTypography.body(14, weight: .semibold))
+                            Text("게임 이름과 태그라인을 입력해 계정을 연결하면, 대표/참고 구분과 동기화 상태를 여기서 확인할 수 있어요.")
+                                .font(AppTypography.body(12))
+                                .foregroundStyle(AppPalette.textSecondary)
                         }
-                        .padding(16)
+                        .padding(18)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                         .background(AppPalette.bgCard)
                         .overlay(
                             RoundedRectangle(cornerRadius: 12)
-                                .stroke(account.isPrimary ? AppPalette.accentGold : AppPalette.border, lineWidth: 1)
+                                .stroke(AppPalette.border, lineWidth: 1)
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 12))
+                    } else {
+                        ForEach(accounts) { account in
+                            let isSyncing = viewModel.syncInProgressIDs.contains(account.id) || account.syncStatus.isInFlight
+                            let isUnlinking = viewModel.unlinkInProgressIDs.contains(account.id)
+
+                            VStack(alignment: .leading, spacing: 14) {
+                                HStack(alignment: .top, spacing: 12) {
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack(spacing: 8) {
+                                            Text(account.isPrimary ? "대표" : "참고")
+                                                .font(AppTypography.body(11, weight: .semibold))
+                                                .foregroundStyle(account.isPrimary ? AppPalette.bgPrimary : AppPalette.textSecondary)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 3)
+                                                .background(account.isPrimary ? AppPalette.accentGold : AppPalette.bgTertiary)
+                                                .clipShape(Capsule())
+                                            Text(account.displayName)
+                                                .font(AppTypography.body(14, weight: .semibold))
+                                                .foregroundStyle(AppPalette.textPrimary)
+                                        }
+
+                                        Text("\(account.region.uppercased()) · \(account.verificationStatus.title)")
+                                            .font(AppTypography.body(12))
+                                            .foregroundStyle(AppPalette.textSecondary)
+                                    }
+
+                                    Spacer()
+
+                                    VStack(alignment: .trailing, spacing: 8) {
+                                        Button(isSyncing ? "동기화 중" : "Sync") {
+                                            Task { await viewModel.sync(id: account.id) }
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(AppPalette.accentBlue)
+                                        .disabled(isSyncing || isUnlinking)
+
+                                        Button(isUnlinking ? "해제 중" : "해제") {
+                                            pendingUnlinkAccount = account
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .tint(AppPalette.accentRed)
+                                        .disabled(isSyncing || isUnlinking)
+                                    }
+                                }
+
+                                infoRow(title: "동기화 상태") {
+                                    HStack(spacing: 8) {
+                                        statusPill(for: account.syncUIState)
+                                        if isSyncing {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                                .tint(statusTint(for: account.syncUIState))
+                                        }
+                                    }
+                                }
+
+                                infoRow(
+                                    title: "마지막 동기화",
+                                    value: account.lastSyncedAt?.shortDateText
+                                        ?? account.lastSyncSucceededAt?.shortDateText
+                                        ?? "없음"
+                                )
+
+                                infoRow(
+                                    title: account.syncUIState.isFailure ? "마지막 실패" : "마지막 요청",
+                                    value: account.syncUIState.isFailure
+                                        ? (account.lastSyncFailedAt?.shortDateText ?? account.lastSyncRequestedAt?.shortDateText ?? "없음")
+                                        : (account.lastSyncRequestedAt?.shortDateText ?? "없음")
+                                )
+
+                                infoRow(
+                                    title: account.syncUIState.isFailure ? "실패 원인" : "상태 설명",
+                                    value: account.syncStatusSummary,
+                                    tint: account.syncUIState.isFailure ? statusTint(for: account.syncUIState) : AppPalette.textSecondary
+                                )
+                            }
+                            .padding(16)
+                            .background(AppPalette.bgCard)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(account.isPrimary ? AppPalette.accentGold : AppPalette.border, lineWidth: 1)
+                            )
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                        }
                     }
                 }
 
@@ -4161,8 +5525,146 @@ struct RiotAccountsScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12))
             }
             .padding(24)
+            .contentShape(Rectangle())
+            .onTapGesture {
+                focusedField = nil
+            }
+        }
+        .scrollDismissesKeyboard(.interactively)
+    }
+
+    @ViewBuilder
+    private func validationMessage(state: FieldValidationState, helperText: String) -> some View {
+        HStack(spacing: 6) {
+            if let iconName = state.iconName {
+                Image(systemName: iconName)
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(state.tint)
+            }
+
+            Text(state.message ?? helperText)
+                .font(AppTypography.body(11))
+                .foregroundStyle(state.message == nil ? AppPalette.textMuted : state.tint)
+
+            Spacer()
+        }
+        .frame(minHeight: 18, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func infoRow(title: String, value: String, tint: Color = AppPalette.textPrimary) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text(title)
+                .font(AppTypography.body(11, weight: .semibold))
+                .foregroundStyle(AppPalette.textMuted)
+                .frame(width: 72, alignment: .leading)
+
+            Text(value)
+                .font(AppTypography.body(12))
+                .foregroundStyle(tint)
+                .multilineTextAlignment(.leading)
+
+            Spacer(minLength: 0)
         }
     }
+
+    @ViewBuilder
+    private func infoRow<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text(title)
+                .font(AppTypography.body(11, weight: .semibold))
+                .foregroundStyle(AppPalette.textMuted)
+                .frame(width: 72, alignment: .leading)
+
+            content()
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func statusTint(for state: RiotSyncUIState) -> Color {
+        switch state {
+        case .pending:
+            return AppPalette.textSecondary
+        case .syncing:
+            return AppPalette.accentBlue
+        case .success:
+            return AppPalette.accentGreen
+        case .accountNotFound, .invalidInput:
+            return AppPalette.accentOrange
+        case .serverConfiguration:
+            return AppPalette.accentPurple
+        case .failure:
+            return AppPalette.accentRed
+        }
+    }
+
+    private func statusBackground(for state: RiotSyncUIState) -> Color {
+        switch state {
+        case .pending:
+            return AppPalette.bgTertiary
+        default:
+            return statusTint(for: state).opacity(0.16)
+        }
+    }
+
+    private func statusPill(for state: RiotSyncUIState) -> some View {
+        Text(state.title)
+            .font(AppTypography.body(11, weight: .semibold))
+            .foregroundStyle(statusTint(for: state))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(statusBackground(for: state))
+            .clipShape(Capsule())
+    }
+
+    private func submitConnection() {
+        hasAttemptedSubmit = true
+        focusedField = nil
+
+        guard gameNameValidationState.isValid else {
+            focusedField = .gameName
+            return
+        }
+
+        guard tagLineValidationState.isValid else {
+            focusedField = .tagLine
+            return
+        }
+
+        Task {
+            let didConnect = await viewModel.connect(
+                gameName: normalizedGameName,
+                tagLine: normalizedTagLine,
+                region: RiotAccountInputValidator.region,
+                isPrimary: isPrimary
+            )
+
+            if didConnect {
+                gameName = ""
+                tagLine = ""
+                isPrimary = false
+                hasAttemptedSubmit = false
+            }
+        }
+    }
+
+    private func unlinkConfirmationMessage(for account: RiotAccount, accounts: [RiotAccount]) -> String {
+        var parts = ["해제하면 이 계정의 동기화 정보와 연결 상태가 제거됩니다."]
+        if account.isPrimary {
+            if accounts.count <= 1 {
+                parts.append("현재 대표 계정이 이 계정뿐이라 해제 후에는 연결된 Riot 계정이 없는 상태가 될 수 있습니다.")
+            } else {
+                parts.append("대표 계정을 해제하면 대표/참고 배지는 서버 정책에 따라 다시 정리됩니다.")
+            }
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+private enum RiotAccountInputField: Hashable {
+    case gameName
+    case tagLine
 }
 
 struct NotificationsScreen: View {
