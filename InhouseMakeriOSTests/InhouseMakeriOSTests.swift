@@ -371,6 +371,45 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(error.message, "요청이 많아 잠시 후 다시 시도해 주세요.")
     }
 
+    func testRiotAccountDuplicateServerContractMapsToFriendlyCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Conflict",
+            code: "ALREADY_ADDED_BY_THIS_USER",
+            statusCode: 409
+        ).serverContractMapped
+
+        XCTAssertEqual(error.serverContractCode, .riotAccountAlreadyAddedByThisUser)
+        XCTAssertEqual(error.title, "이미 추가한 Riot ID예요")
+        XCTAssertEqual(error.message, "같은 Riot ID를 내 목록에 두 번 추가할 수는 없어요.")
+    }
+
+    func testRiotAccountDuplicateServerContractUsesDetailsReason() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Conflict",
+            code: "CONFLICT",
+            statusCode: 409,
+            details: ["reason": .string("ALREADY_ADDED_BY_THIS_USER")]
+        ).serverContractMapped
+
+        XCTAssertEqual(error.serverContractCode, .riotAccountAlreadyAddedByThisUser)
+        XCTAssertEqual(error.message, "같은 Riot ID를 내 목록에 두 번 추가할 수는 없어요.")
+    }
+
+    func testRiotAccountAnotherUserConflictIsNotRemappedToOwnershipCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "다른 계정에 이미 연결된 라이엇 계정입니다.",
+            code: "ALREADY_LINKED_TO_ANOTHER_USER",
+            statusCode: 409
+        ).serverContractMapped
+
+        XCTAssertEqual(error.serverContractCode, .riotAccountAddUnavailable)
+        XCTAssertEqual(error.title, "Riot ID를 추가하지 못했어요")
+        XCTAssertEqual(error.message, "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.")
+    }
+
     func testAuthRateLimitedMapsToRateLimitedError() {
         let error = UserFacingError(
             title: "서버 오류",

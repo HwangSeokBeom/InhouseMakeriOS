@@ -192,6 +192,8 @@ enum RiotSyncUIState: Equatable {
 }
 
 enum ServerContractErrorCode: Equatable {
+    case riotAccountAlreadyAddedByThisUser
+    case riotAccountAddUnavailable
     case socialTokenInvalid
     case accountExistsWithApple
     case accountExistsWithGoogle
@@ -213,57 +215,72 @@ enum ServerContractErrorCode: Equatable {
     case rateLimited
     case unknown(String?)
 
-    static func resolve(code: String?, statusCode: Int?) -> Self {
-        let normalizedCode = code?
+    private static func normalizedToken(_ value: String?) -> String {
+        value?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .replacingOccurrences(of: "-", with: "_")
             .replacingOccurrences(of: " ", with: "_")
             .uppercased() ?? ""
+    }
 
-        switch normalizedCode {
-        case let code where code.contains("SOCIAL_TOKEN_INVALID"):
+    static func resolve(code: String?, details: [String: JSONValue]?, statusCode: Int?) -> Self {
+        let normalizedTokens = [
+            normalizedToken(code),
+            normalizedToken(details?["reason"]?.stringValue),
+        ].filter { !$0.isEmpty }
+
+        func contains(_ token: String) -> Bool {
+            normalizedTokens.contains { $0.contains(token) }
+        }
+
+        switch true {
+        case contains("ALREADY_ADDED_BY_THIS_USER"), contains("ALREADY_LINKED_TO_THIS_USER"):
+            return .riotAccountAlreadyAddedByThisUser
+        case contains("ALREADY_LINKED_TO_ANOTHER_USER"), contains("ALREADY_ADDED_BY_ANOTHER_USER"):
+            return .riotAccountAddUnavailable
+        case contains("SOCIAL_TOKEN_INVALID"):
             return .socialTokenInvalid
-        case let code where code.contains("ACCOUNT_EXISTS_WITH_APPLE"):
+        case contains("ACCOUNT_EXISTS_WITH_APPLE"):
             return .accountExistsWithApple
-        case let code where code.contains("ACCOUNT_EXISTS_WITH_GOOGLE"):
+        case contains("ACCOUNT_EXISTS_WITH_GOOGLE"):
             return .accountExistsWithGoogle
-        case let code where code.contains("AUTH_PROVIDER_MISMATCH"):
+        case contains("AUTH_PROVIDER_MISMATCH"):
             return .authProviderMismatch
-        case let code where code.contains("ACCOUNT_NOT_FOUND") || code.contains("USER_NOT_FOUND") || code.contains("EMAIL_NOT_FOUND"):
+        case contains("ACCOUNT_NOT_FOUND"), contains("USER_NOT_FOUND"), contains("EMAIL_NOT_FOUND"):
             return .accountNotFound
-        case let code where code.contains("UNSUPPORTED_PROVIDER") || code.contains("UNSUPPORTED_AUTH_PROVIDER") || code.contains("UNSUPPORTED_LOGIN_METHOD"):
+        case contains("UNSUPPORTED_PROVIDER"), contains("UNSUPPORTED_AUTH_PROVIDER"), contains("UNSUPPORTED_LOGIN_METHOD"):
             return .unsupportedProvider
-        case let code where code.contains("EMAIL_ALREADY_IN_USE") || code.contains("EMAIL_ALREADY_EXISTS") || code.contains("EMAIL_DUPLICATE") || code.contains("DUPLICATE_EMAIL") || code.contains("ACCOUNT_EXISTS_WITH_EMAIL"):
+        case contains("EMAIL_ALREADY_IN_USE"), contains("EMAIL_ALREADY_EXISTS"), contains("EMAIL_DUPLICATE"), contains("DUPLICATE_EMAIL"), contains("ACCOUNT_EXISTS_WITH_EMAIL"):
             return .emailAlreadyExists
-        case let code where code.contains("NICKNAME_ALREADY_IN_USE") || code.contains("NICKNAME_ALREADY_EXISTS") || code.contains("NICKNAME_DUPLICATE") || code.contains("DUPLICATE_NICKNAME") || code.contains("NICKNAME_TAKEN"):
+        case contains("NICKNAME_ALREADY_IN_USE"), contains("NICKNAME_ALREADY_EXISTS"), contains("NICKNAME_DUPLICATE"), contains("DUPLICATE_NICKNAME"), contains("NICKNAME_TAKEN"):
             return .nicknameAlreadyExists
-        case let code where code.contains("INVALID_EMAIL_FORMAT"):
+        case contains("INVALID_EMAIL_FORMAT"):
             return .invalidEmailFormat
-        case let code where code.contains("WEAK_PASSWORD"):
+        case contains("WEAK_PASSWORD"):
             return .weakPassword
-        case let code where code.contains("REQUIRED_TERMS_NOT_AGREED"):
+        case contains("REQUIRED_TERMS_NOT_AGREED"):
             return .requiredTermsNotAgreed
-        case let code where code.contains("INVALID_PAYLOAD"):
+        case contains("INVALID_PAYLOAD"):
             return .invalidPayload
-        case let code where code.contains("INTERNAL_SERVER_ERROR"):
+        case contains("INTERNAL_SERVER_ERROR"):
             return .internalServerError
-        case let code where code.contains("INVALID_CREDENTIALS"):
+        case contains("INVALID_CREDENTIALS"):
             return .invalidCredentials
-        case let code where code.contains("EMAIL_AUTH_DISABLED"):
+        case contains("EMAIL_AUTH_DISABLED"):
             return .emailAuthDisabled
-        case let code where code.contains("PASSWORD_AUTH_DISABLED"):
+        case contains("PASSWORD_AUTH_DISABLED"):
             return .passwordAuthDisabled
-        case let code where code.contains("AUTH_REQUIRED"):
+        case contains("AUTH_REQUIRED"):
             return .authRequired
-        case let code where code.contains("FORBIDDEN_FEATURE"):
+        case contains("FORBIDDEN_FEATURE"):
             return .forbiddenFeature
-        case let code where code.contains("RATE_LIMITED"):
+        case contains("RATE_LIMITED"):
             return .rateLimited
         default:
             if statusCode == 429 {
                 return .rateLimited
             }
-            return .unknown(code)
+            return .unknown(code ?? details?["reason"]?.stringValue)
         }
     }
 }
@@ -295,7 +312,7 @@ struct UserFacingError: Error, Equatable {
 
 extension UserFacingError {
     var serverContractCode: ServerContractErrorCode {
-        ServerContractErrorCode.resolve(code: code, statusCode: statusCode)
+        ServerContractErrorCode.resolve(code: code, details: details, statusCode: statusCode)
     }
 
     var normalizedCode: String {
@@ -320,6 +337,24 @@ extension UserFacingError {
 
     var serverContractMapped: UserFacingError {
         switch serverContractCode {
+        case .riotAccountAlreadyAddedByThisUser:
+            return UserFacingError(
+                title: "이미 추가한 Riot ID예요",
+                message: "같은 Riot ID를 내 목록에 두 번 추가할 수는 없어요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
+        case .riotAccountAddUnavailable:
+            return UserFacingError(
+                title: "Riot ID를 추가하지 못했어요",
+                message: "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                code: self.code,
+                provider: provider,
+                statusCode: statusCode,
+                details: details
+            )
         case .authRequired:
             return UserFacingError(
                 title: "로그인이 필요해요",

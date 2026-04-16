@@ -726,6 +726,8 @@ struct ToastBanner: View {
         Text(message)
             .font(AppTypography.body(12))
             .foregroundStyle(tint)
+            .multilineTextAlignment(.leading)
+            .fixedSize(horizontal: false, vertical: true)
             .padding(.horizontal, 14)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity, alignment: .leading)

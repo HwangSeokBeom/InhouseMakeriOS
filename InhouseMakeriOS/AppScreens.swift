@@ -401,8 +401,8 @@ final class AppSessionViewModel: ObservableObject {
             return .error(mappedError)
         } catch {
             let mappedError = UserFacingError(
-                title: "Riot 계정 로딩 실패",
-                message: "Riot 계정을 불러오지 못했습니다."
+                title: "Riot ID 로딩 실패",
+                message: "Riot ID를 불러오지 못했습니다."
             )
             updateRiotAccountsViewState(.error(mappedError), invalidateDependents: invalidateDependents)
             return .error(mappedError)
@@ -1196,10 +1196,10 @@ fileprivate enum PowerViewStateBuilder {
                 percentileText: nil,
                 supportingText: hasLinkedRiotAccount
                     ? "최근 경기와 결과 입력이 쌓이면 파워가 계산돼요"
-                    : "Riot 계정을 연결하면 파워 프로필을 확인할 수 있어요",
+                    : "Riot ID를 추가하면 파워 프로필을 확인할 수 있어요",
                 insightText: hasLinkedRiotAccount
                     ? "파워를 계산할 데이터가 아직 충분하지 않아요"
-                    : "연결된 Riot 계정이 없어요",
+                    : "추가한 Riot ID가 없어요",
                 components: placeholderComponents(),
                 isPlaceholder: true
             )
@@ -1218,7 +1218,7 @@ fileprivate enum PowerViewStateBuilder {
             changeCaptionText: totalDelta == 0 ? nil : "지난 주 대비",
             percentileText: "상위 \(percentile)%",
             supportingText: hasLinkedRiotAccount
-                ? "최근 10경기 기준 · 라이엇 연동 데이터 반영"
+                ? "최근 10경기 기준 · Riot 참고 데이터 반영"
                 : "최근 10경기 기준 · 내전 기록 기반 추정",
             insightText: insightText(power: power),
             components: components,
@@ -1273,7 +1273,7 @@ fileprivate enum PowerViewStateBuilder {
                 title: "내전 MMR",
                 shortMetricLabel: "MMR",
                 scoreText: "--",
-                description: "내전 결과와 라이엇 데이터가 연결되면 계산돼요",
+                description: "내전 결과와 Riot 참고 데이터가 반영되면 계산돼요",
                 progress: 0.26,
                 tone: .orange,
                 delta: nil
@@ -1534,7 +1534,7 @@ fileprivate enum PowerViewStateBuilder {
                 PowerCalculationFactorViewState(
                     id: "mmr",
                     title: "내전 MMR",
-                    description: "내전 매칭 결과를 기반으로 산출되는 실력 지표예요. 라이엇 계정 데이터도 함께 반영돼요.",
+                    description: "내전 매칭 결과를 기반으로 산출되는 실력 지표예요. Riot 참고 데이터도 함께 반영돼요.",
                     tone: .orange
                 ),
             ],
@@ -1665,7 +1665,7 @@ fileprivate final class PowerDetailViewModel: ObservableObject {
         }
 
         guard riotAccountsViewState.hasLinkedAccounts else {
-            state = .empty("Riot 계정을 연결하면 내전 전적과 파워 프로필을 확인할 수 있어요.")
+            state = .empty("Riot ID를 추가하면 내전 전적과 파워 프로필을 확인할 수 있어요.")
             didSucceed = true
             return
         }
@@ -2031,7 +2031,7 @@ final class RiotAccountsViewModel: ObservableObject {
             session.applyRiotAccounts(accounts, invalidateDependents: invalidateDependents)
         }
         let snapshot = RiotAccountSnapshot(accounts: accounts, syncInProgressIDs: syncInProgressIDs)
-        state = accounts.isEmpty ? .empty("연결된 Riot 계정이 없습니다.") : .content(snapshot)
+        state = accounts.isEmpty ? .empty("추가한 Riot ID가 없습니다.") : .content(snapshot)
     }
 
     private func applyRiotAccountsViewState(_ riotAccountsViewState: RiotLinkedAccountsViewState) {
@@ -2054,6 +2054,15 @@ final class RiotAccountsViewModel: ObservableObject {
         }
         guard updatedAccounts != currentAccounts else { return }
         setAccounts(updatedAccounts)
+    }
+
+    private func accountsAfterAdding(_ addedAccount: RiotAccount) -> [RiotAccount] {
+        let preservedAccounts = currentAccounts
+            .filter { $0.id != addedAccount.id }
+            .map { account in
+                addedAccount.isPrimary ? account.withPrimary(false) : account
+            }
+        return preservedAccounts + [addedAccount]
     }
 
     private func observeSyncStatusesIfNeeded(for accounts: [RiotAccount]) {
@@ -2115,7 +2124,7 @@ final class RiotAccountsViewModel: ObservableObject {
 
     func load(force: Bool = false) async {
         guard session.isAuthenticated else {
-            state = .empty("로그인하면 Riot 계정 연동과 동기화를 사용할 수 있어요.")
+            state = .empty("로그인하면 Riot ID 추가와 동기화를 사용할 수 있어요.")
             return
         }
         if !force, case .content = state { return }
@@ -2125,7 +2134,7 @@ final class RiotAccountsViewModel: ObservableObject {
                 error,
                 requirement: .riotAccount,
                 state: &state,
-                fallbackMessage: "로그인 후 Riot 계정을 다시 확인할 수 있어요."
+                fallbackMessage: "로그인 후 Riot ID 목록을 다시 확인할 수 있어요."
             )
             return
         }
@@ -2134,7 +2143,7 @@ final class RiotAccountsViewModel: ObservableObject {
 
     func connect(gameName: String, tagLine: String, region: String, isPrimary: Bool) async -> Bool {
         guard session.isAuthenticated else {
-            actionState = .failure("로그인 후 Riot 계정을 연결할 수 있어요.")
+            actionState = .failure("로그인 후 Riot ID를 추가할 수 있어요.")
             return false
         }
 
@@ -2143,33 +2152,51 @@ final class RiotAccountsViewModel: ObservableObject {
         isConnecting = true
         defer { isConnecting = false }
 
-        actionState = .inProgress("계정을 연결하는 중입니다")
+        actionState = .inProgress("Riot ID를 추가하는 중입니다")
         do {
-            _ = try await session.container.riotRepository.connect(
+            let addedAccount = try await session.container.riotRepository.connect(
                 gameName: normalizedGameName,
                 tagLine: normalizedTagLine,
                 region: region.lowercased(),
                 isPrimary: isPrimary
             )
-            actionState = .success("계정이 연결되었습니다")
+
+            let optimisticAccounts = accountsAfterAdding(addedAccount)
+            setAccounts(optimisticAccounts, invalidateDependents: true)
+
             let riotAccountsViewState = await session.refreshRiotAccountsViewState(
                 force: true,
                 invalidateDependents: true
             )
-            applyRiotAccountsViewState(riotAccountsViewState)
+            switch riotAccountsViewState {
+            case .loading:
+                setAccounts(optimisticAccounts, invalidateDependents: true)
+            case .noLinkedAccounts, .loaded:
+                applyRiotAccountsViewState(riotAccountsViewState)
+            case .error:
+                setAccounts(optimisticAccounts, invalidateDependents: true)
+            }
+            actionState = .success("Riot ID를 추가했습니다")
             return true
         } catch let error as UserFacingError {
+            if error.serverContractCode == .riotAccountAlreadyAddedByThisUser {
+                let riotAccountsViewState = await session.refreshRiotAccountsViewState(
+                    force: true,
+                    invalidateDependents: true
+                )
+                applyRiotAccountsViewState(riotAccountsViewState)
+            }
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
             return false
         } catch {
-            actionState = .failure("계정 연결에 실패했습니다")
+            actionState = .failure("Riot ID 추가에 실패했습니다")
             return false
         }
     }
 
     func sync(id: String) async {
         guard session.isAuthenticated else {
-            actionState = .failure("로그인 후 Riot 계정 동기화를 사용할 수 있어요.")
+            actionState = .failure("로그인 후 Riot ID 동기화를 사용할 수 있어요.")
             return
         }
         syncInProgressIDs.insert(id)
@@ -2180,7 +2207,7 @@ final class RiotAccountsViewModel: ObservableObject {
             updateAccount(id: id) { account in
                 account.withSyncAccepted(accepted, requestedAt: requestedAt)
             }
-            session.container.localStore.appendNotification(title: "Riot 동기화 요청", body: "Riot 계정 동기화가 큐에 등록되었습니다.", symbol: "arrow.clockwise")
+            session.container.localStore.appendNotification(title: "Riot 동기화 요청", body: "Riot ID 동기화가 큐에 등록되었습니다.", symbol: "arrow.clockwise")
             actionState = .success("동기화 요청을 보냈습니다")
             await pollSyncStatus(for: id, showCompletionBanner: true)
         } catch let error as UserFacingError {
@@ -2194,7 +2221,7 @@ final class RiotAccountsViewModel: ObservableObject {
 
     func unlink(account: RiotAccount) async {
         guard session.isAuthenticated else {
-            actionState = .failure("로그인 후 Riot 계정 연결을 해제할 수 있어요.")
+            actionState = .failure("로그인 후 Riot ID를 목록에서 제거할 수 있어요.")
             return
         }
         guard !unlinkInProgressIDs.contains(account.id) else { return }
@@ -2206,11 +2233,11 @@ final class RiotAccountsViewModel: ObservableObject {
             previousAccounts.filter { $0.id != account.id },
             invalidateDependents: true
         )
-        actionState = .inProgress("계정 연결을 해제하는 중입니다")
+        actionState = .inProgress("Riot ID를 목록에서 제거하는 중입니다")
 
         do {
             try await session.container.riotRepository.unlink(accountID: account.id)
-            actionState = .success("계정 연결이 해제되었습니다")
+            actionState = .success("Riot ID를 목록에서 제거했습니다")
             let riotAccountsViewState = await session.refreshRiotAccountsViewState(
                 force: true,
                 invalidateDependents: true
@@ -2221,7 +2248,7 @@ final class RiotAccountsViewModel: ObservableObject {
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
         } catch {
             setAccounts(previousAccounts, invalidateDependents: true)
-            actionState = .failure("계정 연결 해제에 실패했습니다")
+            actionState = .failure("Riot ID 제거에 실패했습니다")
         }
 
         unlinkInProgressIDs.remove(account.id)
@@ -2779,9 +2806,9 @@ struct HomeScreen: View {
         case .noLinkedAccounts:
             return AnyView(
                 riotPowerEmptyCard(
-                    title: "연결된 Riot 계정이 없어요",
-                    message: "Riot 계정을 연결하면 내전 전적과 파워 프로필을 확인할 수 있어요",
-                    buttonTitle: "계정 연결하기"
+                    title: "추가한 Riot ID가 없어요",
+                    message: "Riot ID를 추가하면 내전 전적과 파워 프로필을 확인할 수 있어요",
+                    buttonTitle: "Riot ID 추가하기"
                 ) {
                     router.push(.riotAccounts)
                 }
@@ -2789,9 +2816,9 @@ struct HomeScreen: View {
         case let .error(error):
             return AnyView(
                 riotPowerEmptyCard(
-                    title: "Riot 계정 상태를 확인하지 못했어요",
+                    title: "Riot ID 상태를 확인하지 못했어요",
                     message: error.message,
-                    buttonTitle: "계정 관리 열기"
+                    buttonTitle: "Riot ID 관리 열기"
                 ) {
                     router.push(.riotAccounts)
                 }
@@ -2799,9 +2826,9 @@ struct HomeScreen: View {
         case .loading:
             return AnyView(
                 riotPowerEmptyCard(
-                    title: "Riot 계정을 확인하는 중이에요",
-                    message: "연결 상태를 확인한 뒤 파워 프로필을 보여드릴게요",
-                    buttonTitle: "계정 관리 열기"
+                    title: "Riot ID 목록을 확인하는 중이에요",
+                    message: "추가한 Riot ID를 확인한 뒤 파워 프로필을 보여드릴게요",
+                    buttonTitle: "Riot ID 관리 열기"
                 ) {
                     router.push(.riotAccounts)
                 }
@@ -2880,9 +2907,9 @@ struct HomeScreen: View {
         case .loaded:
             return "상세 보기 >"
         case .noLinkedAccounts:
-            return "계정 연결 >"
+            return "Riot ID 추가 >"
         case .loading, .error:
-            return "계정 관리 >"
+            return "Riot ID 관리 >"
         }
     }
 
@@ -5258,7 +5285,7 @@ struct ProfileScreen: View {
 
         VStack(alignment: .leading, spacing: 10) {
             HStack {
-                Text("연결된 Riot 계정")
+                Text("추가한 Riot ID")
                     .font(AppTypography.body(14, weight: .semibold))
                 Spacer()
                 Button("관리") {
@@ -5271,7 +5298,7 @@ struct ProfileScreen: View {
             case let .loaded(accounts):
                 ForEach(accounts.prefix(2)) { account in
                     HStack {
-                        tagLabel(account.isPrimary ? "대표" : "참고", tint: account.isPrimary ? AppPalette.accentGold : AppPalette.textMuted)
+                        tagLabel(account.isPrimary ? "기준" : "참고", tint: account.isPrimary ? AppPalette.accentGold : AppPalette.textMuted)
                         Text("\(account.riotGameName)#\(account.tagLine)")
                             .font(AppTypography.body(12, weight: .semibold))
                         Spacer()
@@ -5282,18 +5309,18 @@ struct ProfileScreen: View {
                 }
             case .noLinkedAccounts:
                 profileRiotAccountsEmptyState(
-                    title: "연결된 Riot 계정이 없어요",
-                    message: "게임 이름과 태그라인을 입력해 계정을 연결해 주세요."
+                    title: "추가한 Riot ID가 없어요",
+                    message: "게임 이름과 태그라인을 입력해 Riot ID를 추가해 주세요."
                 )
             case let .error(error):
                 profileRiotAccountsEmptyState(
-                    title: "Riot 계정을 확인하지 못했어요",
+                    title: "Riot ID를 확인하지 못했어요",
                     message: error.message
                 )
             case .loading:
                 profileRiotAccountsEmptyState(
-                    title: "Riot 계정을 확인하는 중이에요",
-                    message: "잠시 후 연결 상태를 다시 보여드릴게요."
+                    title: "Riot ID 목록을 확인하는 중이에요",
+                    message: "잠시 후 Riot ID 목록을 다시 보여드릴게요."
                 )
             }
         }
@@ -5345,18 +5372,18 @@ struct ProfileScreen: View {
             }
         } else if case let .error(error) = snapshot.riotAccountsViewState {
             riotProfileEmptyStateCard(
-                title: "Riot 계정 상태를 확인하지 못했어요",
+                title: "Riot ID 상태를 확인하지 못했어요",
                 message: error.message
             )
         } else if case .loading = snapshot.riotAccountsViewState {
             riotProfileEmptyStateCard(
-                title: "Riot 계정을 확인하는 중이에요",
-                message: "연결 상태를 확인한 뒤 파워 프로필을 보여드릴게요."
+                title: "Riot ID 목록을 확인하는 중이에요",
+                message: "추가한 Riot ID를 확인한 뒤 파워 프로필을 보여드릴게요."
             )
         } else {
             riotProfileEmptyStateCard(
-                title: "Riot 계정을 연결하면 확인할 수 있어요",
-                message: "내전 전적과 파워 프로필이 연결된 계정 기준으로 표시됩니다."
+                title: "Riot ID를 추가하면 확인할 수 있어요",
+                message: "내전 전적과 파워 프로필이 기준 Riot ID와 참고 데이터 기준으로 표시됩니다."
             )
         }
     }
@@ -5400,7 +5427,7 @@ struct ProfileScreen: View {
             }
             HStack {
                 tagLabel("동기화", tint: AppPalette.accentGold)
-                Text("Riot 계정 연동과 프로필 저장은 로그인 후 사용할 수 있어요.")
+                Text("Riot ID 추가와 프로필 저장은 로그인 후 사용할 수 있어요.")
                     .font(AppTypography.body(12))
                     .foregroundStyle(AppPalette.textSecondary)
             }
@@ -5507,7 +5534,7 @@ struct ProfileScreen: View {
                 .font(AppTypography.body(12))
                 .foregroundStyle(AppPalette.textSecondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("계정 연결하기") {
+            Button("Riot ID 추가하기") {
                 router.push(.riotAccounts)
             }
             .buttonStyle(SecondaryButtonStyle())
@@ -5567,13 +5594,13 @@ struct RiotAccountsScreen: View {
     @FocusState private var focusedField: RiotAccountInputField?
 
     var body: some View {
-        screenScaffold(title: "Riot 계정 관리", onBack: onBack, rightSystemImage: nil) {
+        screenScaffold(title: "Riot ID 관리", onBack: onBack, rightSystemImage: nil) {
             if session.isGuest {
                 guestContent
             } else {
                 switch viewModel.state {
                 case .initial, .loading:
-                    LoadingStateView(title: "Riot 계정을 불러오는 중입니다")
+                    LoadingStateView(title: "Riot ID를 불러오는 중입니다")
                         .task { await viewModel.load() }
                 case let .error(error):
                     ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
@@ -5586,7 +5613,7 @@ struct RiotAccountsScreen: View {
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
         .alert(
-            "이 라이엇 계정 연결을 해제할까요?",
+            "이 Riot ID를 목록에서 제거할까요?",
             isPresented: Binding(
                 get: { pendingUnlinkAccount != nil },
                 set: { isPresented in
@@ -5600,7 +5627,7 @@ struct RiotAccountsScreen: View {
             Button("취소", role: .cancel) {
                 pendingUnlinkAccount = nil
             }
-            Button("해제", role: .destructive) {
+            Button("제거", role: .destructive) {
                 pendingUnlinkAccount = nil
                 Task { await viewModel.unlink(account: account) }
             }
@@ -5638,15 +5665,15 @@ struct RiotAccountsScreen: View {
     private var guestContent: some View {
         ScrollView(showsIndicators: false) {
             VStack(spacing: 20) {
-                Text("Riot 계정 연동은 계정 귀속 기능입니다.")
+                Text("Riot ID는 공개 Riot API 기반 참고 데이터로 사용됩니다.")
                     .font(AppTypography.body(12))
                     .foregroundStyle(AppPalette.textSecondary)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                 AuthInlineAccessCard(
                     session: session,
-                    title: "로그인 후 Riot 계정 연동",
-                    message: "대표 계정 설정, 전적 동기화, 프로필 연결은 로그인 후 사용할 수 있어요."
+                    title: "로그인 후 Riot ID 관리",
+                    message: "Riot ID 추가, 기준 Riot ID 설정, 전적 동기화는 로그인 후 사용할 수 있어요."
                 )
             }
             .padding(24)
@@ -5656,7 +5683,7 @@ struct RiotAccountsScreen: View {
     private func formContent(accounts: [RiotAccount]) -> some View {
         ScrollView(showsIndicators: false) {
             VStack(spacing: 20) {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 10) {
                     HStack(spacing: 10) {
                         Image(systemName: "info.circle")
                             .foregroundStyle(AppPalette.accentBlue)
@@ -5664,6 +5691,14 @@ struct RiotAccountsScreen: View {
                             .font(AppTypography.body(12))
                             .foregroundStyle(AppPalette.textSecondary)
                     }
+
+                    Text("입력한 Riot ID는 이 계정의 밸런스 계산과 참고 정보 표시 기준으로 사용할 수 있습니다.")
+                        .font(AppTypography.body(11))
+                        .foregroundStyle(AppPalette.textMuted)
+
+                    Text("본인 인증 기반 연동이 아니라 공개 Riot ID 기준 참고 데이터로 동작합니다.")
+                        .font(AppTypography.body(11))
+                        .foregroundStyle(AppPalette.textMuted)
 
                     Text("입력 예시: Hide on bush#KR1")
                         .font(AppTypography.body(12, weight: .semibold))
@@ -5678,7 +5713,7 @@ struct RiotAccountsScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("새 계정 추가")
+                    Text("새 Riot ID 추가")
                         .font(AppTypography.heading(16, weight: .bold))
 
                     HStack(alignment: .top, spacing: 12) {
@@ -5694,7 +5729,7 @@ struct RiotAccountsScreen: View {
                                 .onSubmit { focusedField = .tagLine }
                             validationMessage(
                                 state: gameNameValidationState,
-                                helperText: "Riot ID의 # 앞부분을 입력해 주세요."
+                                helperText: "Riot ID의 게임 이름 부분을 입력해 주세요."
                             )
                         }
 
@@ -5716,7 +5751,7 @@ struct RiotAccountsScreen: View {
                         .frame(width: 124)
                     }
 
-                    Toggle("대표 계정으로 설정", isOn: $isPrimary)
+                    Toggle("기준 Riot ID로 설정", isOn: $isPrimary)
                         .tint(AppPalette.accentBlue)
 
                     Button {
@@ -5727,7 +5762,7 @@ struct RiotAccountsScreen: View {
                                 ProgressView()
                                     .tint(AppPalette.bgPrimary)
                             }
-                            Text(viewModel.isConnecting ? "연결 중" : "연결하기")
+                            Text(viewModel.isConnecting ? "추가 중" : "추가하기")
                         }
                         .frame(maxWidth: .infinity)
                     }
@@ -5737,14 +5772,14 @@ struct RiotAccountsScreen: View {
                 }
 
                 VStack(alignment: .leading, spacing: 12) {
-                    Text("연결된 계정")
+                    Text("추가한 Riot ID")
                         .font(AppTypography.heading(16, weight: .bold))
 
                     if accounts.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("연결된 Riot 계정이 없습니다")
+                            Text("추가한 Riot ID가 없습니다")
                                 .font(AppTypography.body(14, weight: .semibold))
-                            Text("게임 이름과 태그라인을 입력해 계정을 연결하면, 대표/참고 구분과 동기화 상태를 여기서 확인할 수 있어요.")
+                            Text("게임 이름과 태그라인을 입력해 Riot ID를 추가하면, 밸런스 계산 기준과 참고 데이터를 여기서 확인할 수 있어요.")
                                 .font(AppTypography.body(12))
                                 .foregroundStyle(AppPalette.textSecondary)
                         }
@@ -5765,7 +5800,7 @@ struct RiotAccountsScreen: View {
                                 HStack(alignment: .top, spacing: 12) {
                                     VStack(alignment: .leading, spacing: 6) {
                                         HStack(spacing: 8) {
-                                            Text(account.isPrimary ? "대표" : "참고")
+                                            Text(account.isPrimary ? "기준" : "참고")
                                                 .font(AppTypography.body(11, weight: .semibold))
                                                 .foregroundStyle(account.isPrimary ? AppPalette.bgPrimary : AppPalette.textSecondary)
                                                 .padding(.horizontal, 8)
@@ -5792,7 +5827,7 @@ struct RiotAccountsScreen: View {
                                         .tint(AppPalette.accentBlue)
                                         .disabled(isSyncing || isUnlinking)
 
-                                        Button(isUnlinking ? "해제 중" : "해제") {
+                                        Button(isUnlinking ? "제거 중" : "제거") {
                                             pendingUnlinkAccount = account
                                         }
                                         .buttonStyle(.bordered)
@@ -5844,9 +5879,12 @@ struct RiotAccountsScreen: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("여러 계정 합산 기준")
+                    Text("여러 Riot ID 활용 기준")
                         .font(AppTypography.body(13, weight: .semibold))
-                    Text("대표 계정의 티어·전적이 주 기준이며, 참고 계정은 라인별 성과 데이터를 보완합니다. 실제 서버는 대표/참고 가중치를 노출하지 않으므로 현재 클라이언트는 설명성 UI만 제공합니다.")
+                    Text("기준 Riot ID의 데이터가 우선 반영되며, 다른 Riot ID는 참고용 데이터로 함께 볼 수 있습니다.")
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                    Text("실제 계산 로직과 가중치는 서버 기준을 따르며, 클라이언트는 이해를 돕기 위한 설명을 제공합니다.")
                         .font(AppTypography.body(12))
                         .foregroundStyle(AppPalette.textSecondary)
                 }
@@ -5980,12 +6018,12 @@ struct RiotAccountsScreen: View {
     }
 
     private func unlinkConfirmationMessage(for account: RiotAccount, accounts: [RiotAccount]) -> String {
-        var parts = ["해제하면 이 계정의 동기화 정보와 연결 상태가 제거됩니다."]
+        var parts = ["제거하면 이 Riot ID의 동기화 정보와 목록 표시가 함께 사라집니다."]
         if account.isPrimary {
             if accounts.count <= 1 {
-                parts.append("현재 대표 계정이 이 계정뿐이라 해제 후에는 연결된 Riot 계정이 없는 상태가 될 수 있습니다.")
+                parts.append("현재 기준 Riot ID가 이 항목뿐이라 제거 후에는 추가한 Riot ID가 없는 상태가 될 수 있습니다.")
             } else {
-                parts.append("대표 계정을 해제하면 대표/참고 배지는 서버 정책에 따라 다시 정리됩니다.")
+                parts.append("기준 Riot ID를 제거하면 어떤 Riot ID를 기준으로 볼지는 서버 정책에 따라 다시 정리됩니다.")
             }
         }
         return parts.joined(separator: " ")
@@ -6109,14 +6147,14 @@ struct SettingsScreen: View {
                         AuthInlineAccessCard(
                             session: session,
                             title: "로그인하고 이어쓰기",
-                            message: "설정 동기화, 프로필 편집, Riot 계정 연동은 로그인 후 사용할 수 있어요."
+                            message: "설정 동기화, 프로필 편집, Riot ID 관리는 로그인 후 사용할 수 있어요."
                         )
 
                         settingsSection(title: "계정", rows: [
                             settingsRow("로그인", subtitle: "동기화 시작", systemImage: "person.crop.circle") {
                                 session.requireAuthentication(for: .settings)
                             },
-                            settingsRow("Riot 계정 관리", subtitle: "로그인 후 사용", systemImage: "person.text.rectangle") {
+                            settingsRow("Riot ID 관리", subtitle: "로그인 후 사용", systemImage: "person.text.rectangle") {
                                 session.requireAuthentication(for: .riotAccount) {
                                     router.push(.riotAccounts)
                                 }
@@ -6134,7 +6172,7 @@ struct SettingsScreen: View {
                     } else {
                         settingsSection(title: "계정", rows: [
                             settingsRow("계정 관리", subtitle: session.profile?.email ?? "-", systemImage: "person.crop.circle") { showsProfileEdit = true },
-                            settingsRow("Riot 계정 관리", subtitle: "연결 계정 확인", systemImage: "person.text.rectangle") { router.push(.riotAccounts) }
+                            settingsRow("Riot ID 관리", subtitle: "추가한 Riot ID 확인", systemImage: "person.text.rectangle") { router.push(.riotAccounts) }
                         ])
 
                         settingsSection(title: "게임 설정", rows: [

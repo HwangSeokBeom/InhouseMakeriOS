@@ -118,7 +118,7 @@ enum AuthRequirement: Equatable {
         case .profileHistory:
             return "내 기록, 통계, 프로필 상세는 로그인 후 사용할 수 있어요."
         case .riotAccount:
-            return "Riot 계정 연동과 동기화는 계정 귀속 기능이라 로그인 후 사용할 수 있어요."
+            return "Riot ID 관리와 동기화는 로그인 후 사용할 수 있어요."
         case .settings:
             return "계정 기반 설정, 프로필 편집, 동기화 기능을 사용하려면 로그인이 필요해요."
         case .generic:
@@ -379,7 +379,11 @@ enum AuthErrorMapper {
             return .serverUnavailable
         case .forbiddenFeature:
             return .networkError
-        case .socialTokenInvalid, .unknown:
+        case .socialTokenInvalid:
+            return .socialTokenInvalid
+        case .unknown:
+            break
+        @unknown default:
             break
         }
 
