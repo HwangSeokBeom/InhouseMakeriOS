@@ -118,6 +118,8 @@ final class AppSessionViewModel: ObservableObject {
     @Published var authPrompt: AuthPromptContext?
     @Published private(set) var onboardingPresentationState: OnboardingPresentationState = .unresolved
     @Published private(set) var activeModal: AppModalKind?
+    @Published private(set) var riotAccountsViewState: RiotLinkedAccountsViewState = .loading
+    @Published private(set) var riotLinkedDataRevision = 0
 
     let container: AppContainer
     private(set) var userSession: UserSession?
@@ -179,6 +181,7 @@ final class AppSessionViewModel: ObservableObject {
 
         guard let persistedTokens else {
             syncOnboardingPresentation(hasAuthenticatedSession: false)
+            updateRiotAccountsViewState(.noLinkedAccounts)
             debugLog("bootstrap completed without persisted tokens; session changed to guest")
             state = .guest
             return
@@ -189,12 +192,14 @@ final class AppSessionViewModel: ObservableObject {
             let session = UserSession(authTokens: persistedTokens, user: profile)
             userSession = session
             syncOnboardingPresentation(hasAuthenticatedSession: true)
+            updateRiotAccountsViewState(.loading)
             debugLog("bootstrap restored authenticated session for user \(session.user.id)")
             state = .authenticated(session)
         } catch {
             await container.authRepository.signOut()
             userSession = nil
             syncOnboardingPresentation(hasAuthenticatedSession: false)
+            updateRiotAccountsViewState(.noLinkedAccounts)
             debugLog("bootstrap failed to restore session; falling back to guest")
             state = .guest
         }
@@ -221,6 +226,7 @@ final class AppSessionViewModel: ObservableObject {
 
     func restoreGuestSession() {
         userSession = nil
+        updateRiotAccountsViewState(.noLinkedAccounts)
         debugLog("session changed to guest")
         state = .guest
     }
@@ -364,6 +370,52 @@ final class AppSessionViewModel: ObservableObject {
         state = .authenticated(session)
     }
 
+    func refreshRiotAccountsViewState(
+        force: Bool = false,
+        invalidateDependents: Bool = false
+    ) async -> RiotLinkedAccountsViewState {
+        guard isAuthenticated else {
+            updateRiotAccountsViewState(.noLinkedAccounts, invalidateDependents: invalidateDependents)
+            return riotAccountsViewState
+        }
+
+        if !force {
+            switch riotAccountsViewState {
+            case .noLinkedAccounts, .loaded:
+                return riotAccountsViewState
+            case .loading, .error:
+                break
+            }
+        }
+
+        updateRiotAccountsViewState(.loading)
+
+        do {
+            let accounts = try await container.riotRepository.list()
+            let nextState = RiotLinkedAccountsViewState(accounts: accounts)
+            updateRiotAccountsViewState(nextState, invalidateDependents: invalidateDependents)
+            return nextState
+        } catch let error as UserFacingError {
+            let mappedError = error.serverContractMapped
+            updateRiotAccountsViewState(.error(mappedError), invalidateDependents: invalidateDependents)
+            return .error(mappedError)
+        } catch {
+            let mappedError = UserFacingError(
+                title: "Riot 계정 로딩 실패",
+                message: "Riot 계정을 불러오지 못했습니다."
+            )
+            updateRiotAccountsViewState(.error(mappedError), invalidateDependents: invalidateDependents)
+            return .error(mappedError)
+        }
+    }
+
+    func applyRiotAccounts(_ accounts: [RiotAccount], invalidateDependents: Bool = false) {
+        updateRiotAccountsViewState(
+            RiotLinkedAccountsViewState(accounts: accounts),
+            invalidateDependents: invalidateDependents
+        )
+    }
+
     func signOut(router: AppRouter) async {
         await container.authRepository.signOut()
         router.reset()
@@ -373,6 +425,7 @@ final class AppSessionViewModel: ObservableObject {
         deferredAuthPrompt = nil
         clearAuthPrompt(userInitiated: false)
         syncOnboardingPresentation(hasAuthenticatedSession: false)
+        updateRiotAccountsViewState(.noLinkedAccounts)
         debugLog("signOut completed; route reset to main home and session changed to guest")
         state = .guest
     }
@@ -380,6 +433,7 @@ final class AppSessionViewModel: ObservableObject {
     func applyAuthenticatedSession(_ session: UserSession) {
         userSession = session
         syncOnboardingPresentation(hasAuthenticatedSession: true)
+        updateRiotAccountsViewState(.loading)
         debugLog("session changed to authenticated for user \(session.user.id)")
         state = .authenticated(session)
     }
@@ -411,6 +465,16 @@ final class AppSessionViewModel: ObservableObject {
         self.deferredAuthPrompt = nil
         debugLog("presenting login prompt after dismiss")
         authPrompt = deferredAuthPrompt
+    }
+
+    private func updateRiotAccountsViewState(
+        _ nextState: RiotLinkedAccountsViewState,
+        invalidateDependents: Bool = false
+    ) {
+        riotAccountsViewState = nextState
+        if invalidateDependents {
+            riotLinkedDataRevision &+= 1
+        }
     }
 
     private func clearAuthPrompt(userInitiated: Bool) {
@@ -473,10 +537,20 @@ final class HomeViewModel: ObservableObject {
                 let groups = try await loadTrackedGroups()
                 let currentMatch = try await loadCurrentMatch()
                 let posts = try await session.container.recruitingRepository.list(status: .open)
-                let power = try? await session.container.profileRepository.powerProfile(userID: userID)
+                let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
+                if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
+                    throw error
+                }
+                let power: PowerProfile?
+                if riotAccountsViewState.hasLinkedAccounts {
+                    power = try? await session.container.profileRepository.powerProfile(userID: userID)
+                } else {
+                    power = nil
+                }
                 let history = try await session.container.profileRepository.history(userID: userID, limit: 1)
                 let snapshot = HomeSnapshot(
                     profile: profile,
+                    riotAccountsViewState: riotAccountsViewState,
                     power: power,
                     groups: groups,
                     currentMatch: currentMatch,
@@ -812,10 +886,31 @@ final class ProfileViewModel: ObservableObject {
                 profile = try await session.container.profileRepository.me()
                 session.updateAuthenticatedProfile(profile)
             }
-            let power = try? await session.container.profileRepository.powerProfile(userID: userID)
-            let riotAccounts = (try? await session.container.riotRepository.list()) ?? []
-            let history = (try? await session.container.profileRepository.history(userID: userID, limit: 10)) ?? []
-            state = .content(.authenticated(ProfileSnapshot(profile: profile, power: power, riotAccounts: riotAccounts, history: history)))
+            let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
+            if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
+                throw error
+            }
+
+            let power: PowerProfile?
+            let history: [MatchHistoryItem]
+            if riotAccountsViewState.hasLinkedAccounts {
+                power = try? await session.container.profileRepository.powerProfile(userID: userID)
+                history = (try? await session.container.profileRepository.history(userID: userID, limit: 10)) ?? []
+            } else {
+                power = nil
+                history = []
+            }
+
+            state = .content(
+                .authenticated(
+                    ProfileSnapshot(
+                        profile: profile,
+                        riotAccountsViewState: riotAccountsViewState,
+                        power: power,
+                        history: history
+                    )
+                )
+            )
             didSucceed = true
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
@@ -1000,12 +1095,12 @@ fileprivate struct GroupPowerGuideViewState: Hashable {
 }
 
 fileprivate enum PowerViewStateBuilder {
-    static func home(power: PowerProfile?) -> HomePowerCardViewState {
+    static func home(power: PowerProfile?, hasLinkedRiotAccount: Bool) -> HomePowerCardViewState {
         HomePowerCardViewState(
             overview: overview(
                 power: power,
                 history: [],
-                hasLinkedRiotAccount: true,
+                hasLinkedRiotAccount: hasLinkedRiotAccount,
                 showsTier: false
             )
         )
@@ -1099,8 +1194,12 @@ fileprivate enum PowerViewStateBuilder {
                 change: nil,
                 changeCaptionText: nil,
                 percentileText: nil,
-                supportingText: "최근 경기와 결과 입력이 쌓이면 파워가 계산돼요",
-                insightText: "파워를 계산할 데이터가 아직 충분하지 않아요",
+                supportingText: hasLinkedRiotAccount
+                    ? "최근 경기와 결과 입력이 쌓이면 파워가 계산돼요"
+                    : "Riot 계정을 연결하면 파워 프로필을 확인할 수 있어요",
+                insightText: hasLinkedRiotAccount
+                    ? "파워를 계산할 데이터가 아직 충분하지 않아요"
+                    : "연결된 Riot 계정이 없어요",
                 components: placeholderComponents(),
                 isPlaceholder: true
             )
@@ -1554,15 +1653,31 @@ fileprivate final class PowerDetailViewModel: ObservableObject {
 
         state = .loading
 
+        let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
+        if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
+            session.handleProtectedLoadError(
+                error,
+                requirement: .riotAccount,
+                state: &state,
+                fallbackMessage: "로그인 후 파워 상세를 다시 확인할 수 있어요."
+            )
+            return
+        }
+
+        guard riotAccountsViewState.hasLinkedAccounts else {
+            state = .empty("Riot 계정을 연결하면 내전 전적과 파워 프로필을 확인할 수 있어요.")
+            didSucceed = true
+            return
+        }
+
         let power = try? await session.container.profileRepository.powerProfile(userID: userID)
         let history = (try? await session.container.profileRepository.history(userID: userID, limit: 10)) ?? []
-        let riotAccounts = (try? await session.container.riotRepository.list()) ?? []
 
         state = .content(
             PowerViewStateBuilder.detail(
                 power: power,
                 history: history,
-                hasLinkedRiotAccount: riotAccounts.isEmpty == false
+                hasLinkedRiotAccount: true
             )
         )
         didSucceed = true
@@ -1907,9 +2022,30 @@ final class RiotAccountsViewModel: ObservableObject {
         state.value?.accounts ?? []
     }
 
-    private func setAccounts(_ accounts: [RiotAccount]) {
+    private func setAccounts(
+        _ accounts: [RiotAccount],
+        syncSession: Bool = true,
+        invalidateDependents: Bool = false
+    ) {
+        if syncSession {
+            session.applyRiotAccounts(accounts, invalidateDependents: invalidateDependents)
+        }
         let snapshot = RiotAccountSnapshot(accounts: accounts, syncInProgressIDs: syncInProgressIDs)
         state = accounts.isEmpty ? .empty("연결된 Riot 계정이 없습니다.") : .content(snapshot)
+    }
+
+    private func applyRiotAccountsViewState(_ riotAccountsViewState: RiotLinkedAccountsViewState) {
+        switch riotAccountsViewState {
+        case .loading:
+            state = .loading
+        case .noLinkedAccounts:
+            setAccounts([], syncSession: false)
+        case let .loaded(accounts):
+            setAccounts(accounts, syncSession: false)
+            observeSyncStatusesIfNeeded(for: accounts)
+        case let .error(error):
+            state = .error(error)
+        }
     }
 
     private func updateAccount(id: String, transform: (RiotAccount) -> RiotAccount) {
@@ -1983,21 +2119,17 @@ final class RiotAccountsViewModel: ObservableObject {
             return
         }
         if !force, case .content = state { return }
-        state = .loading
-        do {
-            let accounts = try await session.container.riotRepository.list()
-            setAccounts(accounts)
-            observeSyncStatusesIfNeeded(for: accounts)
-        } catch let error as UserFacingError {
+        let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
+        if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
             session.handleProtectedLoadError(
                 error,
                 requirement: .riotAccount,
                 state: &state,
                 fallbackMessage: "로그인 후 Riot 계정을 다시 확인할 수 있어요."
             )
-        } catch {
-            state = .error(UserFacingError(title: "Riot 계정 로딩 실패", message: "Riot 계정을 불러오지 못했습니다."))
+            return
         }
+        applyRiotAccountsViewState(riotAccountsViewState)
     }
 
     func connect(gameName: String, tagLine: String, region: String, isPrimary: Bool) async -> Bool {
@@ -2020,7 +2152,11 @@ final class RiotAccountsViewModel: ObservableObject {
                 isPrimary: isPrimary
             )
             actionState = .success("계정이 연결되었습니다")
-            await load(force: true)
+            let riotAccountsViewState = await session.refreshRiotAccountsViewState(
+                force: true,
+                invalidateDependents: true
+            )
+            applyRiotAccountsViewState(riotAccountsViewState)
             return true
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
@@ -2066,18 +2202,25 @@ final class RiotAccountsViewModel: ObservableObject {
         let previousAccounts = currentAccounts
         unlinkInProgressIDs.insert(account.id)
         syncInProgressIDs.remove(account.id)
-        setAccounts(previousAccounts.filter { $0.id != account.id })
+        setAccounts(
+            previousAccounts.filter { $0.id != account.id },
+            invalidateDependents: true
+        )
         actionState = .inProgress("계정 연결을 해제하는 중입니다")
 
         do {
             try await session.container.riotRepository.unlink(accountID: account.id)
             actionState = .success("계정 연결이 해제되었습니다")
-            await load(force: true)
+            let riotAccountsViewState = await session.refreshRiotAccountsViewState(
+                force: true,
+                invalidateDependents: true
+            )
+            applyRiotAccountsViewState(riotAccountsViewState)
         } catch let error as UserFacingError {
-            setAccounts(previousAccounts)
+            setAccounts(previousAccounts, invalidateDependents: true)
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
         } catch {
-            setAccounts(previousAccounts)
+            setAccounts(previousAccounts, invalidateDependents: true)
             actionState = .failure("계정 연결 해제에 실패했습니다")
         }
 
@@ -2174,6 +2317,14 @@ struct AppShellView: View {
                 .task(id: session.dataScopeKey) {
                     resetViewModelsForSessionChange()
                     await loadSelectedTab(force: true)
+                }
+                .task(id: session.riotLinkedDataRevision) {
+                    guard session.riotLinkedDataRevision > 0 else { return }
+                    homeViewModel.reset()
+                    profileViewModel.reset()
+                    if session.selectedTab == .home || session.selectedTab == .profile {
+                        await loadSelectedTab(force: true)
+                    }
                 }
         }
     }
@@ -2473,10 +2624,17 @@ struct HomeScreen: View {
 
                         switch contentState {
                         case let .authenticated(snapshot):
-                            homeContentSection(title: "내 파워 프로필", trailing: "상세 보기 >") {
-                                openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
+                            homeContentSection(
+                                title: "내 파워 프로필",
+                                trailing: powerSectionTrailingText(for: snapshot.riotAccountsViewState)
+                            ) {
+                                openPowerSection(for: snapshot.riotAccountsViewState)
                             } content: {
-                                powerSummaryCard(profile: snapshot.profile, power: snapshot.power)
+                                powerSummaryCard(
+                                    profile: snapshot.profile,
+                                    power: snapshot.power,
+                                    riotAccountsViewState: snapshot.riotAccountsViewState
+                                )
                             }
 
                             homeContentSection(title: "최근 경기") {
@@ -2574,6 +2732,14 @@ struct HomeScreen: View {
         router.push(route)
     }
 
+    private func openPowerSection(for riotAccountsViewState: RiotLinkedAccountsViewState) {
+        if riotAccountsViewState.hasLinkedAccounts {
+            openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
+        } else {
+            router.push(.riotAccounts)
+        }
+    }
+
     private func groups(for content: HomeContentState) -> [GroupSummary] {
         switch content {
         case let .guest(snapshot):
@@ -2604,67 +2770,161 @@ struct HomeScreen: View {
         }
     }
 
-    private func powerSummaryCard(profile: UserProfile, power: PowerProfile?) -> some View {
-        let overview = PowerViewStateBuilder.home(power: power).overview
+    private func powerSummaryCard(
+        profile: UserProfile,
+        power: PowerProfile?,
+        riotAccountsViewState: RiotLinkedAccountsViewState
+    ) -> some View {
+        switch riotAccountsViewState {
+        case .noLinkedAccounts:
+            return AnyView(
+                riotPowerEmptyCard(
+                    title: "연결된 Riot 계정이 없어요",
+                    message: "Riot 계정을 연결하면 내전 전적과 파워 프로필을 확인할 수 있어요",
+                    buttonTitle: "계정 연결하기"
+                ) {
+                    router.push(.riotAccounts)
+                }
+            )
+        case let .error(error):
+            return AnyView(
+                riotPowerEmptyCard(
+                    title: "Riot 계정 상태를 확인하지 못했어요",
+                    message: error.message,
+                    buttonTitle: "계정 관리 열기"
+                ) {
+                    router.push(.riotAccounts)
+                }
+            )
+        case .loading:
+            return AnyView(
+                riotPowerEmptyCard(
+                    title: "Riot 계정을 확인하는 중이에요",
+                    message: "연결 상태를 확인한 뒤 파워 프로필을 보여드릴게요",
+                    buttonTitle: "계정 관리 열기"
+                ) {
+                    router.push(.riotAccounts)
+                }
+            )
+        case .loaded:
+            let overview = PowerViewStateBuilder.home(
+                power: power,
+                hasLinkedRiotAccount: riotAccountsViewState.hasLinkedAccounts
+            ).overview
 
-        return Button {
-            openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
-        } label: {
-            VStack(alignment: .leading, spacing: 14) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(overview.scoreText)
-                            .font(AppTypography.heading(42, weight: .heavy))
-                            .foregroundStyle(AppPalette.accentBlue)
-                        Text(overview.scoreLabel)
-                            .font(AppTypography.body(11))
-                            .foregroundStyle(AppPalette.textMuted)
-                    }
+            return AnyView(
+                Button {
+                    openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
+                } label: {
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack(alignment: .top) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(overview.scoreText)
+                                    .font(AppTypography.heading(42, weight: .heavy))
+                                    .foregroundStyle(AppPalette.accentBlue)
+                                Text(overview.scoreLabel)
+                                    .font(AppTypography.body(11))
+                                    .foregroundStyle(AppPalette.textMuted)
+                            }
 
-                    Spacer(minLength: 16)
+                            Spacer(minLength: 16)
 
-                    VStack(alignment: .trailing, spacing: 8) {
-                        if let delta = overview.change {
-                            powerHomeDeltaBadge(delta, caption: overview.changeCaptionText)
+                            VStack(alignment: .trailing, spacing: 8) {
+                                if let delta = overview.change {
+                                    powerHomeDeltaBadge(delta, caption: overview.changeCaptionText)
+                                }
+
+                                if let percentileText = overview.percentileText {
+                                    Text(percentileText)
+                                        .font(AppTypography.body(11, weight: .semibold))
+                                        .foregroundStyle(AppPalette.accentGold)
+                                }
+                            }
                         }
 
-                        if let percentileText = overview.percentileText {
-                            Text(percentileText)
-                                .font(AppTypography.body(11, weight: .semibold))
-                                .foregroundStyle(AppPalette.accentGold)
+                        Text(overview.isPlaceholder ? "\(profile.nickname)님의 경기 결과가 쌓이면 파워가 계산돼요." : overview.insightText)
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        HStack(spacing: 6) {
+                            Text("상세 보기")
+                                .font(AppTypography.body(13, weight: .semibold))
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 11, weight: .semibold))
                         }
+                        .foregroundStyle(AppPalette.textPrimary)
                     }
+                    .padding(18)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        LinearGradient(
+                            colors: [Color(hex: 0x16284C), Color(hex: 0x111824)],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                 }
-
-                Text(overview.isPlaceholder ? "\(profile.nickname)님의 경기 결과가 쌓이면 파워가 계산돼요." : overview.insightText)
-                    .font(AppTypography.body(12))
-                    .foregroundStyle(AppPalette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 6) {
-                    Text("상세 보기")
-                        .font(AppTypography.body(13, weight: .semibold))
-                    Image(systemName: "chevron.right")
-                        .font(.system(size: 11, weight: .semibold))
-                }
-                .foregroundStyle(AppPalette.textPrimary)
-            }
-            .padding(18)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                LinearGradient(
-                    colors: [Color(hex: 0x16284C), Color(hex: 0x111824)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                .buttonStyle(.plain)
             )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
-        .buttonStyle(.plain)
+    }
+
+    private func powerSectionTrailingText(for riotAccountsViewState: RiotLinkedAccountsViewState) -> String {
+        switch riotAccountsViewState {
+        case .loaded:
+            return "상세 보기 >"
+        case .noLinkedAccounts:
+            return "계정 연결 >"
+        case .loading, .error:
+            return "계정 관리 >"
+        }
+    }
+
+    private func riotPowerEmptyCard(
+        title: String,
+        message: String,
+        buttonTitle: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "person.text.rectangle.fill")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(AppPalette.accentBlue)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(AppTypography.heading(16, weight: .bold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                    Text(message)
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            Button(buttonTitle, action: action)
+                .buttonStyle(SecondaryButtonStyle())
+        }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [Color(hex: 0x16284C), Color(hex: 0x111824)],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
     }
 
     private func guestBenefitCard(title: String, message: String, buttonTitle: String, action: @escaping () -> Void) -> some View {
@@ -4985,7 +5245,7 @@ struct ProfileScreen: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(snapshot.profile.nickname)
                     .font(AppTypography.heading(24, weight: .bold))
-                Text(snapshot.riotAccounts.first.map { "\($0.riotGameName)#\($0.tagLine)" } ?? snapshot.profile.email)
+                Text(snapshot.riotAccountsViewState.primaryAccount.map { "\($0.riotGameName)#\($0.tagLine)" } ?? snapshot.profile.email)
                     .font(AppTypography.body(13))
                     .foregroundStyle(AppPalette.textSecondary)
                 HStack(spacing: 8) {
@@ -5007,71 +5267,97 @@ struct ProfileScreen: View {
                 .font(AppTypography.body(12, weight: .semibold))
                 .foregroundStyle(AppPalette.accentBlue)
             }
-            ForEach(snapshot.riotAccounts.prefix(2)) { account in
-                HStack {
-                    tagLabel(account.isPrimary ? "대표" : "참고", tint: account.isPrimary ? AppPalette.accentGold : AppPalette.textMuted)
-                    Text("\(account.riotGameName)#\(account.tagLine)")
-                        .font(AppTypography.body(12, weight: .semibold))
-                    Spacer()
-                    Text(account.verificationStatus.title)
-                        .font(AppTypography.body(12))
-                        .foregroundStyle(account.isPrimary ? AppPalette.accentGold : AppPalette.textSecondary)
+            switch snapshot.riotAccountsViewState {
+            case let .loaded(accounts):
+                ForEach(accounts.prefix(2)) { account in
+                    HStack {
+                        tagLabel(account.isPrimary ? "대표" : "참고", tint: account.isPrimary ? AppPalette.accentGold : AppPalette.textMuted)
+                        Text("\(account.riotGameName)#\(account.tagLine)")
+                            .font(AppTypography.body(12, weight: .semibold))
+                        Spacer()
+                        Text(account.verificationStatus.title)
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(account.isPrimary ? AppPalette.accentGold : AppPalette.textSecondary)
+                    }
                 }
+            case .noLinkedAccounts:
+                profileRiotAccountsEmptyState(
+                    title: "연결된 Riot 계정이 없어요",
+                    message: "게임 이름과 태그라인을 입력해 계정을 연결해 주세요."
+                )
+            case let .error(error):
+                profileRiotAccountsEmptyState(
+                    title: "Riot 계정을 확인하지 못했어요",
+                    message: error.message
+                )
+            case .loading:
+                profileRiotAccountsEmptyState(
+                    title: "Riot 계정을 확인하는 중이에요",
+                    message: "잠시 후 연결 상태를 다시 보여드릴게요."
+                )
             }
         }
         .padding(16)
         .background(AppPalette.bgCard)
         .clipShape(RoundedRectangle(cornerRadius: 12))
 
-        if let power = snapshot.power {
-            VStack(alignment: .leading, spacing: 14) {
-                Text("파워 프로필")
-                    .font(AppTypography.heading(16, weight: .bold))
-                HStack(spacing: 16) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("\(Int(power.overallPower.rounded()))")
-                            .font(AppTypography.heading(40, weight: .heavy))
-                            .foregroundStyle(AppPalette.accentBlue)
-                        Text("종합 파워")
-                            .font(AppTypography.body(11))
-                            .foregroundStyle(AppPalette.textMuted)
+        if snapshot.riotAccountsViewState.hasLinkedAccounts {
+            if let power = snapshot.power {
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("파워 프로필")
+                        .font(AppTypography.heading(16, weight: .bold))
+                    HStack(spacing: 16) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(Int(power.overallPower.rounded()))")
+                                .font(AppTypography.heading(40, weight: .heavy))
+                                .foregroundStyle(AppPalette.accentBlue)
+                            Text("종합 파워")
+                                .font(AppTypography.body(11))
+                                .foregroundStyle(AppPalette.textMuted)
+                        }
+                        VStack(alignment: .leading, spacing: 8) {
+                            profileStat("최근 폼", value: Int(power.formScore.rounded()), tint: AppPalette.textPrimary)
+                            profileStat("안정성", value: Int(power.stability.rounded()), tint: AppPalette.textSecondary)
+                            profileStat("캐리 기여", value: Int(power.carry.rounded()), tint: AppPalette.textSecondary)
+                            profileStat("팀 기여도", value: Int(power.teamContribution.rounded()), tint: AppPalette.textSecondary)
+                            profileStat("내전 MMR", value: Int(power.inhouseMMR.rounded()), tint: AppPalette.accentGold)
+                        }
                     }
-                    VStack(alignment: .leading, spacing: 8) {
-                        profileStat("최근 폼", value: Int(power.formScore.rounded()), tint: AppPalette.textPrimary)
-                        profileStat("안정성", value: Int(power.stability.rounded()), tint: AppPalette.textSecondary)
-                        profileStat("캐리 기여", value: Int(power.carry.rounded()), tint: AppPalette.textSecondary)
-                        profileStat("팀 기여도", value: Int(power.teamContribution.rounded()), tint: AppPalette.textSecondary)
-                        profileStat("내전 MMR", value: Int(power.inhouseMMR.rounded()), tint: AppPalette.accentGold)
-                    }
-                }
-                Text("라인별 파워")
-                    .font(AppTypography.body(13, weight: .semibold))
-                ForEach([Position.top, .jungle, .mid, .adc, .support], id: \.self) { role in
-                    HStack(spacing: 8) {
-                        Text(role.shortLabel)
-                            .font(AppTypography.body(12, weight: .semibold))
-                            .foregroundStyle(role == .mid ? AppPalette.accentBlue : AppPalette.textSecondary)
-                            .frame(width: 32, alignment: .leading)
-                        ProgressView(value: power.lanePower[role] ?? 50, total: 100)
-                            .tint(laneTint(role))
-                        Text("\(Int((power.lanePower[role] ?? 50).rounded()))")
-                            .font(AppTypography.body(12, weight: .semibold))
+                    Text("라인별 파워")
+                        .font(AppTypography.body(13, weight: .semibold))
+                    ForEach([Position.top, .jungle, .mid, .adc, .support], id: \.self) { role in
+                        profileLanePowerRow(role: role, lanePower: power.lanePower[role])
                     }
                 }
+                .padding(16)
+                .background(AppPalette.bgCard)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
-            .padding(16)
-            .background(AppPalette.bgCard)
-            .clipShape(RoundedRectangle(cornerRadius: 12))
-        }
 
-        VStack(alignment: .leading, spacing: 10) {
-            Text("최근 내전 성적")
-                .font(AppTypography.heading(16, weight: .bold))
-            HStack(spacing: 8) {
-                recentStat(title: "최근 전적", value: "\(snapshot.history.filter { $0.result == "WIN" }.count)승 \(snapshot.history.filter { $0.result == "LOSE" }.count)패", tint: AppPalette.textPrimary)
-                recentStat(title: "승률", value: winRateText(snapshot.history), tint: AppPalette.accentGreen)
-                recentStat(title: "연속", value: streakText(snapshot.history), tint: AppPalette.accentGold)
+            VStack(alignment: .leading, spacing: 10) {
+                Text("최근 내전 성적")
+                    .font(AppTypography.heading(16, weight: .bold))
+                HStack(spacing: 8) {
+                    recentStat(title: "최근 전적", value: "\(snapshot.history.filter { $0.result == "WIN" }.count)승 \(snapshot.history.filter { $0.result == "LOSE" }.count)패", tint: AppPalette.textPrimary)
+                    recentStat(title: "승률", value: winRateText(snapshot.history), tint: AppPalette.accentGreen)
+                    recentStat(title: "연속", value: streakText(snapshot.history), tint: AppPalette.accentGold)
+                }
             }
+        } else if case let .error(error) = snapshot.riotAccountsViewState {
+            riotProfileEmptyStateCard(
+                title: "Riot 계정 상태를 확인하지 못했어요",
+                message: error.message
+            )
+        } else if case .loading = snapshot.riotAccountsViewState {
+            riotProfileEmptyStateCard(
+                title: "Riot 계정을 확인하는 중이에요",
+                message: "연결 상태를 확인한 뒤 파워 프로필을 보여드릴게요."
+            )
+        } else {
+            riotProfileEmptyStateCard(
+                title: "Riot 계정을 연결하면 확인할 수 있어요",
+                message: "내전 전적과 파워 프로필이 연결된 계정 기준으로 표시됩니다."
+            )
         }
     }
 
@@ -5198,6 +5484,50 @@ struct ProfileScreen: View {
         .padding(.vertical, 12)
         .background(AppPalette.bgCard)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    private func profileRiotAccountsEmptyState(title: String, message: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(AppTypography.body(14, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+            Text(message)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func riotProfileEmptyStateCard(title: String, message: String) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(AppTypography.heading(16, weight: .bold))
+            Text(message)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button("계정 연결하기") {
+                router.push(.riotAccounts)
+            }
+            .buttonStyle(SecondaryButtonStyle())
+        }
+        .padding(16)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func profileLanePowerRow(role: Position, lanePower: Double?) -> some View {
+        HStack(spacing: 8) {
+            Text(role.shortLabel)
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(role == .mid ? AppPalette.accentBlue : AppPalette.textSecondary)
+                .frame(width: 32, alignment: .leading)
+            ProgressView(value: max(lanePower ?? 0, 0), total: 100)
+                .tint(laneTint(role))
+            Text(lanePower.map { "\(Int($0.rounded()))" } ?? "--")
+                .font(AppTypography.body(12, weight: .semibold))
+        }
     }
 
     private func laneTint(_ role: Position) -> Color {

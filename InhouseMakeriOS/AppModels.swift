@@ -938,6 +938,40 @@ struct RiotAccount: Codable, Hashable, Identifiable {
     }
 }
 
+enum RiotLinkedAccountsViewState: Equatable {
+    case loading
+    case noLinkedAccounts
+    case loaded([RiotAccount])
+    case error(UserFacingError)
+
+    init(accounts: [RiotAccount]) {
+        self = accounts.isEmpty ? .noLinkedAccounts : .loaded(accounts)
+    }
+
+    var accounts: [RiotAccount] {
+        switch self {
+        case let .loaded(accounts):
+            return accounts
+        case .loading, .noLinkedAccounts, .error:
+            return []
+        }
+    }
+
+    var hasLinkedAccounts: Bool {
+        switch self {
+        case let .loaded(accounts):
+            return accounts.isEmpty == false
+        case .loading, .noLinkedAccounts, .error:
+            return false
+        }
+    }
+
+    var primaryAccount: RiotAccount? {
+        let accounts = accounts
+        return accounts.first(where: \.isPrimary) ?? accounts.first
+    }
+}
+
 struct RiotAccountSyncAccepted: Codable, Hashable {
     let riotAccountId: String
     let queued: Bool
@@ -1388,6 +1422,7 @@ struct ResultPreviewDraft: Codable, Hashable {
 
 struct HomeSnapshot: Equatable {
     let profile: UserProfile
+    let riotAccountsViewState: RiotLinkedAccountsViewState
     let power: PowerProfile?
     let groups: [GroupSummary]
     let currentMatch: Match?
@@ -1442,8 +1477,8 @@ struct ManualAdjustRow: Hashable, Identifiable {
 
 struct ProfileSnapshot: Equatable {
     let profile: UserProfile
+    let riotAccountsViewState: RiotLinkedAccountsViewState
     let power: PowerProfile?
-    let riotAccounts: [RiotAccount]
     let history: [MatchHistoryItem]
 }
 

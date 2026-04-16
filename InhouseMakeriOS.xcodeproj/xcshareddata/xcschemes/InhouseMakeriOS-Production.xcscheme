@@ -28,27 +28,7 @@
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       shouldUseLaunchSchemeArgsEnv = "YES">
       <Testables>
-         <TestableReference
-            skipped = "NO"
-            parallelizable = "YES">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "8BB373492E0945C400D35084"
-               BuildableName = "InhouseMakeriOSTests.xctest"
-               BlueprintName = "InhouseMakeriOSTests"
-               ReferencedContainer = "container:InhouseMakeriOS.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
       </Testables>
-      <MacroExpansion>
-         <BuildableReference
-            BuildableIdentifier = "primary"
-            BlueprintIdentifier = "8BB373392E0945C100D35084"
-            BuildableName = "InhouseMakeriOS.app"
-            BlueprintName = "InhouseMakeriOS"
-            ReferencedContainer = "container:InhouseMakeriOS.xcodeproj">
-         </BuildableReference>
-      </MacroExpansion>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Production"

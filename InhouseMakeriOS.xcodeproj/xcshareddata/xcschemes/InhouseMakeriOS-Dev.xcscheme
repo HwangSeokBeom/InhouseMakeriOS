@@ -20,6 +20,20 @@
                ReferencedContainer = "container:InhouseMakeriOS.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
+         <BuildActionEntry
+            buildForTesting = "YES"
+            buildForRunning = "NO"
+            buildForProfiling = "NO"
+            buildForArchiving = "NO"
+            buildForAnalyzing = "YES">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "8BB373492E0945C400D35084"
+               BuildableName = "InhouseMakeriOSTests.xctest"
+               BlueprintName = "InhouseMakeriOSTests"
+               ReferencedContainer = "container:InhouseMakeriOS.xcodeproj">
+            </BuildableReference>
+         </BuildActionEntry>
       </BuildActionEntries>
    </BuildAction>
    <TestAction

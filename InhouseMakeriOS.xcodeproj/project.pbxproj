@@ -645,40 +645,12 @@
 			};
 			name = Dev;
 		};
-		C10000000000000000000032 /* Staging */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = C10000000000000000000008 /* UnitTests.Staging.xcconfig */;
-			buildSettings = {
-			};
-			name = Staging;
-		};
-		8BB373632E0945C400D35084 /* Production */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = C10000000000000000000009 /* UnitTests.Production.xcconfig */;
-			buildSettings = {
-			};
-			name = Production;
-		};
 		8BB373652E0945C400D35084 /* Dev */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = C1000000000000000000000B /* UITests.Dev.xcconfig */;
 			buildSettings = {
 			};
 			name = Dev;
-		};
-		C10000000000000000000033 /* Staging */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = C1000000000000000000000C /* UITests.Staging.xcconfig */;
-			buildSettings = {
-			};
-			name = Staging;
-		};
-		8BB373662E0945C400D35084 /* Production */ = {
-			isa = XCBuildConfiguration;
-			baseConfigurationReference = C1000000000000000000000D /* UITests.Production.xcconfig */;
-			buildSettings = {
-			};
-			name = Production;
 		};
 /* End XCBuildConfiguration section */
 
@@ -691,7 +663,7 @@
 				8BB3735D2E0945C400D35084 /* Production */,
 			);
 			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Production;
+			defaultConfigurationName = Dev;
 		};
 		8BB3735E2E0945C400D35084 /* Build configuration list for PBXNativeTarget "InhouseMakeriOS" */ = {
 			isa = XCConfigurationList;
@@ -701,27 +673,23 @@
 				8BB373602E0945C400D35084 /* Production */,
 			);
 			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Production;
+			defaultConfigurationName = Dev;
 		};
 		8BB373612E0945C400D35084 /* Build configuration list for PBXNativeTarget "InhouseMakeriOSTests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				8BB373622E0945C400D35084 /* Dev */,
-				C10000000000000000000032 /* Staging */,
-				8BB373632E0945C400D35084 /* Production */,
 			);
 			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Production;
+			defaultConfigurationName = Dev;
 		};
 		8BB373642E0945C400D35084 /* Build configuration list for PBXNativeTarget "InhouseMakeriOSUITests" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				8BB373652E0945C400D35084 /* Dev */,
-				C10000000000000000000033 /* Staging */,
-				8BB373662E0945C400D35084 /* Production */,
 			);
 			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Production;
+			defaultConfigurationName = Dev;
 		};
 /* End XCConfigurationList section */
 	};
