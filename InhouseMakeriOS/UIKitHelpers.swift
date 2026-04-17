@@ -30,6 +30,22 @@ func topViewController() -> UIViewController? {
     topViewController(from: UIApplication.shared.preferredKeyWindow?.rootViewController)
 }
 
+func currentDeviceModelDescription() -> String {
+    var systemInfo = utsname()
+    uname(&systemInfo)
+    let machineIdentifier = withUnsafePointer(to: &systemInfo.machine) {
+        $0.withMemoryRebound(to: CChar.self, capacity: 1) {
+            String(cString: $0)
+        }
+    }
+
+    let modelName = UIDevice.current.model
+    if machineIdentifier.isEmpty {
+        return modelName
+    }
+    return "\(modelName) (\(machineIdentifier))"
+}
+
 @MainActor
 private func topViewController(from rootViewController: UIViewController?) -> UIViewController? {
     if let navigationController = rootViewController as? UINavigationController {

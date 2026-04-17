@@ -1,15 +1,25 @@
 import GoogleSignIn
 import SwiftUI
+import SwiftData
 
 @main
 struct InhouseMakeriOSApp: App {
-    @StateObject private var router = AppRouter()
-    @StateObject private var session = AppSessionViewModel(container: AppContainer())
+    @StateObject private var router: AppRouter
+    @StateObject private var session: AppSessionViewModel
     @State private var hasStartedLaunchSequence = false
     @State private var hasCompletedLaunchSequence = false
+    private let modelContainer: ModelContainer
 
     init() {
         AppNavigationAppearance.apply()
+        let modelContainer = AppModelContainerFactory.makeContainer()
+        self.modelContainer = modelContainer
+        _router = StateObject(wrappedValue: AppRouter())
+        _session = StateObject(
+            wrappedValue: AppSessionViewModel(
+                container: AppContainer(modelContainer: modelContainer)
+            )
+        )
     }
 
     var body: some Scene {
@@ -30,6 +40,7 @@ struct InhouseMakeriOSApp: App {
             .persistentSystemOverlays(.hidden)
             .appBackground()
             .preferredColorScheme(.dark)
+            .modelContainer(modelContainer)
             .task {
                 await runLaunchSequenceIfNeeded()
             }

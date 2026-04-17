@@ -19,6 +19,7 @@ enum AppTab: String, CaseIterable, Hashable {
 }
 
 enum AppRoute: Hashable {
+    case search
     case notifications
     case riotAccounts
     case settings
@@ -1242,6 +1243,96 @@ struct LocalMatchRecord: Codable, Hashable, Identifiable {
     let winningTeam: TeamSide
     let balanceRating: Int
     let mvpUserID: String
+}
+
+struct RecentSearchKeyword: Codable, Hashable, Identifiable {
+    let id: String
+    let keyword: String
+    let searchedAt: Date
+}
+
+enum SearchResultKind: String, Hashable, Identifiable {
+    case riotAccount
+    case group
+    case recruitPost
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .riotAccount:
+            return "Riot ID"
+        case .group:
+            return "공개 그룹"
+        case .recruitPost:
+            return "모집글"
+        }
+    }
+
+    var emptyDescription: String {
+        switch self {
+        case .riotAccount:
+            return "연결된 Riot ID와 일치하는 항목이 없습니다."
+        case .group:
+            return "일치하는 공개 그룹이 없습니다."
+        case .recruitPost:
+            return "일치하는 모집글이 없습니다."
+        }
+    }
+}
+
+enum SearchResultDestination: Hashable {
+    case riotAccounts
+    case groupDetail(groupID: String)
+    case recruitDetail(postID: String)
+
+    var route: AppRoute {
+        switch self {
+        case .riotAccounts:
+            return .riotAccounts
+        case let .groupDetail(groupID):
+            return .groupDetail(groupID)
+        case let .recruitDetail(postID):
+            return .recruitDetail(postID: postID)
+        }
+    }
+
+    var authRequirement: AuthRequirement {
+        switch self {
+        case .riotAccounts:
+            return .riotAccount
+        case .groupDetail:
+            return .groupManagement
+        case .recruitDetail:
+            return .recruitingWrite
+        }
+    }
+}
+
+struct SearchResultItem: Hashable, Identifiable {
+    let id: String
+    let kind: SearchResultKind
+    let title: String
+    let subtitle: String
+    let tags: [String]
+    let supportingText: String?
+    let destination: SearchResultDestination
+}
+
+struct SearchResultSection: Hashable, Identifiable {
+    let kind: SearchResultKind
+    let items: [SearchResultItem]
+
+    var id: String { kind.rawValue }
+    var title: String { kind.title }
+}
+
+struct SearchResponse: Hashable {
+    let sections: [SearchResultSection]
+
+    var isEmpty: Bool {
+        sections.allSatisfy { $0.items.isEmpty }
+    }
 }
 
 struct PreviewRosterPlayer: Codable, Hashable, Identifiable {

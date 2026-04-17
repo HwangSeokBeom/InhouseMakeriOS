@@ -1,6 +1,8 @@
 import AuthenticationServices
 import ComposableArchitecture
 import GoogleSignIn
+import MessageUI
+import SafariServices
 import SwiftUI
 import UIKit
 
@@ -515,6 +517,18 @@ final class AppSessionViewModel: ObservableObject {
 
 // MARK: - Root View Models
 
+enum GroupCreationFlowResult {
+    case success(GroupSummary)
+    case failure(String)
+    case requiresAuthentication
+}
+
+enum RecruitPostCreationFlowResult {
+    case success
+    case failure(String)
+    case requiresAuthentication
+}
+
 @MainActor
 final class HomeViewModel: ObservableObject {
     @Published private(set) var state: ScreenLoadState<HomeContentState> = .initial
@@ -687,8 +701,9 @@ final class GroupMainViewModel: ObservableObject {
         }
     }
 
-    func createGroup(name: String, description: String, tags: [String]) async -> GroupSummary? {
+    func createGroup(name: String, description: String, tags: [String]) async -> GroupCreationFlowResult {
         actionState = .inProgress("그룹을 생성하는 중입니다")
+        debugCreateGroup("request POST /groups")
         do {
             let group = try await session.container.groupRepository.create(
                 name: name,
@@ -701,13 +716,20 @@ final class GroupMainViewModel: ObservableObject {
             session.container.localStore.appendNotification(title: "그룹 생성", body: "\(group.name) 그룹이 생성되었습니다.", symbol: "person.3.fill")
             await load(force: true, trigger: "group_created_refresh")
             actionState = .success("그룹이 생성되었습니다")
-            return group
+            debugCreateGroup("response success groupId=\(group.id)")
+            return .success(group)
         } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .groupManagement, actionState: &actionState)
-            return nil
+            debugCreateGroup("response failure: \(error.message)")
+            actionState = .idle
+            if error.requiresAuthentication {
+                session.requireReauthentication(for: .groupManagement)
+                return .requiresAuthentication
+            }
+            return .failure(error.message)
         } catch {
-            actionState = .failure("그룹 생성에 실패했습니다")
-            return nil
+            debugCreateGroup("response failure: 그룹 생성에 실패했습니다")
+            actionState = .idle
+            return .failure("그룹 생성에 실패했습니다")
         }
     }
 
@@ -715,6 +737,12 @@ final class GroupMainViewModel: ObservableObject {
         state = .initial
         actionState = .idle
         initialLoadTracker.reset()
+    }
+
+    private func debugCreateGroup(_ message: String) {
+        #if DEBUG
+        print("[CreateGroup] \(message)")
+        #endif
     }
 }
 
@@ -769,8 +797,9 @@ final class RecruitBoardViewModel: ObservableObject {
         await load(force: true, trigger: "type_switch")
     }
 
-    func createPost(groupID: String, title: String, body: String, tags: [String], positions: [String]) async {
+    func createPost(groupID: String, title: String, body: String, tags: [String], positions: [String]) async -> RecruitPostCreationFlowResult {
         actionState = .inProgress("모집글을 등록하는 중입니다")
+        debugCreateRecruitingPost("request POST /recruiting-posts groupId=\(groupID)")
         do {
             let post = try await session.container.recruitingRepository.create(
                 groupID: groupID,
@@ -784,10 +813,20 @@ final class RecruitBoardViewModel: ObservableObject {
             session.container.localStore.appendNotification(title: "모집글 등록", body: "\(post.title) 글이 등록되었습니다.", symbol: "megaphone.fill")
             actionState = .success("모집글이 등록되었습니다")
             await load(force: true, trigger: "post_created_refresh")
+            debugCreateRecruitingPost("response success postId=\(post.id)")
+            return .success
         } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .recruitingWrite, actionState: &actionState)
+            debugCreateRecruitingPost("response failure: \(error.message)")
+            actionState = .idle
+            if error.requiresAuthentication {
+                session.requireReauthentication(for: .recruitingWrite)
+                return .requiresAuthentication
+            }
+            return .failure(error.message)
         } catch {
-            actionState = .failure("모집글 등록에 실패했습니다")
+            debugCreateRecruitingPost("response failure: 모집글 등록에 실패했습니다")
+            actionState = .idle
+            return .failure("모집글 등록에 실패했습니다")
         }
     }
 
@@ -796,6 +835,12 @@ final class RecruitBoardViewModel: ObservableObject {
         actionState = .idle
         selectedType = session.container.localStore.recruitFilterType
         initialLoadTracker.reset()
+    }
+
+    private func debugCreateRecruitingPost(_ message: String) {
+        #if DEBUG
+        print("[CreateRecruitingPost] \(message)")
+        #endif
     }
 }
 
@@ -927,6 +972,112 @@ final class ProfileViewModel: ObservableObject {
     func reset() {
         state = .initial
         initialLoadTracker.reset()
+    }
+}
+
+@MainActor
+final class SearchViewModel: ObservableObject {
+    enum ViewState: Equatable {
+        case idle
+        case searching
+        case results(SearchResponse)
+        case empty(String)
+        case error(UserFacingError)
+    }
+
+    @Published private(set) var state: ViewState = .idle
+    @Published private(set) var recentSearchKeywords: [RecentSearchKeyword] = []
+
+    private let session: AppSessionViewModel
+    private var searchTask: Task<Void, Never>?
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+        self.recentSearchKeywords = session.container.localStore.recentSearchKeywords
+    }
+
+    func refreshRecentSearchKeywords() {
+        recentSearchKeywords = session.container.localStore.recentSearchKeywords
+    }
+
+    func updateQuery(_ rawQuery: String) {
+        let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+
+        guard !trimmedQuery.isEmpty else {
+            state = .idle
+            refreshRecentSearchKeywords()
+            return
+        }
+
+        state = .searching
+        searchTask = Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            await performSearch(trimmedQuery, forceRefresh: false)
+        }
+    }
+
+    func submitSearch(_ rawQuery: String) {
+        let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            state = .idle
+            return
+        }
+
+        recordRecentSearchKeyword(trimmedQuery)
+        searchTask?.cancel()
+        searchTask = Task {
+            await performSearch(trimmedQuery, forceRefresh: true)
+        }
+    }
+
+    func deleteRecentSearchKeyword(id: String) {
+        session.container.localStore.deleteRecentSearchKeyword(id: id)
+        refreshRecentSearchKeywords()
+    }
+
+    func clearRecentSearchKeywords() {
+        session.container.localStore.clearRecentSearchKeywords()
+        refreshRecentSearchKeywords()
+    }
+
+    func recordRecentSearchKeyword(_ keyword: String) {
+        session.container.localStore.recordRecentSearchKeyword(keyword)
+        refreshRecentSearchKeywords()
+    }
+
+    func cancelPendingSearch() {
+        searchTask?.cancel()
+    }
+
+    private func performSearch(_ query: String, forceRefresh: Bool) async {
+        let linkedRiotAccounts: [RiotAccount]
+        if session.isAuthenticated {
+            let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: forceRefresh)
+            switch riotAccountsViewState {
+            case let .loaded(accounts):
+                linkedRiotAccounts = accounts
+            default:
+                linkedRiotAccounts = []
+            }
+        } else {
+            linkedRiotAccounts = []
+        }
+
+        let response = await session.container.searchUseCase.execute(
+            query: query,
+            linkedRiotAccounts: linkedRiotAccounts,
+            forceRefresh: forceRefresh
+        )
+
+        guard !Task.isCancelled else { return }
+
+        if response.isEmpty {
+            state = .empty("검색 결과가 없습니다")
+        } else {
+            state = .results(response)
+        }
     }
 }
 
@@ -2375,6 +2526,8 @@ struct AppShellView: View {
     @ViewBuilder
     private func destinationView(_ route: AppRoute) -> some View {
         switch route {
+        case .search:
+            SearchScreen(viewModel: SearchViewModel(session: session), session: session, router: router, onBack: router.pop)
         case .notifications:
             NotificationsScreen(store: session.container.localStore, onBack: router.pop)
         case .riotAccounts:
@@ -2510,7 +2663,9 @@ struct HomeScreen: View {
     }
 
     private var searchHeaderAction: TabHeaderAction {
-        TabHeaderAction(systemName: "magnifyingglass", accessibilityLabel: "검색") {}
+        TabHeaderAction(systemName: "magnifyingglass", accessibilityLabel: "검색") {
+            router.push(.search)
+        }
     }
 
     @ViewBuilder
@@ -3803,13 +3958,21 @@ fileprivate extension MatchStatus {
 }
 
 struct GroupMainScreen: View {
+    private enum ActiveSheet: String, Identifiable {
+        case createGroup
+
+        var id: String { rawValue }
+    }
+
     @ObservedObject var viewModel: GroupMainViewModel
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
-    @State private var showsCreateSheet = false
+    @State private var activeSheet: ActiveSheet?
     @State private var newGroupName = ""
     @State private var newGroupDescription = ""
     @State private var newGroupTags = "빡겜,서울"
+    @State private var createGroupErrorMessage: String?
+    @State private var pendingCreatedGroupID: String?
 
     var body: some View {
         TabRootScaffold(title: AppTab.match.title, trailingAction: createGroupHeaderAction) {
@@ -3824,7 +3987,7 @@ struct GroupMainScreen: View {
                     VStack(spacing: 0) {
                         StatusBarView()
                         EmptyStateView(title: "그룹", message: message, actionTitle: "그룹 생성") {
-                            showsCreateSheet = true
+                            presentCreateGroupEntry(source: "empty_state")
                         }
                     }
                 case let .content(groups), let .refreshing(groups):
@@ -3868,13 +4031,23 @@ struct GroupMainScreen: View {
                 }
             }
         }
-        .sheet(isPresented: $showsCreateSheet) { groupCreationSheet }
+        .sheet(item: $activeSheet, onDismiss: handleCreateGroupSheetDismissed) { sheet in
+            switch sheet {
+            case .createGroup:
+                groupCreationSheet
+            }
+        }
+        .onChange(of: activeSheet) { _, newValue in
+            guard newValue == .createGroup else { return }
+            debugCreateGroup("showModal=createGroup")
+            session.requestModalPresentation(.groupCreate)
+        }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
     }
 
     private var createGroupHeaderAction: TabHeaderAction {
         TabHeaderAction(systemName: "plus", accessibilityLabel: "그룹 생성") {
-            showsCreateSheet = true
+            presentCreateGroupEntry(source: "header")
         }
     }
 
@@ -3884,6 +4057,11 @@ struct GroupMainScreen: View {
                 TextField("그룹 이름", text: $newGroupName)
                 TextField("설명", text: $newGroupDescription, axis: .vertical)
                 TextField("태그 (쉼표 구분)", text: $newGroupTags)
+                if let createGroupErrorMessage {
+                    Text(createGroupErrorMessage)
+                        .font(AppTypography.body(12, weight: .semibold))
+                        .foregroundStyle(AppPalette.accentRed)
+                }
                 Text("실제 서버에는 그룹 목록 API가 없어, 생성 또는 방문한 groupId를 클라이언트에 저장한 뒤 이 탭에서 다시 조회합니다.")
                     .font(AppTypography.body(12))
                     .foregroundStyle(AppPalette.textSecondary)
@@ -3891,28 +4069,140 @@ struct GroupMainScreen: View {
             .scrollContentBackground(.hidden)
             .background(AppPalette.bgPrimary)
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("닫기") { showsCreateSheet = false } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("생성") {
-                        let action: @MainActor () -> Void = {
-                            Task {
-                                let created = await viewModel.createGroup(
-                                    name: newGroupName,
-                                    description: newGroupDescription,
-                                    tags: newGroupTags.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                                )
-                                if let created {
-                                    showsCreateSheet = false
-                                    router.push(.groupDetail(created.id))
-                                }
-                            }
-                        }
-                        session.requireAuthentication(for: .groupManagement, perform: action)
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("닫기") {
+                        dismissCreateGroupSheet(reason: "close_button")
                     }
-                    .disabled(newGroupName.count < 2)
+                    .disabled(isCreateGroupSubmitInFlight)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        submitCreateGroup()
+                    } label: {
+                        if isCreateGroupSubmitInFlight {
+                            ProgressView()
+                                .tint(AppPalette.accentBlue)
+                        } else {
+                            Text("생성")
+                        }
+                    }
+                    .disabled(isCreateGroupSubmitDisabled)
                 }
             }
         }
+    }
+
+    private var normalizedNewGroupName: String {
+        newGroupName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedNewGroupDescription: String {
+        newGroupDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedNewGroupTags: [String] {
+        newGroupTags
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private var isCreateGroupSubmitInFlight: Bool {
+        if case .inProgress = viewModel.actionState {
+            return true
+        }
+        return false
+    }
+
+    private var isCreateGroupSubmitDisabled: Bool {
+        normalizedNewGroupName.count < 2 || isCreateGroupSubmitInFlight
+    }
+
+    private func presentCreateGroupEntry(source: String) {
+        debugCreateGroup("entryTap source=\(source)")
+        createGroupErrorMessage = nil
+        guard session.isAuthenticated else {
+            debugCreateGroup("auth=guest")
+            debugCreateGroup("showModal=loginPrompt")
+            session.requireAuthentication(for: .groupManagement)
+            return
+        }
+        debugCreateGroup("auth=authenticated")
+        resetCreateGroupDraft()
+        activeSheet = .createGroup
+    }
+
+    private func submitCreateGroup() {
+        debugCreateGroup("tap")
+        createGroupErrorMessage = nil
+
+        guard normalizedNewGroupName.count >= 2 else {
+            debugCreateGroup("validation=failed reason=name_too_short")
+            createGroupErrorMessage = "그룹 이름은 2자 이상 입력해주세요."
+            debugCreateGroup("showInlineError")
+            return
+        }
+
+        debugCreateGroup("validation=passed")
+
+        guard session.isAuthenticated else {
+            debugCreateGroup("auth=guest")
+            debugCreateGroup("showModal=loginPrompt")
+            session.requireAuthentication(for: .groupManagement)
+            dismissCreateGroupSheet(reason: "auth_required")
+            return
+        }
+
+        debugCreateGroup("auth=authenticated")
+
+        Task {
+            let result = await viewModel.createGroup(
+                name: normalizedNewGroupName,
+                description: normalizedNewGroupDescription,
+                tags: normalizedNewGroupTags
+            )
+
+            switch result {
+            case let .success(group):
+                pendingCreatedGroupID = group.id
+                dismissCreateGroupSheet(reason: "success")
+            case let .failure(message):
+                createGroupErrorMessage = message
+                debugCreateGroup("showInlineError")
+            case .requiresAuthentication:
+                debugCreateGroup("auth=reauthentication_required")
+                dismissCreateGroupSheet(reason: "reauthentication_required")
+            }
+        }
+    }
+
+    private func dismissCreateGroupSheet(reason: String) {
+        guard activeSheet != nil else { return }
+        debugCreateGroup("dismiss requested reason=\(reason)")
+        activeSheet = nil
+    }
+
+    private func handleCreateGroupSheetDismissed() {
+        debugCreateGroup("dismiss")
+        session.handleModalDismissed(.groupCreate)
+        resetCreateGroupDraft()
+        if let pendingCreatedGroupID {
+            self.pendingCreatedGroupID = nil
+            router.push(.groupDetail(pendingCreatedGroupID))
+        }
+    }
+
+    private func resetCreateGroupDraft() {
+        newGroupName = ""
+        newGroupDescription = ""
+        newGroupTags = "빡겜,서울"
+        createGroupErrorMessage = nil
+    }
+
+    private func debugCreateGroup(_ message: String) {
+        #if DEBUG
+        print("[CreateGroup] \(message)")
+        #endif
     }
 
     private func tagBadge(_ text: String, tint: Color) -> some View {
@@ -4119,13 +4409,20 @@ struct GroupDetailScreen: View {
 }
 
 struct RecruitBoardScreen: View {
+    private enum ActiveSheet: String, Identifiable {
+        case createPost
+
+        var id: String { rawValue }
+    }
+
     @ObservedObject var viewModel: RecruitBoardViewModel
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
-    @State private var showsCreateSheet = false
+    @State private var activeSheet: ActiveSheet?
     @State private var createTitle = ""
     @State private var createBody = ""
     @State private var createPositions = "MID,SUP"
+    @State private var createPostErrorMessage: String?
 
     var body: some View {
         TabRootScaffold(title: AppTab.recruit.title, trailingAction: createRecruitHeaderAction) {
@@ -4140,7 +4437,7 @@ struct RecruitBoardScreen: View {
                     VStack(spacing: 0) {
                         StatusBarView()
                         EmptyStateView(title: "모집", message: message, actionTitle: "글 작성") {
-                            showsCreateSheet = true
+                            presentCreateRecruitEntry(source: "empty_state")
                         }
                     }
                 case let .content(snapshot), let .refreshing(snapshot):
@@ -4234,13 +4531,23 @@ struct RecruitBoardScreen: View {
                 }
             }
         }
-        .sheet(isPresented: $showsCreateSheet) { createSheet }
+        .sheet(item: $activeSheet, onDismiss: handleCreateRecruitSheetDismissed) { sheet in
+            switch sheet {
+            case .createPost:
+                createSheet
+            }
+        }
+        .onChange(of: activeSheet) { _, newValue in
+            guard newValue == .createPost else { return }
+            debugCreateRecruitingPost("showModal=createRecruitingPost")
+            session.requestModalPresentation(.recruitCreate)
+        }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
     }
 
     private var createRecruitHeaderAction: TabHeaderAction {
         TabHeaderAction(systemName: "square.and.pencil", accessibilityLabel: "모집글 작성") {
-            showsCreateSheet = true
+            presentCreateRecruitEntry(source: "header")
         }
     }
 
@@ -4262,36 +4569,161 @@ struct RecruitBoardScreen: View {
                 TextField("제목", text: $createTitle)
                 TextField("본문", text: $createBody, axis: .vertical)
                 TextField("포지션 (쉼표 구분)", text: $createPositions)
+                if let createPostErrorMessage {
+                    Text(createPostErrorMessage)
+                        .font(AppTypography.body(12, weight: .semibold))
+                        .foregroundStyle(AppPalette.accentRed)
+                }
                 Text("모집글 생성은 실제 서버를 호출합니다. groupId는 로컬에 저장된 첫 그룹을 사용합니다.")
                     .font(AppTypography.body(12))
                     .foregroundStyle(AppPalette.textSecondary)
             }
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("닫기") { showsCreateSheet = false } }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("등록") {
-                        let action: @MainActor () -> Void = {
-                            Task {
-                                guard let groupID = session.container.localStore.storedGroupIDs.first else {
-                                    viewModel.actionState = .failure("모집글을 연결할 그룹이 없습니다. 먼저 로그인 후 그룹을 생성해주세요.")
-                                    return
-                                }
-                                await viewModel.createPost(
-                                    groupID: groupID,
-                                    title: createTitle,
-                                    body: createBody,
-                                    tags: ["빡겜"],
-                                    positions: createPositions.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-                                )
-                                showsCreateSheet = false
-                            }
-                        }
-                        session.requireAuthentication(for: .recruitingWrite, perform: action)
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("닫기") {
+                        dismissCreateRecruitSheet(reason: "close_button")
                     }
-                    .disabled(createTitle.count < 2)
+                    .disabled(isCreateRecruitSubmitInFlight)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        submitCreateRecruitingPost()
+                    } label: {
+                        if isCreateRecruitSubmitInFlight {
+                            ProgressView()
+                                .tint(AppPalette.accentBlue)
+                        } else {
+                            Text("등록")
+                        }
+                    }
+                    .disabled(isCreateRecruitSubmitDisabled)
                 }
             }
         }
+    }
+
+    private var normalizedCreateTitle: String {
+        createTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedCreateBody: String {
+        createBody.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var normalizedCreatePositions: [String] {
+        createPositions
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private var isCreateRecruitSubmitInFlight: Bool {
+        if case .inProgress = viewModel.actionState {
+            return true
+        }
+        return false
+    }
+
+    private var isCreateRecruitSubmitDisabled: Bool {
+        normalizedCreateTitle.count < 2 || isCreateRecruitSubmitInFlight
+    }
+
+    private func presentCreateRecruitEntry(source: String) {
+        debugCreateRecruitingPost("entryTap source=\(source)")
+        createPostErrorMessage = nil
+        guard session.isAuthenticated else {
+            debugCreateRecruitingPost("auth=guest")
+            debugCreateRecruitingPost("showModal=loginPrompt")
+            session.requireAuthentication(for: .recruitingWrite)
+            return
+        }
+        debugCreateRecruitingPost("auth=authenticated")
+        resetCreateRecruitDraft()
+        activeSheet = .createPost
+    }
+
+    private func submitCreateRecruitingPost() {
+        debugCreateRecruitingPost("tap")
+        createPostErrorMessage = nil
+
+        guard normalizedCreateTitle.count >= 2 else {
+            debugCreateRecruitingPost("validation=failed reason=title_too_short")
+            createPostErrorMessage = "제목은 2자 이상 입력해주세요."
+            debugCreateRecruitingPost("showInlineError")
+            return
+        }
+
+        guard !normalizedCreatePositions.isEmpty else {
+            debugCreateRecruitingPost("validation=failed reason=positions_empty")
+            createPostErrorMessage = "최소 한 개 이상의 포지션을 입력해주세요."
+            debugCreateRecruitingPost("showInlineError")
+            return
+        }
+
+        guard let groupID = session.container.localStore.storedGroupIDs.first else {
+            debugCreateRecruitingPost("validation=failed reason=missing_group")
+            createPostErrorMessage = "모집글을 연결할 그룹이 없습니다. 먼저 그룹을 생성해주세요."
+            debugCreateRecruitingPost("showInlineError")
+            return
+        }
+
+        debugCreateRecruitingPost("validation=passed")
+
+        guard session.isAuthenticated else {
+            debugCreateRecruitingPost("auth=guest")
+            debugCreateRecruitingPost("showModal=loginPrompt")
+            session.requireAuthentication(for: .recruitingWrite)
+            dismissCreateRecruitSheet(reason: "auth_required")
+            return
+        }
+
+        debugCreateRecruitingPost("auth=authenticated")
+
+        Task {
+            let result = await viewModel.createPost(
+                groupID: groupID,
+                title: normalizedCreateTitle,
+                body: normalizedCreateBody,
+                tags: ["빡겜"],
+                positions: normalizedCreatePositions
+            )
+
+            switch result {
+            case .success:
+                dismissCreateRecruitSheet(reason: "success")
+            case let .failure(message):
+                createPostErrorMessage = message
+                debugCreateRecruitingPost("showInlineError")
+            case .requiresAuthentication:
+                debugCreateRecruitingPost("auth=reauthentication_required")
+                dismissCreateRecruitSheet(reason: "reauthentication_required")
+            }
+        }
+    }
+
+    private func dismissCreateRecruitSheet(reason: String) {
+        guard activeSheet != nil else { return }
+        debugCreateRecruitingPost("dismiss requested reason=\(reason)")
+        activeSheet = nil
+    }
+
+    private func handleCreateRecruitSheetDismissed() {
+        debugCreateRecruitingPost("dismiss")
+        session.handleModalDismissed(.recruitCreate)
+        resetCreateRecruitDraft()
+    }
+
+    private func resetCreateRecruitDraft() {
+        createTitle = ""
+        createBody = ""
+        createPositions = "MID,SUP"
+        createPostErrorMessage = nil
+    }
+
+    private func debugCreateRecruitingPost(_ message: String) {
+        #if DEBUG
+        print("[CreateRecruitingPost] \(message)")
+        #endif
     }
 }
 
@@ -5218,6 +5650,362 @@ struct ResultPreviewScreen: View {
     }
 }
 
+struct SearchScreen: View {
+    @StateObject private var viewModel: SearchViewModel
+    @ObservedObject var session: AppSessionViewModel
+    @ObservedObject var router: AppRouter
+    let onBack: () -> Void
+
+    @State private var searchText = ""
+    @FocusState private var isSearchFieldFocused: Bool
+
+    init(
+        viewModel: SearchViewModel,
+        session: AppSessionViewModel,
+        router: AppRouter,
+        onBack: @escaping () -> Void
+    ) {
+        _viewModel = StateObject(wrappedValue: viewModel)
+        self.session = session
+        self.router = router
+        self.onBack = onBack
+    }
+
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        screenScaffold(title: "검색", onBack: onBack, rightSystemImage: nil) {
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 18) {
+                    searchFieldCard
+
+                    if trimmedSearchText.isEmpty {
+                        searchIntroCard
+                        recentSearchSection
+                    } else {
+                        resultContent
+                    }
+                }
+                .padding(24)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .onAppear {
+            viewModel.refreshRecentSearchKeywords()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                isSearchFieldFocused = true
+            }
+        }
+        .onDisappear {
+            viewModel.cancelPendingSearch()
+        }
+        .onChange(of: searchText) { _, newValue in
+            viewModel.updateQuery(newValue)
+        }
+    }
+
+    private var searchFieldCard: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(AppPalette.textSecondary)
+
+            TextField("Riot ID, 그룹, 모집글 검색", text: $searchText)
+                .font(AppTypography.body(15))
+                .foregroundStyle(AppPalette.textPrimary)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .submitLabel(.search)
+                .focused($isSearchFieldFocused)
+                .onSubmit {
+                    viewModel.submitSearch(searchText)
+                }
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(AppPalette.textMuted)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 52)
+        .background(AppPalette.bgCard)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(AppPalette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var searchIntroCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("바로 찾기")
+                .font(AppTypography.heading(18, weight: .bold))
+
+            Text("연결한 Riot ID, 공개 그룹, 모집글을 한 번에 확인할 수 있습니다.")
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(spacing: 10) {
+                introRow(
+                    badge: "Riot ID",
+                    title: "내 계정에 연결한 Riot ID 검색",
+                    description: session.isAuthenticated
+                        ? "기준 Riot ID와 참고 Riot ID를 빠르게 다시 열 수 있습니다."
+                        : "로그인 후 연결한 Riot ID를 검색 결과에 함께 표시합니다."
+                )
+                introRow(
+                    badge: "GROUP",
+                    title: "공개 그룹 검색",
+                    description: "그룹 이름, 설명, 태그를 기준으로 찾아볼 수 있습니다."
+                )
+                introRow(
+                    badge: "RECRUIT",
+                    title: "모집글 검색",
+                    description: "제목, 본문, 포지션 태그를 기준으로 현재 공개 모집글을 찾습니다."
+                )
+            }
+        }
+        .padding(18)
+        .appPanel(background: AppPalette.bgCard, radius: 14)
+    }
+
+    @ViewBuilder
+    private var recentSearchSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("최근 검색어")
+                    .font(AppTypography.heading(16, weight: .bold))
+                Spacer()
+                if !viewModel.recentSearchKeywords.isEmpty {
+                    Button("전체 삭제") {
+                        viewModel.clearRecentSearchKeywords()
+                    }
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(AppPalette.accentRed)
+                }
+            }
+
+            if viewModel.recentSearchKeywords.isEmpty {
+                emptySearchCard(
+                    title: "최근 검색어가 없습니다",
+                    message: "검색어를 입력하면 이 기기에 최근 검색어가 저장됩니다."
+                )
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(viewModel.recentSearchKeywords) { keyword in
+                        HStack(spacing: 12) {
+                            Button {
+                                searchText = keyword.keyword
+                                isSearchFieldFocused = true
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "clock.arrow.circlepath")
+                                        .foregroundStyle(AppPalette.textMuted)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(keyword.keyword)
+                                            .font(AppTypography.body(13, weight: .semibold))
+                                            .foregroundStyle(AppPalette.textPrimary)
+                                        Text(keyword.searchedAt.shortDateText)
+                                            .font(AppTypography.body(10))
+                                            .foregroundStyle(AppPalette.textMuted)
+                                    }
+                                    Spacer()
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                viewModel.deleteRecentSearchKeyword(id: keyword.id)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(AppPalette.textMuted)
+                                    .frame(width: 24, height: 24)
+                                    .background(AppPalette.bgSecondary)
+                                    .clipShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .appPanel(background: AppPalette.bgCard, radius: 12)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var resultContent: some View {
+        switch viewModel.state {
+        case .idle:
+            emptySearchCard(
+                title: "검색어를 입력해 주세요",
+                message: "불필요한 연속 검색을 줄이기 위해 입력을 잠시 멈추면 검색합니다."
+            )
+        case .searching:
+            HStack(spacing: 10) {
+                ProgressView()
+                    .tint(AppPalette.accentBlue)
+                Text("검색 중입니다")
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+                Spacer()
+            }
+            .padding(16)
+            .appPanel(background: AppPalette.bgCard, radius: 12)
+        case let .results(response):
+            VStack(alignment: .leading, spacing: 16) {
+                Text("검색 결과")
+                    .font(AppTypography.heading(16, weight: .bold))
+
+                ForEach(response.sections) { section in
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text(section.title)
+                                .font(AppTypography.body(14, weight: .semibold))
+                            Spacer()
+                            Text("\(section.items.count)건")
+                                .font(AppTypography.body(11))
+                                .foregroundStyle(AppPalette.textMuted)
+                        }
+
+                        ForEach(section.items) { item in
+                            Button {
+                                handleSelection(of: item)
+                            } label: {
+                                VStack(alignment: .leading, spacing: 10) {
+                                    HStack(alignment: .top, spacing: 10) {
+                                        VStack(alignment: .leading, spacing: 4) {
+                                            Text(item.title)
+                                                .font(AppTypography.body(14, weight: .semibold))
+                                                .foregroundStyle(AppPalette.textPrimary)
+                                            Text(item.subtitle)
+                                                .font(AppTypography.body(12))
+                                                .foregroundStyle(AppPalette.textSecondary)
+                                        }
+                                        Spacer()
+                                        if session.isGuest, item.destination != .riotAccounts {
+                                            Text("로그인 필요")
+                                                .font(AppTypography.body(10, weight: .semibold))
+                                                .foregroundStyle(AppPalette.accentGold)
+                                                .padding(.horizontal, 8)
+                                                .padding(.vertical, 4)
+                                                .background(AppPalette.bgSecondary)
+                                                .clipShape(Capsule())
+                                        }
+                                    }
+
+                                    if let supportingText = item.supportingText, !supportingText.isEmpty {
+                                        Text(supportingText)
+                                            .font(AppTypography.body(11))
+                                            .foregroundStyle(AppPalette.textMuted)
+                                            .lineLimit(2)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+
+                                    if !item.tags.isEmpty {
+                                        ScrollView(.horizontal, showsIndicators: false) {
+                                            HStack(spacing: 6) {
+                                                ForEach(item.tags, id: \.self) { tag in
+                                                    Text(tag)
+                                                        .font(AppTypography.body(10, weight: .semibold))
+                                                        .foregroundStyle(tag == "기준 Riot ID" ? AppPalette.accentGold : AppPalette.accentBlue)
+                                                        .padding(.horizontal, 8)
+                                                        .padding(.vertical, 4)
+                                                        .background(AppPalette.bgSecondary)
+                                                        .clipShape(Capsule())
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                                .appPanel(background: AppPalette.bgCard, radius: 12)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        case let .empty(message):
+            VStack(spacing: 14) {
+                emptySearchCard(
+                    title: message,
+                    message: "다른 검색어를 입력하거나 최근 검색어에서 다시 시작해 주세요."
+                )
+                if !viewModel.recentSearchKeywords.isEmpty {
+                    recentSearchSection
+                }
+            }
+        case let .error(error):
+            ErrorStateView(error: error) {
+                viewModel.submitSearch(searchText)
+            }
+        }
+    }
+
+    private func introRow(badge: String, title: String, description: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(badge)
+                .font(AppTypography.body(10, weight: .semibold))
+                .foregroundStyle(AppPalette.accentBlue)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(AppPalette.bgSecondary)
+                .clipShape(Capsule())
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(title)
+                    .font(AppTypography.body(13, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text(description)
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer()
+        }
+    }
+
+    private func emptySearchCard(title: String, message: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(AppTypography.body(14, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+            Text(message)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+
+    private func handleSelection(of item: SearchResultItem) {
+        if !trimmedSearchText.isEmpty {
+            viewModel.recordRecentSearchKeyword(trimmedSearchText)
+        }
+        isSearchFieldFocused = false
+        session.openProtectedRoute(
+            item.destination.route,
+            requirement: item.destination.authRequirement,
+            router: router
+        )
+    }
+}
+
 struct ProfileScreen: View {
     @ObservedObject var viewModel: ProfileViewModel
     @ObservedObject var session: AppSessionViewModel
@@ -6125,14 +6913,48 @@ struct NotificationsScreen: View {
     }
 }
 
+private enum SettingsSheet: Identifiable {
+    case externalLink(AppExternalLink)
+    case supportMail(SupportMailDraft)
+
+    var id: String {
+        switch self {
+        case let .externalLink(link):
+            return "external-\(link.rawValue)"
+        case let .supportMail(draft):
+            return "support-mail-\(draft.id.uuidString)"
+        }
+    }
+}
+
 struct SettingsScreen: View {
+    @Environment(\.openURL) private var openURL
+
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
     let onBack: () -> Void
-    @State private var isProfilePublic = true
-    @State private var isHistoryPublic = true
-    @State private var notificationsEnabled = true
+
+    @State private var isProfilePublic: Bool
+    @State private var isHistoryPublic: Bool
+    @State private var notificationsEnabled: Bool
     @State private var showsProfileEdit = false
+    @State private var activeSheet: SettingsSheet?
+    @State private var externalLinkErrorMessage: String?
+
+    init(session: AppSessionViewModel, router: AppRouter, onBack: @escaping () -> Void) {
+        self.session = session
+        self.router = router
+        self.onBack = onBack
+        let localStore = session.container.localStore
+        _isProfilePublic = State(initialValue: localStore.isProfilePublic)
+        _isHistoryPublic = State(initialValue: localStore.isHistoryPublic)
+        _notificationsEnabled = State(initialValue: localStore.notificationsEnabled)
+    }
+
+    private var appVersionText: String {
+        let info = AppInfoDescriptor.current()
+        return "\(info.appName) v\(info.appVersion) (\(info.buildNumber))"
+    }
 
     var body: some View {
         screenScaffold(title: "설정", onBack: onBack, rightSystemImage: nil) {
@@ -6191,12 +7013,18 @@ struct SettingsScreen: View {
                     ])
 
                     settingsSection(title: "정보", rows: [
-                        settingsRow("문의하기", subtitle: "준비 중", systemImage: "bubble.left") {},
-                        settingsRow("이용약관", subtitle: "준비 중", systemImage: "doc.text") {},
-                        settingsRow("개인정보처리방침", subtitle: "준비 중", systemImage: "doc.badge.shield") {}
+                        settingsRow("문의하기", subtitle: "지원 페이지", systemImage: "bubble.left") {
+                            activeSheet = .externalLink(.support)
+                        },
+                        settingsRow("이용약관", subtitle: "커뮤니티 가이드라인", systemImage: "doc.text") {
+                            activeSheet = .externalLink(.terms)
+                        },
+                        settingsRow("개인정보처리방침", subtitle: "정책 문서", systemImage: "doc.badge.shield") {
+                            activeSheet = .externalLink(.privacy)
+                        }
                     ])
 
-                    Text("내전 메이커 v1.0.0")
+                    Text(appVersionText)
                         .font(AppTypography.body(12))
                         .foregroundStyle(AppPalette.textMuted)
 
@@ -6217,6 +7045,48 @@ struct SettingsScreen: View {
         }
         .sheet(isPresented: $showsProfileEdit) {
             ProfileEditSheet(session: session, profile: session.profile, isPresented: $showsProfileEdit)
+        }
+        .sheet(item: $activeSheet) { sheet in
+            settingsSheetView(sheet)
+        }
+        .alert(
+            "문서를 열 수 없습니다",
+            isPresented: Binding(
+                get: { externalLinkErrorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        externalLinkErrorMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("확인", role: .cancel) {
+                externalLinkErrorMessage = nil
+            }
+        } message: {
+            Text(externalLinkErrorMessage ?? "잠시 후 다시 시도해 주세요.")
+        }
+        .onChange(of: notificationsEnabled) { _, newValue in
+            session.container.localStore.setNotificationsEnabled(newValue)
+        }
+        .onChange(of: isProfilePublic) { _, newValue in
+            session.container.localStore.setProfilePublic(newValue)
+        }
+        .onChange(of: isHistoryPublic) { _, newValue in
+            session.container.localStore.setHistoryPublic(newValue)
+        }
+    }
+
+    @ViewBuilder
+    private func settingsSheetView(_ sheet: SettingsSheet) -> some View {
+        switch sheet {
+        case let .externalLink(link):
+            SafariSheetView(link: link) {
+                handleExternalLinkLoadFailure(link)
+            }
+            .ignoresSafeArea()
+        case let .supportMail(draft):
+            SupportMailComposeSheet(draft: draft)
         }
     }
 
@@ -6282,6 +7152,140 @@ struct SettingsScreen: View {
             .frame(height: 48)
             .tint(AppPalette.accentBlue)
         )
+    }
+
+    private func handleExternalLinkLoadFailure(_ link: AppExternalLink) {
+        activeSheet = nil
+
+        guard link == .support else {
+            externalLinkErrorMessage = "\(link.title) 페이지를 열지 못했습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요."
+            return
+        }
+
+        let draft = makeSupportMailDraft()
+        if MFMailComposeViewController.canSendMail() {
+            DispatchQueue.main.async {
+                activeSheet = .supportMail(draft)
+            }
+            return
+        }
+
+        if let mailtoURL = draft.mailtoURL {
+            DispatchQueue.main.async {
+                openURL(mailtoURL)
+            }
+            return
+        }
+
+        externalLinkErrorMessage = "지원 페이지와 메일 앱을 모두 열 수 없습니다. \(AppSupportContact.emailAddress)로 직접 문의해 주세요."
+    }
+
+    private func makeSupportMailDraft() -> SupportMailDraft {
+        let appInfo = AppInfoDescriptor.current()
+        let versionText = "\(appInfo.appVersion) (\(appInfo.buildNumber))"
+        let body = [
+            "문의 유형:",
+            "",
+            "상세 내용:",
+            "",
+            "재현 순서:",
+            "",
+            "추가 참고 사항:",
+            "",
+            "---",
+            "앱 이름: \(appInfo.appName)",
+            "앱 버전: \(versionText)",
+            "iOS 버전: \(UIDevice.current.systemVersion)",
+            "기기 정보: \(currentDeviceModelDescription())",
+        ].joined(separator: "\n")
+
+        return SupportMailDraft(
+            recipients: [AppSupportContact.emailAddress],
+            subject: "[InhouseMaker 문의] ",
+            body: body
+        )
+    }
+}
+
+struct SupportMailDraft: Identifiable, Hashable {
+    let id = UUID()
+    let recipients: [String]
+    let subject: String
+    let body: String
+
+    var mailtoURL: URL? {
+        var components = URLComponents()
+        components.scheme = "mailto"
+        components.path = recipients.joined(separator: ",")
+        components.queryItems = [
+            URLQueryItem(name: "subject", value: subject),
+            URLQueryItem(name: "body", value: body),
+        ]
+        return components.url
+    }
+}
+
+struct SafariSheetView: UIViewControllerRepresentable {
+    let link: AppExternalLink
+    let onInitialLoadFailure: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onInitialLoadFailure: onInitialLoadFailure)
+    }
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let controller = SFSafariViewController(url: link.url)
+        controller.dismissButtonStyle = .close
+        controller.preferredControlTintColor = UIColor(hex: 0x4A9FFF)
+        controller.delegate = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
+
+    final class Coordinator: NSObject, SFSafariViewControllerDelegate {
+        private let onInitialLoadFailure: () -> Void
+
+        init(onInitialLoadFailure: @escaping () -> Void) {
+            self.onInitialLoadFailure = onInitialLoadFailure
+        }
+
+        func safariViewController(
+            _ controller: SFSafariViewController,
+            didCompleteInitialLoad didLoadSuccessfully: Bool
+        ) {
+            guard !didLoadSuccessfully else { return }
+            onInitialLoadFailure()
+        }
+    }
+}
+
+struct SupportMailComposeSheet: UIViewControllerRepresentable {
+    let draft: SupportMailDraft
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator()
+    }
+
+    func makeUIViewController(context: Context) -> MFMailComposeViewController {
+        let controller = MFMailComposeViewController()
+        controller.mailComposeDelegate = context.coordinator
+        controller.setToRecipients(draft.recipients)
+        controller.setSubject(draft.subject)
+        controller.setMessageBody(draft.body, isHTML: false)
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: MFMailComposeViewController, context: Context) {}
+
+    final class Coordinator: NSObject, MFMailComposeViewControllerDelegate {
+        func mailComposeController(
+            _ controller: MFMailComposeViewController,
+            didFinishWith result: MFMailComposeResult,
+            error: Error?
+        ) {
+            controller.dismiss(animated: true)
+        }
     }
 }
 

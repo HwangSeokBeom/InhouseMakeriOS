@@ -1404,6 +1404,100 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testGroupMainViewModelCreateGroupDefersLoginPromptUntilSheetDismissWhenAuthExpires() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/groups":
+                    return (401, Data())
+                case "/auth/refresh":
+                    return (401, Data())
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        session.requestModalPresentation(.groupCreate)
+        let viewModel = GroupMainViewModel(session: session)
+
+        let result = await viewModel.createGroup(name: "테스트 그룹", description: "설명", tags: ["서울"])
+
+        switch result {
+        case .requiresAuthentication:
+            XCTAssertTrue(true)
+        case let .failure(message):
+            XCTFail("Expected authentication recovery, got failure: \(message)")
+        case .success:
+            XCTFail("Expected authentication recovery result")
+        }
+
+        XCTAssertEqual(viewModel.actionState, .idle)
+        XCTAssertEqual(session.activeModal, .groupCreate)
+        XCTAssertNil(session.authPrompt)
+
+        session.handleModalDismissed(.groupCreate)
+
+        XCTAssertEqual(session.authPrompt?.requirement, .groupManagement)
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelCreatePostDefersLoginPromptUntilSheetDismissWhenAuthExpires() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/recruiting-posts":
+                    return (401, Data())
+                case "/auth/refresh":
+                    return (401, Data())
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        session.requestModalPresentation(.recruitCreate)
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        let result = await viewModel.createPost(
+            groupID: "group-1",
+            title: "테스트 모집",
+            body: "본문",
+            tags: ["빡겜"],
+            positions: ["MID"]
+        )
+
+        switch result {
+        case .requiresAuthentication:
+            XCTAssertTrue(true)
+        case let .failure(message):
+            XCTFail("Expected authentication recovery, got failure: \(message)")
+        case .success:
+            XCTFail("Expected authentication recovery result")
+        }
+
+        XCTAssertEqual(viewModel.actionState, .idle)
+        XCTAssertEqual(session.activeModal, .recruitCreate)
+        XCTAssertNil(session.authPrompt)
+
+        session.handleModalDismissed(.recruitCreate)
+
+        XCTAssertEqual(session.authPrompt?.requirement, .recruitingWrite)
+    }
+
+    @MainActor
     func testMatchLobbyFeatureAuthRequiredQueuesRetryIntent() async {
         let store = TestStore(initialState: MatchLobbyFeature.State(groupID: "g1", matchID: "m1")) {
             MatchLobbyFeature()

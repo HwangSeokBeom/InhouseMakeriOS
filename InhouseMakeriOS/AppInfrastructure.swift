@@ -1,5 +1,6 @@
 import Foundation
 import Security
+import SwiftData
 
 enum AppEnvironment: String, Equatable {
     case dev
@@ -42,6 +43,62 @@ struct AppConfiguration {
     }
 }
 
+enum AppExternalLink: String, CaseIterable, Identifiable {
+    case product
+    case support
+    case terms
+    case privacy
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .product:
+            return "InhouseMaker"
+        case .support:
+            return "문의하기"
+        case .terms:
+            return "이용약관"
+        case .privacy:
+            return "개인정보처리방침"
+        }
+    }
+
+    var url: URL {
+        switch self {
+        case .product:
+            return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal")!
+        case .support:
+            return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/support.html")!
+        case .terms:
+            return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/community.html")!
+        case .privacy:
+            return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/privacy.html")!
+        }
+    }
+}
+
+enum AppSupportContact {
+    static let emailAddress = "tjrqja014@gmail.com"
+}
+
+struct AppInfoDescriptor {
+    let appName: String
+    let appVersion: String
+    let buildNumber: String
+
+    static func current(bundle: Bundle = .main) -> AppInfoDescriptor {
+        let appName = (
+            bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String
+        ) ?? (
+            bundle.object(forInfoDictionaryKey: "CFBundleName") as? String
+        ) ?? "InhouseMaker"
+        let appVersion = (bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "1.0"
+        let buildNumber = (bundle.object(forInfoDictionaryKey: kCFBundleVersionKey as String) as? String) ?? "1"
+        return AppInfoDescriptor(appName: appName, appVersion: appVersion, buildNumber: buildNumber)
+    }
+}
+
 enum HTTPMethod: String {
     case get = "GET"
     case post = "POST"
@@ -54,11 +111,670 @@ private enum LocalStoreKey {
     static let recentMatches = "local.recent.matches"
     static let cachedResults = "local.cached.results"
     static let notifications = "local.notifications"
+    static let recentSearchKeywords = "local.recent.search.keywords"
     static let guestOnboardingCompleted = "local.guest.onboarding.completed"
     static let onboardingStatus = "local.onboarding.status"
     static let recruitFilterType = "local.recruit.filter.type"
     static let teamBalancePreviewDraft = "local.team.balance.preview.draft"
     static let resultPreviewDraft = "local.result.preview.draft"
+    static let notificationsEnabled = "local.notifications.enabled"
+    static let profilePublic = "local.profile.public"
+    static let historyPublic = "local.history.public"
+}
+
+private enum LocalPreferenceKey: String {
+    case migrationVersion = "local.persistence.migration.version"
+    case onboardingStatus = "local.onboarding.status"
+    case recruitFilterType = "local.recruit.filter.type"
+    case teamBalancePreviewDraft = "local.team.balance.preview.draft"
+    case resultPreviewDraft = "local.result.preview.draft"
+    case notificationsEnabled = "local.notifications.enabled"
+    case profilePublic = "local.profile.public"
+    case historyPublic = "local.history.public"
+}
+
+enum AppModelContainerFactory {
+    private static let schema = Schema([
+        LocalSearchKeywordEntity.self,
+        LocalRecentGroupEntity.self,
+        LocalMatchRecordEntity.self,
+        LocalNotificationEntity.self,
+        LocalAppPreferenceEntity.self,
+    ])
+
+    static func makeContainer(inMemoryOnly: Bool = false) -> ModelContainer {
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: inMemoryOnly)
+
+        do {
+            return try ModelContainer(for: schema, configurations: configuration)
+        } catch {
+            #if DEBUG
+            print("[SwiftData] persistent container initialization failed: \(error)")
+            #endif
+
+            do {
+                let fallbackConfiguration = ModelConfiguration(isStoredInMemoryOnly: true)
+                return try ModelContainer(for: schema, configurations: fallbackConfiguration)
+            } catch {
+                fatalError("SwiftData container initialization failed: \(error)")
+            }
+        }
+    }
+}
+
+@Model
+private final class LocalSearchKeywordEntity {
+    @Attribute(.unique) var normalizedKeyword: String
+    var keyword: String
+    var lastSearchedAt: Date
+
+    init(keyword: String, lastSearchedAt: Date) {
+        self.normalizedKeyword = keyword.normalizedSearchKey
+        self.keyword = keyword
+        self.lastSearchedAt = lastSearchedAt
+    }
+}
+
+@Model
+private final class LocalRecentGroupEntity {
+    @Attribute(.unique) var groupID: String
+    var groupName: String?
+    var lastViewedAt: Date
+
+    init(groupID: String, groupName: String? = nil, lastViewedAt: Date) {
+        self.groupID = groupID
+        self.groupName = groupName
+        self.lastViewedAt = lastViewedAt
+    }
+}
+
+@Model
+private final class LocalMatchRecordEntity {
+    @Attribute(.unique) var matchID: String
+    var groupID: String?
+    var groupName: String
+    var trackedAt: Date
+    var savedAt: Date?
+    var winningTeamRawValue: String?
+    var balanceRating: Int?
+    var mvpUserID: String?
+
+    init(
+        matchID: String,
+        groupID: String?,
+        groupName: String,
+        trackedAt: Date,
+        savedAt: Date? = nil,
+        winningTeamRawValue: String? = nil,
+        balanceRating: Int? = nil,
+        mvpUserID: String? = nil
+    ) {
+        self.matchID = matchID
+        self.groupID = groupID
+        self.groupName = groupName
+        self.trackedAt = trackedAt
+        self.savedAt = savedAt
+        self.winningTeamRawValue = winningTeamRawValue
+        self.balanceRating = balanceRating
+        self.mvpUserID = mvpUserID
+    }
+}
+
+@Model
+private final class LocalNotificationEntity {
+    @Attribute(.unique) var notificationID: UUID
+    var title: String
+    var body: String
+    var createdAt: Date
+    var isUnread: Bool
+    var systemImageName: String
+
+    init(
+        notificationID: UUID,
+        title: String,
+        body: String,
+        createdAt: Date,
+        isUnread: Bool,
+        systemImageName: String
+    ) {
+        self.notificationID = notificationID
+        self.title = title
+        self.body = body
+        self.createdAt = createdAt
+        self.isUnread = isUnread
+        self.systemImageName = systemImageName
+    }
+}
+
+@Model
+private final class LocalAppPreferenceEntity {
+    @Attribute(.unique) var key: String
+    var stringValue: String?
+    var dataValue: Data?
+    var updatedAt: Date
+
+    init(key: String, stringValue: String? = nil, dataValue: Data? = nil, updatedAt: Date) {
+        self.key = key
+        self.stringValue = stringValue
+        self.dataValue = dataValue
+        self.updatedAt = updatedAt
+    }
+}
+
+private extension NSLock {
+    func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock()
+        defer { unlock() }
+        return try body()
+    }
+}
+
+private extension String {
+    var normalizedSearchKey: String {
+        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+            .replacingOccurrences(of: " ", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+private final class LocalPersistenceStore {
+    private let modelContainer: ModelContainer
+    private let lock = NSLock()
+
+    init(modelContainer: ModelContainer) {
+        self.modelContainer = modelContainer
+    }
+
+    func migrateLegacyData(from defaults: UserDefaults) {
+        lock.withLock {
+            let context = ModelContext(modelContainer)
+
+            if preferenceString(for: .migrationVersion, in: context) == "1" {
+                return
+            }
+
+            let now = Date()
+
+            let legacyGroupIDs = defaults.stringArray(forKey: LocalStoreKey.groupIDs) ?? []
+            for (index, groupID) in legacyGroupIDs.enumerated() {
+                let groupEntity = recentGroupEntity(for: groupID, in: context)
+                    ?? LocalRecentGroupEntity(
+                        groupID: groupID,
+                        lastViewedAt: now.addingTimeInterval(-Double(index))
+                    )
+                groupEntity.lastViewedAt = now.addingTimeInterval(-Double(index))
+                if groupEntity.modelContext == nil {
+                    context.insert(groupEntity)
+                }
+            }
+
+            let recentMatches = decodeLegacy([RecentMatchContext].self, forKey: LocalStoreKey.recentMatches, defaults: defaults) ?? []
+            for recentMatch in recentMatches {
+                let entity = matchRecordEntity(for: recentMatch.matchID, in: context)
+                    ?? LocalMatchRecordEntity(
+                        matchID: recentMatch.matchID,
+                        groupID: recentMatch.groupID,
+                        groupName: recentMatch.groupName,
+                        trackedAt: recentMatch.createdAt
+                    )
+                entity.groupID = recentMatch.groupID
+                entity.groupName = recentMatch.groupName
+                entity.trackedAt = recentMatch.createdAt
+                if entity.modelContext == nil {
+                    context.insert(entity)
+                }
+            }
+
+            let cachedResults = decodeLegacy([String: CachedResultMetadata].self, forKey: LocalStoreKey.cachedResults, defaults: defaults) ?? [:]
+            for (matchID, metadata) in cachedResults {
+                let entity = matchRecordEntity(for: matchID, in: context)
+                    ?? LocalMatchRecordEntity(
+                        matchID: matchID,
+                        groupID: nil,
+                        groupName: "최근 내전",
+                        trackedAt: metadata.updatedAt
+                    )
+                entity.savedAt = metadata.updatedAt
+                entity.winningTeamRawValue = metadata.winningTeam.rawValue
+                entity.balanceRating = metadata.balanceRating
+                entity.mvpUserID = metadata.mvpUserID
+                if entity.modelContext == nil {
+                    context.insert(entity)
+                }
+            }
+
+            let notifications = decodeLegacy([NotificationEntry].self, forKey: LocalStoreKey.notifications, defaults: defaults) ?? []
+            for notification in notifications {
+                let entity = notificationEntity(for: notification.id, in: context)
+                    ?? LocalNotificationEntity(
+                        notificationID: notification.id,
+                        title: notification.title,
+                        body: notification.body,
+                        createdAt: notification.createdAt,
+                        isUnread: notification.isUnread,
+                        systemImageName: notification.systemImageName
+                    )
+                entity.title = notification.title
+                entity.body = notification.body
+                entity.createdAt = notification.createdAt
+                entity.isUnread = notification.isUnread
+                entity.systemImageName = notification.systemImageName
+                if entity.modelContext == nil {
+                    context.insert(entity)
+                }
+            }
+
+            if let onboardingStatus = defaults.string(forKey: LocalStoreKey.onboardingStatus) {
+                setPreferenceString(onboardingStatus, for: .onboardingStatus, in: context)
+            } else if let legacyFlag = defaults.object(forKey: LocalStoreKey.guestOnboardingCompleted) as? Bool {
+                setPreferenceString(legacyFlag ? OnboardingStatus.completed.rawValue : OnboardingStatus.pending.rawValue, for: .onboardingStatus, in: context)
+            }
+
+            if let recruitFilterType = decodeLegacy(RecruitingPostType.self, forKey: LocalStoreKey.recruitFilterType, defaults: defaults) {
+                setPreferenceCodable(recruitFilterType, for: .recruitFilterType, in: context)
+            }
+
+            if let draft = decodeLegacy(TeamBalancePreviewDraft.self, forKey: LocalStoreKey.teamBalancePreviewDraft, defaults: defaults) {
+                setPreferenceCodable(draft, for: .teamBalancePreviewDraft, in: context)
+            }
+
+            if let draft = decodeLegacy(ResultPreviewDraft.self, forKey: LocalStoreKey.resultPreviewDraft, defaults: defaults) {
+                setPreferenceCodable(draft, for: .resultPreviewDraft, in: context)
+            }
+
+            setPreferenceString("1", for: .migrationVersion, in: context)
+            pruneRecentGroups(in: context)
+            pruneMatchRecords(in: context)
+            pruneNotifications(in: context)
+            save(context)
+        }
+    }
+
+    func storedGroupIDs(limit: Int = 12) -> [String] {
+        read { context in
+            var descriptor = FetchDescriptor<LocalRecentGroupEntity>(
+                sortBy: [SortDescriptor(\.lastViewedAt, order: .reverse)]
+            )
+            descriptor.fetchLimit = limit
+            return (try? context.fetch(descriptor).map(\.groupID)) ?? []
+        }
+    }
+
+    func trackGroup(id: String, name: String? = nil) {
+        write { context in
+            let entity = recentGroupEntity(for: id, in: context)
+                ?? LocalRecentGroupEntity(groupID: id, groupName: name, lastViewedAt: Date())
+            entity.lastViewedAt = Date()
+            if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                entity.groupName = name
+            }
+            if entity.modelContext == nil {
+                context.insert(entity)
+            }
+            pruneRecentGroups(in: context)
+        }
+    }
+
+    func recentMatches(limit: Int = 12) -> [RecentMatchContext] {
+        read { context in
+            var descriptor = FetchDescriptor<LocalMatchRecordEntity>(
+                sortBy: [SortDescriptor(\.trackedAt, order: .reverse)]
+            )
+            descriptor.fetchLimit = limit
+            let entities = (try? context.fetch(descriptor)) ?? []
+            return entities.compactMap { entity in
+                guard let groupID = entity.groupID else { return nil }
+                return RecentMatchContext(
+                    matchID: entity.matchID,
+                    groupID: groupID,
+                    groupName: entity.groupName,
+                    createdAt: entity.trackedAt
+                )
+            }
+        }
+    }
+
+    func trackMatch(_ contextValue: RecentMatchContext) {
+        write { context in
+            let entity = matchRecordEntity(for: contextValue.matchID, in: context)
+                ?? LocalMatchRecordEntity(
+                    matchID: contextValue.matchID,
+                    groupID: contextValue.groupID,
+                    groupName: contextValue.groupName,
+                    trackedAt: contextValue.createdAt
+                )
+            entity.groupID = contextValue.groupID
+            entity.groupName = contextValue.groupName
+            entity.trackedAt = contextValue.createdAt
+            if entity.modelContext == nil {
+                context.insert(entity)
+            }
+            pruneMatchRecords(in: context)
+        }
+    }
+
+    func cachedResults() -> [String: CachedResultMetadata] {
+        read { context in
+            let descriptor = FetchDescriptor<LocalMatchRecordEntity>()
+            let entities = ((try? context.fetch(descriptor)) ?? []).sorted {
+                ($0.savedAt ?? .distantPast) > ($1.savedAt ?? .distantPast)
+            }
+            return Dictionary(
+                uniqueKeysWithValues: entities.compactMap { entity in
+                    guard
+                        let savedAt = entity.savedAt,
+                        let winningTeamRawValue = entity.winningTeamRawValue,
+                        let winningTeam = TeamSide(rawValue: winningTeamRawValue),
+                        let balanceRating = entity.balanceRating,
+                        let mvpUserID = entity.mvpUserID
+                    else {
+                        return nil
+                    }
+
+                    return (
+                        entity.matchID,
+                        CachedResultMetadata(
+                            winningTeam: winningTeam,
+                            mvpUserID: mvpUserID,
+                            balanceRating: balanceRating,
+                            updatedAt: savedAt
+                        )
+                    )
+                }
+            )
+        }
+    }
+
+    func cacheResult(matchID: String, metadata: CachedResultMetadata) {
+        write { context in
+            let entity = matchRecordEntity(for: matchID, in: context)
+                ?? LocalMatchRecordEntity(
+                    matchID: matchID,
+                    groupID: nil,
+                    groupName: "최근 내전",
+                    trackedAt: metadata.updatedAt
+                )
+            entity.savedAt = metadata.updatedAt
+            entity.winningTeamRawValue = metadata.winningTeam.rawValue
+            entity.balanceRating = metadata.balanceRating
+            entity.mvpUserID = metadata.mvpUserID
+            if entity.modelContext == nil {
+                context.insert(entity)
+            }
+            pruneMatchRecords(in: context)
+        }
+    }
+
+    func localMatchRecords() -> [LocalMatchRecord] {
+        read { context in
+            let descriptor = FetchDescriptor<LocalMatchRecordEntity>()
+            let entities = ((try? context.fetch(descriptor)) ?? []).sorted {
+                ($0.savedAt ?? .distantPast) > ($1.savedAt ?? .distantPast)
+            }
+            return entities.compactMap { entity in
+                guard
+                    let savedAt = entity.savedAt,
+                    let winningTeamRawValue = entity.winningTeamRawValue,
+                    let winningTeam = TeamSide(rawValue: winningTeamRawValue),
+                    let balanceRating = entity.balanceRating,
+                    let mvpUserID = entity.mvpUserID
+                else {
+                    return nil
+                }
+
+                return LocalMatchRecord(
+                    matchID: entity.matchID,
+                    groupID: entity.groupID,
+                    groupName: entity.groupName,
+                    savedAt: savedAt,
+                    winningTeam: winningTeam,
+                    balanceRating: balanceRating,
+                    mvpUserID: mvpUserID
+                )
+            }
+        }
+    }
+
+    func notifications() -> [NotificationEntry] {
+        read { context in
+            let descriptor = FetchDescriptor<LocalNotificationEntity>(
+                sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+            )
+            return ((try? context.fetch(descriptor)) ?? []).map {
+                NotificationEntry(
+                    id: $0.notificationID,
+                    title: $0.title,
+                    body: $0.body,
+                    createdAt: $0.createdAt,
+                    isUnread: $0.isUnread,
+                    systemImageName: $0.systemImageName
+                )
+            }
+        }
+    }
+
+    func appendNotification(title: String, body: String, symbol: String, unread: Bool = true) {
+        write { context in
+            context.insert(
+                LocalNotificationEntity(
+                    notificationID: UUID(),
+                    title: title,
+                    body: body,
+                    createdAt: Date(),
+                    isUnread: unread,
+                    systemImageName: symbol
+                )
+            )
+            pruneNotifications(in: context)
+        }
+    }
+
+    func recentSearchKeywords(limit: Int = 10) -> [RecentSearchKeyword] {
+        read { context in
+            var descriptor = FetchDescriptor<LocalSearchKeywordEntity>(
+                sortBy: [SortDescriptor(\.lastSearchedAt, order: .reverse)]
+            )
+            descriptor.fetchLimit = limit
+            return ((try? context.fetch(descriptor)) ?? []).map {
+                RecentSearchKeyword(id: $0.normalizedKeyword, keyword: $0.keyword, searchedAt: $0.lastSearchedAt)
+            }
+        }
+    }
+
+    func recordRecentSearchKeyword(_ keyword: String) {
+        let trimmedKeyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKeyword.isEmpty else { return }
+
+        write { context in
+            let normalizedKeyword = trimmedKeyword.normalizedSearchKey
+            let entity = searchKeywordEntity(for: normalizedKeyword, in: context)
+                ?? LocalSearchKeywordEntity(keyword: trimmedKeyword, lastSearchedAt: Date())
+            entity.keyword = trimmedKeyword
+            entity.normalizedKeyword = normalizedKeyword
+            entity.lastSearchedAt = Date()
+            if entity.modelContext == nil {
+                context.insert(entity)
+            }
+            pruneRecentSearchKeywords(in: context)
+        }
+    }
+
+    func deleteRecentSearchKeyword(id: String) {
+        write { context in
+            guard let entity = searchKeywordEntity(for: id, in: context) else { return }
+            context.delete(entity)
+        }
+    }
+
+    func deleteAllRecentSearchKeywords() {
+        write { context in
+            let descriptor = FetchDescriptor<LocalSearchKeywordEntity>()
+            let entities = (try? context.fetch(descriptor)) ?? []
+            for entity in entities {
+                context.delete(entity)
+            }
+        }
+    }
+
+    func stringPreference(for key: LocalPreferenceKey) -> String? {
+        read { context in
+            preferenceString(for: key, in: context)
+        }
+    }
+
+    func setStringPreference(_ value: String?, for key: LocalPreferenceKey) {
+        write { context in
+            setPreferenceString(value, for: key, in: context)
+        }
+    }
+
+    func codablePreference<T: Decodable>(_ type: T.Type, for key: LocalPreferenceKey) -> T? {
+        read { context in
+            guard let data = preferenceEntity(for: key, in: context)?.dataValue else { return nil }
+            return try? JSONDecoder.app.decode(type, from: data)
+        }
+    }
+
+    func setCodablePreference<T: Encodable>(_ value: T, for key: LocalPreferenceKey) {
+        write { context in
+            setPreferenceCodable(value, for: key, in: context)
+        }
+    }
+
+    private func read<T>(_ body: (ModelContext) -> T) -> T {
+        lock.withLock {
+            body(ModelContext(modelContainer))
+        }
+    }
+
+    private func write(_ body: (ModelContext) -> Void) {
+        lock.withLock {
+            let context = ModelContext(modelContainer)
+            body(context)
+            save(context)
+        }
+    }
+
+    private func save(_ context: ModelContext) {
+        do {
+            try context.save()
+        } catch {
+            #if DEBUG
+            print("[SwiftData] save failed: \(error)")
+            #endif
+        }
+    }
+
+    private func recentGroupEntity(for groupID: String, in context: ModelContext) -> LocalRecentGroupEntity? {
+        let descriptor = FetchDescriptor<LocalRecentGroupEntity>(
+            predicate: #Predicate { $0.groupID == groupID }
+        )
+        return (try? context.fetch(descriptor))?.first
+    }
+
+    private func matchRecordEntity(for matchID: String, in context: ModelContext) -> LocalMatchRecordEntity? {
+        let descriptor = FetchDescriptor<LocalMatchRecordEntity>(
+            predicate: #Predicate { $0.matchID == matchID }
+        )
+        return (try? context.fetch(descriptor))?.first
+    }
+
+    private func notificationEntity(for notificationID: UUID, in context: ModelContext) -> LocalNotificationEntity? {
+        let descriptor = FetchDescriptor<LocalNotificationEntity>(
+            predicate: #Predicate { $0.notificationID == notificationID }
+        )
+        return (try? context.fetch(descriptor))?.first
+    }
+
+    private func searchKeywordEntity(for normalizedKeyword: String, in context: ModelContext) -> LocalSearchKeywordEntity? {
+        let descriptor = FetchDescriptor<LocalSearchKeywordEntity>(
+            predicate: #Predicate { $0.normalizedKeyword == normalizedKeyword }
+        )
+        return (try? context.fetch(descriptor))?.first
+    }
+
+    private func preferenceEntity(for key: LocalPreferenceKey, in context: ModelContext) -> LocalAppPreferenceEntity? {
+        let rawKey = key.rawValue
+        let descriptor = FetchDescriptor<LocalAppPreferenceEntity>(
+            predicate: #Predicate { $0.key == rawKey }
+        )
+        return (try? context.fetch(descriptor))?.first
+    }
+
+    private func preferenceString(for key: LocalPreferenceKey, in context: ModelContext) -> String? {
+        preferenceEntity(for: key, in: context)?.stringValue
+    }
+
+    private func setPreferenceString(_ value: String?, for key: LocalPreferenceKey, in context: ModelContext) {
+        let entity = preferenceEntity(for: key, in: context)
+            ?? LocalAppPreferenceEntity(key: key.rawValue, updatedAt: Date())
+        entity.stringValue = value
+        entity.updatedAt = Date()
+        if entity.modelContext == nil {
+            context.insert(entity)
+        }
+    }
+
+    private func setPreferenceCodable<T: Encodable>(_ value: T, for key: LocalPreferenceKey, in context: ModelContext) {
+        guard let data = try? JSONEncoder.app.encode(value) else { return }
+        let entity = preferenceEntity(for: key, in: context)
+            ?? LocalAppPreferenceEntity(key: key.rawValue, updatedAt: Date())
+        entity.dataValue = data
+        entity.updatedAt = Date()
+        if entity.modelContext == nil {
+            context.insert(entity)
+        }
+    }
+
+    private func pruneRecentGroups(in context: ModelContext, limit: Int = 12) {
+        let descriptor = FetchDescriptor<LocalRecentGroupEntity>(
+            sortBy: [SortDescriptor(\.lastViewedAt, order: .reverse)]
+        )
+        let entities = (try? context.fetch(descriptor)) ?? []
+        guard entities.count > limit else { return }
+        for entity in entities.dropFirst(limit) {
+            context.delete(entity)
+        }
+    }
+
+    private func pruneMatchRecords(in context: ModelContext, limit: Int = 50) {
+        let descriptor = FetchDescriptor<LocalMatchRecordEntity>(
+            sortBy: [SortDescriptor(\.trackedAt, order: .reverse)]
+        )
+        let entities = (try? context.fetch(descriptor)) ?? []
+        guard entities.count > limit else { return }
+        for entity in entities.dropFirst(limit) {
+            context.delete(entity)
+        }
+    }
+
+    private func pruneNotifications(in context: ModelContext, limit: Int = 50) {
+        let descriptor = FetchDescriptor<LocalNotificationEntity>(
+            sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
+        )
+        let entities = (try? context.fetch(descriptor)) ?? []
+        guard entities.count > limit else { return }
+        for entity in entities.dropFirst(limit) {
+            context.delete(entity)
+        }
+    }
+
+    private func pruneRecentSearchKeywords(in context: ModelContext, limit: Int = 10) {
+        let descriptor = FetchDescriptor<LocalSearchKeywordEntity>(
+            sortBy: [SortDescriptor(\.lastSearchedAt, order: .reverse)]
+        )
+        let entities = (try? context.fetch(descriptor)) ?? []
+        guard entities.count > limit else { return }
+        for entity in entities.dropFirst(limit) {
+            context.delete(entity)
+        }
+    }
+
+    private func decodeLegacy<T: Decodable>(_ type: T.Type, forKey key: String, defaults: UserDefaults) -> T? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder.app.decode(type, from: data)
+    }
 }
 
 enum OnboardingStatus: String, Codable, Equatable {
@@ -85,30 +801,45 @@ struct OnboardingStatusNormalizationResult: Equatable {
 
 final class AppLocalStore {
     private let defaults: UserDefaults
+    private let persistenceStore: LocalPersistenceStore
 
-    init(defaults: UserDefaults = .standard) {
+    convenience init(defaults: UserDefaults = .standard) {
+        let usesStandardDefaults = defaults === UserDefaults.standard
+        let modelContainer = AppModelContainerFactory.makeContainer(
+            inMemoryOnly: !usesStandardDefaults
+        )
+        self.init(defaults: defaults, modelContainer: modelContainer)
+    }
+
+    init(defaults: UserDefaults, modelContainer: ModelContainer) {
         self.defaults = defaults
+        self.persistenceStore = LocalPersistenceStore(modelContainer: modelContainer)
+        persistenceStore.migrateLegacyData(from: defaults)
     }
 
     var storedGroupIDs: [String] {
-        defaults.stringArray(forKey: LocalStoreKey.groupIDs) ?? []
+        let groupIDs = persistenceStore.storedGroupIDs()
+        return groupIDs.isEmpty ? (defaults.stringArray(forKey: LocalStoreKey.groupIDs) ?? []) : groupIDs
     }
 
     var recentMatches: [RecentMatchContext] {
-        decode([RecentMatchContext].self, forKey: LocalStoreKey.recentMatches) ?? []
+        let recentMatches = persistenceStore.recentMatches()
+        return recentMatches.isEmpty ? (decode([RecentMatchContext].self, forKey: LocalStoreKey.recentMatches) ?? []) : recentMatches
     }
 
     var cachedResults: [String: CachedResultMetadata] {
-        decode([String: CachedResultMetadata].self, forKey: LocalStoreKey.cachedResults) ?? [:]
+        let cachedResults = persistenceStore.cachedResults()
+        return cachedResults.isEmpty ? (decode([String: CachedResultMetadata].self, forKey: LocalStoreKey.cachedResults) ?? [:]) : cachedResults
     }
 
     var notifications: [NotificationEntry] {
-        decode([NotificationEntry].self, forKey: LocalStoreKey.notifications) ?? []
+        let notifications = persistenceStore.notifications()
+        return notifications.isEmpty ? (decode([NotificationEntry].self, forKey: LocalStoreKey.notifications) ?? []) : notifications
     }
 
     var onboardingStatus: OnboardingStatus? {
-        guard let rawValue = defaults.string(forKey: LocalStoreKey.onboardingStatus) else { return nil }
-        return OnboardingStatus(rawValue: rawValue)
+        guard let rawValue = persistenceStore.stringPreference(for: .onboardingStatus) else { return nil }
+        return OnboardingStatus(rawValue: rawValue) ?? legacyOnboardingStatus
     }
 
     var hasCompletedOnboarding: Bool {
@@ -120,56 +851,98 @@ final class AppLocalStore {
     }
 
     var recruitFilterType: RecruitingPostType {
-        decode(RecruitingPostType.self, forKey: LocalStoreKey.recruitFilterType) ?? .memberRecruit
+        persistenceStore.codablePreference(RecruitingPostType.self, for: .recruitFilterType)
+            ?? decode(RecruitingPostType.self, forKey: LocalStoreKey.recruitFilterType)
+            ?? .memberRecruit
     }
 
     var teamBalancePreviewDraft: TeamBalancePreviewDraft {
-        decode(TeamBalancePreviewDraft.self, forKey: LocalStoreKey.teamBalancePreviewDraft) ?? .defaultValue
+        persistenceStore.codablePreference(TeamBalancePreviewDraft.self, for: .teamBalancePreviewDraft)
+            ?? decode(TeamBalancePreviewDraft.self, forKey: LocalStoreKey.teamBalancePreviewDraft)
+            ?? .defaultValue
     }
 
     var resultPreviewDraft: ResultPreviewDraft {
-        decode(ResultPreviewDraft.self, forKey: LocalStoreKey.resultPreviewDraft)
+        persistenceStore.codablePreference(ResultPreviewDraft.self, for: .resultPreviewDraft)
+            ?? decode(ResultPreviewDraft.self, forKey: LocalStoreKey.resultPreviewDraft)
             ?? .defaultValue(from: teamBalancePreviewDraft)
     }
 
     var localMatchRecords: [LocalMatchRecord] {
-        let contexts = Dictionary(uniqueKeysWithValues: recentMatches.map { ($0.matchID, $0) })
-        return cachedResults
-            .map { matchID, metadata in
-                let context = contexts[matchID]
-                return LocalMatchRecord(
-                    matchID: matchID,
-                    groupID: context?.groupID,
-                    groupName: context?.groupName ?? "최근 내전",
-                    savedAt: metadata.updatedAt,
-                    winningTeam: metadata.winningTeam,
-                    balanceRating: metadata.balanceRating,
-                    mvpUserID: metadata.mvpUserID
-                )
-            }
-            .sorted { $0.savedAt > $1.savedAt }
+        let records = persistenceStore.localMatchRecords()
+        guard !records.isEmpty else {
+            let contexts = Dictionary(uniqueKeysWithValues: recentMatches.map { ($0.matchID, $0) })
+            return cachedResults
+                .map { matchID, metadata in
+                    let context = contexts[matchID]
+                    return LocalMatchRecord(
+                        matchID: matchID,
+                        groupID: context?.groupID,
+                        groupName: context?.groupName ?? "최근 내전",
+                        savedAt: metadata.updatedAt,
+                        winningTeam: metadata.winningTeam,
+                        balanceRating: metadata.balanceRating,
+                        mvpUserID: metadata.mvpUserID
+                    )
+                }
+                .sorted { $0.savedAt > $1.savedAt }
+        }
+        return records
+    }
+
+    var recentSearchKeywords: [RecentSearchKeyword] {
+        let keywords = persistenceStore.recentSearchKeywords()
+        return keywords.isEmpty ? (decode([RecentSearchKeyword].self, forKey: LocalStoreKey.recentSearchKeywords) ?? []) : keywords
+    }
+
+    var notificationsEnabled: Bool {
+        boolPreference(
+            preferenceKey: .notificationsEnabled,
+            defaultsKey: LocalStoreKey.notificationsEnabled,
+            defaultValue: true
+        )
+    }
+
+    var isProfilePublic: Bool {
+        boolPreference(
+            preferenceKey: .profilePublic,
+            defaultsKey: LocalStoreKey.profilePublic,
+            defaultValue: true
+        )
+    }
+
+    var isHistoryPublic: Bool {
+        boolPreference(
+            preferenceKey: .historyPublic,
+            defaultsKey: LocalStoreKey.historyPublic,
+            defaultValue: true
+        )
     }
 
     func trackGroup(id: String) {
+        persistenceStore.trackGroup(id: id)
         var current = storedGroupIDs.filter { $0 != id }
         current.insert(id, at: 0)
         defaults.set(Array(current.prefix(12)), forKey: LocalStoreKey.groupIDs)
     }
 
     func trackMatch(_ context: RecentMatchContext) {
+        persistenceStore.trackMatch(context)
         var current = recentMatches.filter { $0.matchID != context.matchID }
         current.insert(context, at: 0)
         save(Array(current.prefix(12)), forKey: LocalStoreKey.recentMatches)
     }
 
     func cacheResult(matchID: String, metadata: CachedResultMetadata) {
+        persistenceStore.cacheResult(matchID: matchID, metadata: metadata)
         var current = cachedResults
         current[matchID] = metadata
         save(current, forKey: LocalStoreKey.cachedResults)
     }
 
     func appendNotification(title: String, body: String, symbol: String, unread: Bool = true) {
-        var current = notifications
+        persistenceStore.appendNotification(title: title, body: body, symbol: symbol, unread: unread)
+        var current = decode([NotificationEntry].self, forKey: LocalStoreKey.notifications) ?? []
         current.insert(
             NotificationEntry(
                 id: UUID(),
@@ -228,6 +1001,7 @@ final class AppLocalStore {
     }
 
     func setOnboardingStatus(_ status: OnboardingStatus) {
+        persistenceStore.setStringPreference(status.rawValue, for: .onboardingStatus)
         defaults.set(status.rawValue, forKey: LocalStoreKey.onboardingStatus)
         defaults.set(status == .completed, forKey: LocalStoreKey.guestOnboardingCompleted)
     }
@@ -237,15 +1011,60 @@ final class AppLocalStore {
     }
 
     func setRecruitFilterType(_ type: RecruitingPostType) {
+        persistenceStore.setCodablePreference(type, for: .recruitFilterType)
         save(type, forKey: LocalStoreKey.recruitFilterType)
     }
 
     func setTeamBalancePreviewDraft(_ draft: TeamBalancePreviewDraft) {
+        persistenceStore.setCodablePreference(draft, for: .teamBalancePreviewDraft)
         save(draft, forKey: LocalStoreKey.teamBalancePreviewDraft)
     }
 
     func setResultPreviewDraft(_ draft: ResultPreviewDraft) {
+        persistenceStore.setCodablePreference(draft, for: .resultPreviewDraft)
         save(draft, forKey: LocalStoreKey.resultPreviewDraft)
+    }
+
+    func recordRecentSearchKeyword(_ keyword: String) {
+        persistenceStore.recordRecentSearchKeyword(keyword)
+        let trimmedKeyword = keyword.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedKeyword.isEmpty else { return }
+        var current = recentSearchKeywords.filter { $0.id != trimmedKeyword.normalizedSearchKey }
+        current.insert(
+            RecentSearchKeyword(
+                id: trimmedKeyword.normalizedSearchKey,
+                keyword: trimmedKeyword,
+                searchedAt: Date()
+            ),
+            at: 0
+        )
+        save(Array(current.prefix(10)), forKey: LocalStoreKey.recentSearchKeywords)
+    }
+
+    func deleteRecentSearchKeyword(id: String) {
+        persistenceStore.deleteRecentSearchKeyword(id: id)
+        let nextValue = recentSearchKeywords.filter { $0.id != id }
+        save(nextValue, forKey: LocalStoreKey.recentSearchKeywords)
+    }
+
+    func clearRecentSearchKeywords() {
+        persistenceStore.deleteAllRecentSearchKeywords()
+        defaults.removeObject(forKey: LocalStoreKey.recentSearchKeywords)
+    }
+
+    func setNotificationsEnabled(_ isEnabled: Bool) {
+        persistenceStore.setStringPreference(isEnabled ? "true" : "false", for: .notificationsEnabled)
+        defaults.set(isEnabled, forKey: LocalStoreKey.notificationsEnabled)
+    }
+
+    func setProfilePublic(_ isEnabled: Bool) {
+        persistenceStore.setStringPreference(isEnabled ? "true" : "false", for: .profilePublic)
+        defaults.set(isEnabled, forKey: LocalStoreKey.profilePublic)
+    }
+
+    func setHistoryPublic(_ isEnabled: Bool) {
+        persistenceStore.setStringPreference(isEnabled ? "true" : "false", for: .historyPublic)
+        defaults.set(isEnabled, forKey: LocalStoreKey.historyPublic)
     }
 
     private func save<T: Encodable>(_ value: T, forKey key: String) {
@@ -258,12 +1077,36 @@ final class AppLocalStore {
         return try? JSONDecoder.app.decode(type, from: data)
     }
 
+    private var legacyOnboardingStatus: OnboardingStatus? {
+        guard let rawValue = defaults.string(forKey: LocalStoreKey.onboardingStatus) else { return nil }
+        return OnboardingStatus(rawValue: rawValue)
+    }
+
+    private func boolPreference(
+        preferenceKey: LocalPreferenceKey,
+        defaultsKey: String,
+        defaultValue: Bool
+    ) -> Bool {
+        guard let rawValue = persistenceStore.stringPreference(for: preferenceKey) else {
+            if defaults.object(forKey: defaultsKey) != nil {
+                return defaults.bool(forKey: defaultsKey)
+            }
+            return defaultValue
+        }
+        switch rawValue.lowercased() {
+        case "true": return true
+        case "false": return false
+        default: return defaultValue
+        }
+    }
+
     private var hasLegacyUsageData: Bool {
         [
             LocalStoreKey.groupIDs,
             LocalStoreKey.recentMatches,
             LocalStoreKey.cachedResults,
             LocalStoreKey.notifications,
+            LocalStoreKey.recentSearchKeywords,
             LocalStoreKey.recruitFilterType,
             LocalStoreKey.teamBalancePreviewDraft,
             LocalStoreKey.resultPreviewDraft,
@@ -648,6 +1491,7 @@ final class APIClient {
         path == "/auth/signup/email"
             || path == "/auth/login/email"
             || path == "/me"
+            || path == "/groups"
             || path == "/recruiting-posts"
             || path.hasSuffix("/power-profile")
             || path.hasSuffix("/inhouse-history")
@@ -1998,10 +2842,197 @@ final class RecruitingRepository {
     }
 }
 
+struct SearchRepositoryPayload {
+    let groups: [GroupSummary]
+    let recruitingPosts: [RecruitPost]
+}
+
+protocol SearchRepository {
+    func loadSearchableResources(forceRefresh: Bool) async -> SearchRepositoryPayload
+}
+
+final class LiveSearchRepository: SearchRepository {
+    private let groupRepository: GroupRepository
+    private let recruitingRepository: RecruitingRepository
+    private var cachedPayload: SearchRepositoryPayload?
+    private var cacheDate: Date?
+
+    init(groupRepository: GroupRepository, recruitingRepository: RecruitingRepository) {
+        self.groupRepository = groupRepository
+        self.recruitingRepository = recruitingRepository
+    }
+
+    func loadSearchableResources(forceRefresh: Bool = false) async -> SearchRepositoryPayload {
+        if
+            !forceRefresh,
+            let cachedPayload,
+            let cacheDate,
+            Date().timeIntervalSince(cacheDate) < 60
+        {
+            return cachedPayload
+        }
+
+        async let groupsTask: [GroupSummary]? = try? await groupRepository.listPublic()
+        async let recruitingPostsTask: [RecruitPost]? = try? await recruitingRepository.listPublic(status: .open)
+
+        let payload = SearchRepositoryPayload(
+            groups: await groupsTask ?? [],
+            recruitingPosts: await recruitingPostsTask ?? []
+        )
+
+        cachedPayload = payload
+        cacheDate = Date()
+        return payload
+    }
+}
+
+final class SearchUseCase {
+    private let repository: any SearchRepository
+
+    init(repository: any SearchRepository) {
+        self.repository = repository
+    }
+
+    func execute(
+        query: String,
+        linkedRiotAccounts: [RiotAccount],
+        forceRefresh: Bool = false
+    ) async -> SearchResponse {
+        let tokens = query.searchTokens
+        guard !tokens.isEmpty else {
+            return SearchResponse(sections: [])
+        }
+
+        let payload = await repository.loadSearchableResources(forceRefresh: forceRefresh)
+
+        let riotItems = linkedRiotAccounts
+            .filter { account in
+                searchMatches(tokens: tokens, fields: [
+                    account.riotGameName,
+                    account.tagLine,
+                    account.displayName,
+                    account.region,
+                    account.syncStatusSummary,
+                ])
+            }
+            .sorted { lhs, rhs in
+                if lhs.isPrimary != rhs.isPrimary {
+                    return lhs.isPrimary && !rhs.isPrimary
+                }
+                return lhs.displayName < rhs.displayName
+            }
+            .map {
+                SearchResultItem(
+                    id: "riot-\($0.id)",
+                    kind: .riotAccount,
+                    title: $0.displayName,
+                    subtitle: "\($0.region.uppercased()) · \($0.verificationStatus.title)",
+                    tags: [$0.isPrimary ? "기준 Riot ID" : "참고 Riot ID", $0.syncUIState.title],
+                    supportingText: $0.syncStatusSummary,
+                    destination: .riotAccounts
+                )
+            }
+
+        let groupItems = payload.groups
+            .filter { group in
+                searchMatches(tokens: tokens, fields: [
+                    group.name,
+                    group.description ?? "",
+                    group.tags.joined(separator: " "),
+                ])
+            }
+            .sorted { lhs, rhs in
+                if lhs.recentMatches != rhs.recentMatches {
+                    return lhs.recentMatches > rhs.recentMatches
+                }
+                return lhs.name < rhs.name
+            }
+            .map { group in
+                SearchResultItem(
+                    id: "group-\(group.id)",
+                    kind: .group,
+                    title: group.name,
+                    subtitle: "멤버 \(group.memberCount)명 · 최근 내전 \(group.recentMatches)회",
+                    tags: Array(group.tags.prefix(3)),
+                    supportingText: group.description,
+                    destination: .groupDetail(groupID: group.id)
+                )
+            }
+
+        let postItems = payload.recruitingPosts
+            .filter { post in
+                searchMatches(tokens: tokens, fields: [
+                    post.title,
+                    post.body ?? "",
+                    post.groupID,
+                    post.tags.joined(separator: " "),
+                    post.requiredPositions.joined(separator: " "),
+                ])
+            }
+            .sorted { lhs, rhs in
+                switch (lhs.scheduledAt, rhs.scheduledAt) {
+                case let (left?, right?):
+                    if left == right {
+                        return lhs.title < rhs.title
+                    }
+                    return left < right
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                case (.none, .none):
+                    return lhs.title < rhs.title
+                }
+            }
+            .map { post in
+                SearchResultItem(
+                    id: "recruit-\(post.id)",
+                    kind: .recruitPost,
+                    title: post.title,
+                    subtitle: [post.groupID, post.scheduledAt?.shortDateText].compactMap { $0 }.joined(separator: " · "),
+                    tags: Array((post.requiredPositions + post.tags).filter { !$0.isEmpty }.prefix(4)),
+                    supportingText: post.body,
+                    destination: .recruitDetail(postID: post.id)
+                )
+            }
+
+        let allSections = [
+            SearchResultSection(kind: .riotAccount, items: riotItems),
+            SearchResultSection(kind: .group, items: groupItems),
+            SearchResultSection(kind: .recruitPost, items: postItems),
+        ]
+        .filter { !$0.items.isEmpty }
+
+        return SearchResponse(sections: allSections)
+    }
+
+    private func searchMatches(tokens: [String], fields: [String]) -> Bool {
+        guard !tokens.isEmpty else { return false }
+        let haystack = fields.joined(separator: " ").searchableText
+        return tokens.allSatisfy { haystack.contains($0) }
+    }
+}
+
+private extension String {
+    var searchableText: String {
+        folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
+    }
+
+    var searchTokens: [String] {
+        trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .whitespacesAndNewlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .map(\.searchableText)
+    }
+}
+
 // MARK: - Container
 
 final class AppContainer {
     let configuration: AppConfiguration
+    let modelContainer: ModelContainer
     let tokenStore: TokenStore
     let localStore: AppLocalStore
     let apiClient: APIClient
@@ -2011,16 +3042,20 @@ final class AppContainer {
     let groupRepository: GroupRepository
     let matchRepository: MatchRepository
     let recruitingRepository: RecruitingRepository
+    let searchRepository: any SearchRepository
+    let searchUseCase: SearchUseCase
 
     init(
         configuration: AppConfiguration = .load(),
+        modelContainer: ModelContainer = AppModelContainerFactory.makeContainer(),
         tokenStore: TokenStore = TokenStore(),
-        localStore: AppLocalStore = AppLocalStore(),
+        localStore: AppLocalStore? = nil,
         urlSession: URLSession = .shared
     ) {
         self.configuration = configuration
+        self.modelContainer = modelContainer
         self.tokenStore = tokenStore
-        self.localStore = localStore
+        self.localStore = localStore ?? AppLocalStore(defaults: .standard, modelContainer: modelContainer)
         self.apiClient = APIClient(configuration: configuration, tokenStore: tokenStore, session: urlSession)
         self.authRepository = AuthRepository(apiClient: apiClient, tokenStore: tokenStore)
         self.profileRepository = ProfileRepository(apiClient: apiClient)
@@ -2028,5 +3063,10 @@ final class AppContainer {
         self.groupRepository = GroupRepository(apiClient: apiClient)
         self.matchRepository = MatchRepository(apiClient: apiClient)
         self.recruitingRepository = RecruitingRepository(apiClient: apiClient)
+        self.searchRepository = LiveSearchRepository(
+            groupRepository: groupRepository,
+            recruitingRepository: recruitingRepository
+        )
+        self.searchUseCase = SearchUseCase(repository: searchRepository)
     }
 }
