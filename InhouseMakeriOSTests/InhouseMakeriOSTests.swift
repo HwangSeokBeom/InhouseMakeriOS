@@ -673,6 +673,74 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertNil(clearedTokens)
     }
 
+    func testProfileRepositorySearchInviteUsersFallsBackToAlternateEndpoint() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var requestedPaths: [String] = []
+
+        let repository = ProfileRepository(apiClient: APIClient(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            session: makeURLSession { request in
+                requestLock.lock()
+                requestedPaths.append(request.url?.path ?? "nil")
+                requestLock.unlock()
+
+                switch request.url?.path {
+                case "/users/search":
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RESOURCE_NOT_FOUND",
+                            message: "Not found."
+                        )
+                    )
+                case "/users":
+                    XCTAssertEqual(self.queryItemValues(from: request.url, named: "query"), ["Alpha"])
+                    XCTAssertEqual(self.queryItemValues(from: request.url, named: "limit"), ["20"])
+                    let json = """
+                    [{"userId":"user-42","nickname":"Alpha","primaryPosition":"MID","secondaryPosition":"TOP","recentPower":73.6,"riotGameName":"Alpha","tagLine":"KR1"}]
+                    """
+                    return (200, Data(json.utf8))
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        ))
+
+        let users = try await repository.searchInviteUsers(query: " Alpha ")
+
+        requestLock.lock()
+        let capturedPaths = requestedPaths
+        requestLock.unlock()
+
+        XCTAssertEqual(capturedPaths, ["/users/search", "/users"])
+        XCTAssertEqual(users.count, 1)
+        XCTAssertEqual(users.first?.id, "user-42")
+        XCTAssertEqual(users.first?.nickname, "Alpha")
+        XCTAssertEqual(users.first?.primaryPosition, .mid)
+        XCTAssertEqual(users.first?.secondaryPosition, .top)
+        XCTAssertEqual(users.first?.recentPower, 73.6)
+        XCTAssertEqual(users.first?.riotDisplayName, "Alpha#KR1")
+    }
+
+    func testErrorMapperMapsRecruitingClosedToFriendlyMessage() {
+        let mappedError = UserFacingError(
+            title: "서버 오류",
+            message: "Recruiting closed.",
+            code: "RECRUITING_CLOSED",
+            statusCode: 409,
+            endpoint: "/recruiting-posts/post-1/apply",
+            requestMethod: "POST"
+        ).serverContractMapped
+
+        XCTAssertEqual(mappedError.title, "모집이 마감되었어요")
+        XCTAssertEqual(mappedError.message, "모집이 종료되어 더 이상 진행할 수 없어요.")
+    }
+
     func testEmailSignUpRequestUsesExpectedEndpointAndPayload() async throws {
         let tokenStore = makeTokenStore()
         let repository = AuthRepository(
@@ -2898,6 +2966,307 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(capturedDeleteCount, 1)
         XCTAssertTrue(localStore.storedGroupIDs.isEmpty)
         XCTAssertEqual(viewModel.actionState, .success("내전 방이 삭제되었습니다"))
+    }
+
+    @MainActor
+    func testGroupDetailViewModelInviteMemberUsesActualUserIDAndUpdatesSnapshot() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var capturedPostBody: [String: Any]?
+        var membersGetCount = 0
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "테스트 그룹",
+                            description: "설명",
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "u1",
+                            memberCount: 1,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    requestLock.lock()
+                    membersGetCount += 1
+                    requestLock.unlock()
+                    let payload = try JSONEncoder.app.encode(
+                        GroupMemberListDTO(
+                            items: [
+                                GroupMemberDTO(id: "gm-owner", userId: "u1", nickname: "tester", role: .owner),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                case ("POST", "/groups/group-1/members"):
+                    requestLock.lock()
+                    capturedPostBody = self.requestBodyJSONObject(from: request)
+                    requestLock.unlock()
+                    let payload = try JSONEncoder.app.encode(
+                        GroupMemberListDTO(
+                            items: [
+                                GroupMemberDTO(id: "gm-owner", userId: "u1", nickname: "tester", role: .owner),
+                                GroupMemberDTO(id: "gm-2", userId: "user-42", nickname: "Alpha", role: .member),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case (_, let path?) where path.hasSuffix("/power-profile"):
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RESOURCE_NOT_FOUND",
+                            message: "Power profile not found."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let result = await viewModel.inviteMember(
+            GroupMemberInviteUser(
+                id: "user-42",
+                nickname: "Alpha",
+                primaryPosition: .mid,
+                secondaryPosition: .top,
+                recentPower: 73.6,
+                riotDisplayName: "Alpha#KR1",
+                profileImageURL: nil
+            )
+        )
+
+        requestLock.lock()
+        let postBody = capturedPostBody
+        let capturedMembersGetCount = membersGetCount
+        requestLock.unlock()
+
+        switch result {
+        case .success:
+            break
+        case let .failure(message):
+            XCTFail("Expected invite success, got failure: \(message)")
+        }
+
+        XCTAssertEqual(postBody?["userId"] as? String, "user-42")
+        XCTAssertEqual(postBody?["role"] as? String, GroupRole.member.rawValue)
+        XCTAssertEqual(viewModel.state.value?.group.memberCount, 2)
+        XCTAssertEqual(viewModel.state.value?.members.map(\.userID), ["u1", "user-42"])
+        XCTAssertEqual(viewModel.actionState, .success("팀원이 추가되었어요."))
+        XCTAssertEqual(capturedMembersGetCount, 1)
+    }
+
+    @MainActor
+    func testGroupDetailViewModelInviteMemberMapsBusinessErrorsToFriendlyMessages() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var postAttempt = 0
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "테스트 그룹",
+                            description: "설명",
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "u1",
+                            memberCount: 1,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupMemberListDTO(
+                            items: [
+                                GroupMemberDTO(id: "gm-owner", userId: "u1", nickname: "tester", role: .owner),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                case ("POST", "/groups/group-1/members"):
+                    requestLock.lock()
+                    postAttempt += 1
+                    let currentAttempt = postAttempt
+                    requestLock.unlock()
+
+                    switch currentAttempt {
+                    case 1:
+                        return (
+                            404,
+                            self.makeServerErrorData(
+                                statusCode: 404,
+                                code: "USER_NOT_FOUND",
+                                message: "User not found."
+                            )
+                        )
+                    case 2:
+                        return (
+                            409,
+                            self.makeServerErrorData(
+                                statusCode: 409,
+                                code: "GROUP_MEMBER_ALREADY_EXISTS",
+                                message: "This user is already a member of the group."
+                            )
+                        )
+                    case 3:
+                        return (
+                            403,
+                            self.makeServerErrorData(
+                                statusCode: 403,
+                                code: "GROUP_ACCESS_FORBIDDEN",
+                                message: "You must be a group admin to perform this action."
+                            )
+                        )
+                    default:
+                        XCTFail("Unexpected invite attempt \(currentAttempt)")
+                        return (500, Data())
+                    }
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        let notFoundResult = await viewModel.inviteMember(
+            GroupMemberInviteUser(
+                id: "missing-user",
+                nickname: "Missing",
+                primaryPosition: nil,
+                secondaryPosition: nil,
+                recentPower: nil,
+                riotDisplayName: nil,
+                profileImageURL: nil
+            )
+        )
+        let duplicateResult = await viewModel.inviteMember(
+            GroupMemberInviteUser(
+                id: "dup-user",
+                nickname: "Dup",
+                primaryPosition: nil,
+                secondaryPosition: nil,
+                recentPower: nil,
+                riotDisplayName: nil,
+                profileImageURL: nil
+            )
+        )
+        let forbiddenResult = await viewModel.inviteMember(
+            GroupMemberInviteUser(
+                id: "forbidden-user",
+                nickname: "Forbidden",
+                primaryPosition: nil,
+                secondaryPosition: nil,
+                recentPower: nil,
+                riotDisplayName: nil,
+                profileImageURL: nil
+            )
+        )
+
+        guard case let .failure(notFoundMessage) = notFoundResult else {
+            return XCTFail("Expected not-found failure")
+        }
+        guard case let .failure(duplicateMessage) = duplicateResult else {
+            return XCTFail("Expected duplicate failure")
+        }
+        guard case let .failure(forbiddenMessage) = forbiddenResult else {
+            return XCTFail("Expected forbidden failure")
+        }
+
+        XCTAssertEqual(notFoundMessage, "추가할 사용자를 찾을 수 없어요.")
+        XCTAssertEqual(duplicateMessage, "이미 그룹에 참여 중인 사용자예요.")
+        XCTAssertEqual(forbiddenMessage, "이 그룹의 멤버를 추가할 권한이 없어요.")
+    }
+
+    @MainActor
+    func testGroupDetailViewModelUsesInviteCapabilityFromGroupResponse() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "테스트 그룹",
+                            description: "설명",
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "u1",
+                            canInviteMembers: false,
+                            inviteMembersBlockedReason: "GROUP_ACCESS_FORBIDDEN",
+                            memberCount: 1,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupMemberListDTO(
+                            items: [
+                                GroupMemberDTO(id: "gm-owner", userId: "u1", nickname: "tester", role: .owner),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        XCTAssertFalse(viewModel.isInviteButtonEnabled)
+        XCTAssertEqual(viewModel.invitePermission.note, "이 그룹의 멤버를 추가할 권한이 없어요.")
     }
 
     @MainActor

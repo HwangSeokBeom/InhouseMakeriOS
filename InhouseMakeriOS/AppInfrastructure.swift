@@ -1589,6 +1589,8 @@ final class APIClient {
         path == "/auth/signup/email"
             || path == "/auth/login/email"
             || path == "/me"
+            || path == "/users"
+            || path == "/users/search"
             || path == "/groups"
             || path.hasPrefix("/groups/")
             || path == "/recruiting-posts"
@@ -1845,6 +1847,93 @@ struct UserProfileDTO: Codable {
     }
 }
 
+struct GroupMemberInviteUserDTO: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case userId
+        case nickname
+        case primaryPosition
+        case mainPosition
+        case secondaryPosition
+        case recentPower
+        case riotGameName
+        case tagLine
+        case riotDisplayName
+        case displayName
+        case profileImageUrl
+        case avatarUrl
+        case imageUrl
+    }
+
+    let id: String
+    let nickname: String
+    let primaryPosition: Position?
+    let secondaryPosition: Position?
+    let recentPower: Double?
+    let riotDisplayName: String?
+    let profileImageURL: URL?
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .userId)
+            ?? container.decode(String.self, forKey: .id)
+        nickname = try container.decode(String.self, forKey: .nickname)
+        primaryPosition = try container.decodeIfPresent(Position.self, forKey: .primaryPosition)
+            ?? container.decodeIfPresent(Position.self, forKey: .mainPosition)
+        secondaryPosition = try container.decodeIfPresent(Position.self, forKey: .secondaryPosition)
+        recentPower = try container.decodeIfPresent(Double.self, forKey: .recentPower)
+
+        let explicitRiotDisplay = try container.decodeIfPresent(String.self, forKey: .riotDisplayName)
+            ?? container.decodeIfPresent(String.self, forKey: .displayName)
+        let riotGameName = try container.decodeIfPresent(String.self, forKey: .riotGameName)
+        let tagLine = try container.decodeIfPresent(String.self, forKey: .tagLine)
+        if let explicitRiotDisplay, !explicitRiotDisplay.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            riotDisplayName = explicitRiotDisplay
+        } else if let riotGameName, !riotGameName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let normalizedTagLine = tagLine?.trimmingCharacters(in: .whitespacesAndNewlines)
+            riotDisplayName = normalizedTagLine.map { "\(riotGameName)#\($0)" } ?? riotGameName
+        } else {
+            riotDisplayName = nil
+        }
+
+        let profileImagePath = try container.decodeIfPresent(String.self, forKey: .profileImageUrl)
+            ?? container.decodeIfPresent(String.self, forKey: .avatarUrl)
+            ?? container.decodeIfPresent(String.self, forKey: .imageUrl)
+        profileImageURL = profileImagePath.flatMap(URL.init(string:))
+    }
+
+    func toDomain() -> GroupMemberInviteUser {
+        GroupMemberInviteUser(
+            id: id,
+            nickname: nickname,
+            primaryPosition: primaryPosition,
+            secondaryPosition: secondaryPosition,
+            recentPower: recentPower,
+            riotDisplayName: riotDisplayName,
+            profileImageURL: profileImageURL
+        )
+    }
+}
+
+struct GroupMemberInviteSearchResponseDTO: Decodable {
+    let items: [GroupMemberInviteUserDTO]
+
+    private enum CodingKeys: String, CodingKey {
+        case items
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self),
+           let items = try? container.decode([GroupMemberInviteUserDTO].self, forKey: .items) {
+            self.items = items
+            return
+        }
+
+        let singleValueContainer = try decoder.singleValueContainer()
+        items = try singleValueContainer.decode([GroupMemberInviteUserDTO].self)
+    }
+}
+
 struct UpdateProfileRequestDTO: Encodable {
     let primaryPosition: Position?
     let secondaryPosition: Position?
@@ -1986,6 +2075,8 @@ struct GroupSummaryDTO: Codable {
     let joinPolicy: JoinPolicy
     let tags: [String]
     let ownerUserId: String
+    let canInviteMembers: Bool?
+    let inviteMembersBlockedReason: String?
     let memberCount: Int
     let recentMatches: Int
 
@@ -1998,6 +2089,8 @@ struct GroupSummaryDTO: Codable {
         joinPolicy: JoinPolicy,
         tags: [String],
         ownerUserId: String,
+        canInviteMembers: Bool? = nil,
+        inviteMembersBlockedReason: String? = nil,
         memberCount: Int,
         recentMatches: Int
     ) {
@@ -2009,6 +2102,8 @@ struct GroupSummaryDTO: Codable {
         self.joinPolicy = joinPolicy
         self.tags = tags
         self.ownerUserId = ownerUserId
+        self.canInviteMembers = canInviteMembers
+        self.inviteMembersBlockedReason = inviteMembersBlockedReason
         self.memberCount = memberCount
         self.recentMatches = recentMatches
     }
@@ -2023,6 +2118,8 @@ struct GroupSummaryDTO: Codable {
             joinPolicy: joinPolicy,
             tags: tags,
             ownerUserID: ownerUserId,
+            canInviteMembers: canInviteMembers,
+            inviteMembersBlockedReason: inviteMembersBlockedReason,
             memberCount: memberCount,
             recentMatches: recentMatches
         )
@@ -2610,6 +2707,7 @@ final class AuthRepository {
 
 final class ProfileRepository {
     private let apiClient: APIClient
+    private let inviteSearchEndpointCandidates = ["/users/search", "/users"]
 
     init(apiClient: APIClient) {
         self.apiClient = apiClient
@@ -2652,6 +2750,70 @@ final class ProfileRepository {
             queryItems: items
         )
         return response.items.map { $0.toDomain() }
+    }
+
+    func searchInviteUsers(query: String, limit: Int = 20) async throws -> [GroupMemberInviteUser] {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return [] }
+
+        let queryItems = [
+            URLQueryItem(name: "query", value: trimmedQuery),
+            URLQueryItem(name: "limit", value: String(limit)),
+        ]
+
+        var lastCapabilityError: UserFacingError?
+
+        for path in inviteSearchEndpointCandidates {
+            do {
+                let response: GroupMemberInviteSearchResponseDTO = try await apiClient.sendWithoutBody(
+                    path: path,
+                    queryItems: queryItems
+                )
+                return sanitizeInviteUsers(response.items.map { $0.toDomain() })
+            } catch let error as UserFacingError {
+                if isInviteSearchEndpointUnavailable(error) {
+                    lastCapabilityError = error
+                    continue
+                }
+                throw error
+            }
+        }
+
+        throw lastCapabilityError
+            ?? UserFacingError(
+                title: "사용자 검색 실패",
+                message: "사용자 검색을 진행할 수 없어요.",
+                endpoint: inviteSearchEndpointCandidates.first,
+                requestMethod: HTTPMethod.get.rawValue
+            ).serverContractMapped
+    }
+
+    private func isInviteSearchEndpointUnavailable(_ error: UserFacingError) -> Bool {
+        switch error.statusCode {
+        case 404, 405, 501:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func sanitizeInviteUsers(_ items: [GroupMemberInviteUser]) -> [GroupMemberInviteUser] {
+        var seenUserIDs = Set<String>()
+        return items.compactMap { item in
+            let normalizedUserID = item.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            let normalizedNickname = item.nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedUserID.isEmpty, !normalizedNickname.isEmpty else { return nil }
+            guard seenUserIDs.insert(normalizedUserID).inserted else { return nil }
+            return GroupMemberInviteUser(
+                id: normalizedUserID,
+                nickname: normalizedNickname,
+                primaryPosition: item.primaryPosition,
+                secondaryPosition: item.secondaryPosition,
+                recentPower: item.recentPower,
+                riotDisplayName: item.riotDisplayName,
+                profileImageURL: item.profileImageURL
+            )
+        }
     }
 }
 

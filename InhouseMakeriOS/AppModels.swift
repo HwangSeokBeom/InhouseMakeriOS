@@ -199,6 +199,7 @@ enum ServerContractErrorCode: Equatable {
     case accountExistsWithGoogle
     case authProviderMismatch
     case accountNotFound
+    case userNotFound
     case unsupportedProvider
     case emailAlreadyExists
     case nicknameAlreadyExists
@@ -212,6 +213,9 @@ enum ServerContractErrorCode: Equatable {
     case passwordAuthDisabled
     case authRequired
     case forbiddenFeature
+    case groupAccessForbidden
+    case groupMemberAlreadyExists
+    case recruitingClosed
     case rateLimited
     case unknown(String?)
 
@@ -246,8 +250,10 @@ enum ServerContractErrorCode: Equatable {
             return .accountExistsWithGoogle
         case contains("AUTH_PROVIDER_MISMATCH"):
             return .authProviderMismatch
-        case contains("ACCOUNT_NOT_FOUND"), contains("USER_NOT_FOUND"), contains("EMAIL_NOT_FOUND"):
+        case contains("ACCOUNT_NOT_FOUND"), contains("EMAIL_NOT_FOUND"):
             return .accountNotFound
+        case contains("USER_NOT_FOUND"):
+            return .userNotFound
         case contains("UNSUPPORTED_PROVIDER"), contains("UNSUPPORTED_AUTH_PROVIDER"), contains("UNSUPPORTED_LOGIN_METHOD"):
             return .unsupportedProvider
         case contains("EMAIL_ALREADY_IN_USE"), contains("EMAIL_ALREADY_EXISTS"), contains("EMAIL_DUPLICATE"), contains("DUPLICATE_EMAIL"), contains("ACCOUNT_EXISTS_WITH_EMAIL"):
@@ -274,6 +280,12 @@ enum ServerContractErrorCode: Equatable {
             return .authRequired
         case contains("FORBIDDEN_FEATURE"):
             return .forbiddenFeature
+        case contains("GROUP_ACCESS_FORBIDDEN"):
+            return .groupAccessForbidden
+        case contains("GROUP_MEMBER_ALREADY_EXISTS"):
+            return .groupMemberAlreadyExists
+        case contains("RECRUITING_CLOSED"):
+            return .recruitingClosed
         case contains("RATE_LIMITED"):
             return .rateLimited
         default:
@@ -343,6 +355,22 @@ extension UserFacingError {
 
     var isForbiddenFeature: Bool {
         serverContractCode == .forbiddenFeature
+    }
+
+    var isGroupAccessForbidden: Bool {
+        normalizedCode == "GROUP_ACCESS_FORBIDDEN" || serverContractCode == .groupAccessForbidden
+    }
+
+    var isGroupMemberAlreadyExists: Bool {
+        serverContractCode == .groupMemberAlreadyExists
+    }
+
+    var isUserNotFound: Bool {
+        serverContractCode == .userNotFound
+    }
+
+    var isRecruitingClosed: Bool {
+        serverContractCode == .recruitingClosed
     }
 
     var isRateLimited: Bool {
@@ -473,6 +501,16 @@ enum ErrorMapper {
                 title: "권한이 없어요",
                 message: "이 기능에 대한 권한이 없습니다."
             )
+        case .groupAccessForbidden:
+            return error.withPresentation(
+                title: "권한이 없어요",
+                message: "이 작업을 진행할 권한이 없어요."
+            )
+        case .groupMemberAlreadyExists:
+            return error.withPresentation(
+                title: "이미 참여 중이에요",
+                message: "이미 그룹에 참여 중인 사용자예요."
+            )
         case .socialTokenInvalid:
             return error.withPresentation(
                 title: "소셜 로그인 실패",
@@ -497,6 +535,11 @@ enum ErrorMapper {
             return error.withPresentation(
                 title: "존재하지 않는 계정이에요",
                 message: "가입한 이메일인지 다시 확인해 주세요."
+            )
+        case .userNotFound:
+            return error.withPresentation(
+                title: "사용자를 찾을 수 없어요",
+                message: "추가할 사용자를 찾을 수 없어요."
             )
         case .unsupportedProvider:
             return error.withPresentation(
@@ -549,6 +592,11 @@ enum ErrorMapper {
             return error.withPresentation(
                 title: "이메일 로그인을 사용할 수 없어요",
                 message: "현재 이메일 로그인이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요."
+            )
+        case .recruitingClosed:
+            return error.withPresentation(
+                title: "모집이 마감되었어요",
+                message: "모집이 종료되어 더 이상 진행할 수 없어요."
             )
         case .rateLimited:
             var rateLimitedError = error.withPresentation(
@@ -1233,6 +1281,8 @@ struct GroupSummary: Codable, Hashable, Identifiable {
     let joinPolicy: JoinPolicy
     let tags: [String]
     let ownerUserID: String
+    let canInviteMembers: Bool?
+    let inviteMembersBlockedReason: String?
     let memberCount: Int
     let recentMatches: Int
 
@@ -1245,6 +1295,8 @@ struct GroupSummary: Codable, Hashable, Identifiable {
         joinPolicy: JoinPolicy,
         tags: [String],
         ownerUserID: String,
+        canInviteMembers: Bool? = nil,
+        inviteMembersBlockedReason: String? = nil,
         memberCount: Int,
         recentMatches: Int
     ) {
@@ -1256,6 +1308,8 @@ struct GroupSummary: Codable, Hashable, Identifiable {
         self.joinPolicy = joinPolicy
         self.tags = tags
         self.ownerUserID = ownerUserID
+        self.canInviteMembers = canInviteMembers
+        self.inviteMembersBlockedReason = inviteMembersBlockedReason
         self.memberCount = memberCount
         self.recentMatches = recentMatches
     }
@@ -1448,6 +1502,16 @@ struct RecentSearchKeyword: Codable, Hashable, Identifiable {
     let id: String
     let keyword: String
     let searchedAt: Date
+}
+
+struct GroupMemberInviteUser: Codable, Hashable, Identifiable {
+    let id: String
+    let nickname: String
+    let primaryPosition: Position?
+    let secondaryPosition: Position?
+    let recentPower: Double?
+    let riotDisplayName: String?
+    let profileImageURL: URL?
 }
 
 enum SearchResultKind: String, Hashable, Identifiable {

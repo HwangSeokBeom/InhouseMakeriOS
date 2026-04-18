@@ -2687,6 +2687,40 @@ private enum GroupDetailMutationErrorType: String {
     case other = "other"
 }
 
+struct GroupInvitePermissionState: Equatable {
+    let isEnabled: Bool
+    let note: String
+}
+
+enum GroupMemberInviteRowAvailability: Equatable {
+    case selectable
+    case alreadyMember
+    case selfUser
+    case disabledByPermission
+
+    var badgeTitle: String {
+        switch self {
+        case .selectable:
+            return "초대 가능"
+        case .alreadyMember:
+            return "이미 멤버"
+        case .selfUser:
+            return "나"
+        case .disabledByPermission:
+            return "초대 불가"
+        }
+    }
+
+    var isSelectable: Bool {
+        self == .selectable
+    }
+}
+
+enum GroupMemberInviteSubmissionResult: Equatable {
+    case success
+    case failure(String)
+}
+
 @MainActor
 final class GroupDetailViewModel: ObservableObject {
     @Published var state: ScreenLoadState<GroupDetailSnapshot> = .initial
@@ -2704,6 +2738,18 @@ final class GroupDetailViewModel: ObservableObject {
 
     var isDeleteVisible: Bool {
         isEditVisible
+    }
+
+    var invitePermission: GroupInvitePermissionState {
+        guard let snapshot = state.value else {
+            return GroupInvitePermissionState(isEnabled: false, note: "그룹 정보를 불러온 뒤 팀원을 추가할 수 있어요.")
+        }
+        return resolveInvitePermission(for: snapshot)
+    }
+
+    var isInviteButtonEnabled: Bool {
+        guard !isMutationInFlight else { return false }
+        return invitePermission.isEnabled
     }
 
     var isMutationInFlight: Bool {
@@ -2909,17 +2955,60 @@ final class GroupDetailViewModel: ObservableObject {
         }
     }
 
-    func inviteMember(userID: String) async {
-        guard ensureActiveGroupContextForMutation() else { return }
-        actionState = .inProgress("멤버를 초대하는 중입니다")
+    func makeInviteViewModel() -> GroupMemberInviteViewModel? {
+        guard let snapshot = state.value else { return nil }
+        return GroupMemberInviteViewModel(
+            session: session,
+            currentUserID: session.currentUserID,
+            existingMemberUserIDs: Set(snapshot.members.map(\.userID)),
+            permission: invitePermission
+        )
+    }
+
+    func inviteMember(_ user: GroupMemberInviteUser) async -> GroupMemberInviteSubmissionResult {
+        guard ensureActiveGroupContextForMutation() else {
+            let message = "삭제되었거나 존재하지 않는 그룹입니다."
+            return .failure(message)
+        }
+        guard invitePermission.isEnabled else {
+            return .failure(invitePermission.note)
+        }
+        guard !isMutationInFlight else {
+            return .failure("팀원 추가를 처리하고 있어요. 잠시만 기다려 주세요.")
+        }
+
+        actionState = .inProgress("팀원을 추가하는 중입니다")
+
         do {
-            _ = try await session.container.groupRepository.addMember(groupID: groupID, userID: userID)
-            actionState = .success("멤버가 추가되었습니다")
-            await load(force: true, trigger: .memberInvited)
+            let members = try await session.container.groupRepository.addMember(
+                groupID: groupID,
+                userID: user.id
+            )
+
+            await applyUpdatedMembers(members)
+
+            session.container.localStore.appendNotification(
+                title: "팀원 추가",
+                body: "\(user.nickname)님이 그룹에 합류했습니다.",
+                symbol: "person.badge.plus"
+            )
+
+            actionState = .success("팀원이 추가되었어요.")
+            return .success
         } catch let error as UserFacingError {
-            session.handleProtectedActionError(error, requirement: .groupManagement, actionState: &actionState)
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .groupManagement)
+                return .failure("로그인 후 팀원을 추가할 수 있어요.")
+            }
+
+            let message = inviteMessage(for: error)
+            actionState = .failure(message)
+            return .failure(message)
         } catch {
-            actionState = .failure("멤버 추가에 실패했습니다")
+            let message = "팀원 추가에 실패했어요. 잠시 후 다시 시도해 주세요."
+            actionState = .failure(message)
+            return .failure(message)
         }
     }
 
@@ -2944,8 +3033,10 @@ final class GroupDetailViewModel: ObservableObject {
 
     private func logManagementVisibility(for snapshot: GroupDetailSnapshot) {
         let canEdit = canManage(snapshot)
+        let invitePermission = resolveInvitePermission(for: snapshot)
         debugGroupDetail("edit visible canEdit=\(canEdit)")
         debugGroupDetail("delete visible canDelete=\(canEdit)")
+        debugGroupDetail("invite enabled canInvite=\(invitePermission.isEnabled)")
     }
 
     private func mutationErrorType(for error: UserFacingError) -> GroupDetailMutationErrorType {
@@ -2975,7 +3066,7 @@ final class GroupDetailViewModel: ObservableObject {
         case ("update", .forbidden):
             return "방장 또는 운영진만 내전 방을 수정할 수 있습니다."
         case ("update", .notFound):
-            return "수정할 내전 방을 찾을 수 없거나 서버에서 수정 기능을 아직 지원하지 않습니다."
+            return "수정할 내전 방을 찾을 수 없어요."
         case ("update", .conflict):
             return "현재 방 상태에서는 수정할 수 없습니다. 잠시 후 다시 시도해 주세요."
         case ("update", .server), ("update", .other):
@@ -2983,7 +3074,7 @@ final class GroupDetailViewModel: ObservableObject {
         case ("delete", .forbidden):
             return "방장 또는 운영진만 내전 방을 삭제할 수 있습니다."
         case ("delete", .notFound):
-            return "이미 삭제되었거나 서버에서 삭제 기능을 아직 지원하지 않습니다."
+            return "이미 삭제되었거나 찾을 수 없는 내전 방이에요."
         case ("delete", .conflict):
             return "진행 중인 상태 때문에 내전 방을 삭제할 수 없습니다."
         case ("delete", .server), ("delete", .other):
@@ -2993,6 +3084,113 @@ final class GroupDetailViewModel: ObservableObject {
         default:
             return "요청 처리에 실패했습니다. 잠시 후 다시 시도해 주세요."
         }
+    }
+
+    private func resolveInvitePermission(for snapshot: GroupDetailSnapshot) -> GroupInvitePermissionState {
+        if let canInviteMembers = snapshot.group.canInviteMembers {
+            if canInviteMembers {
+                return GroupInvitePermissionState(isEnabled: true, note: inviteEnabledNote(for: snapshot.group))
+            }
+            return GroupInvitePermissionState(
+                isEnabled: false,
+                note: inviteBlockedNote(from: snapshot.group.inviteMembersBlockedReason)
+            )
+        }
+
+        if canManage(snapshot) {
+            return GroupInvitePermissionState(isEnabled: true, note: inviteEnabledNote(for: snapshot.group))
+        }
+
+        return GroupInvitePermissionState(
+            isEnabled: false,
+            note: "팀원 추가는 방장 또는 운영진만 할 수 있어요."
+        )
+    }
+
+    private func inviteEnabledNote(for group: GroupSummary) -> String {
+        switch (group.visibility, group.joinPolicy) {
+        case (_, .inviteOnly):
+            return "초대 전용 그룹이라 닉네임으로 찾아 바로 팀원을 추가할 수 있어요."
+        case (.private, _):
+            return "비공개 그룹 멤버를 직접 골라 빠르게 팀을 완성해보세요."
+        default:
+            return "닉네임으로 검색해 필요한 팀원을 바로 추가할 수 있어요."
+        }
+    }
+
+    private func inviteBlockedNote(from reason: String?) -> String {
+        let normalizedReason = reason?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased() ?? ""
+
+        switch normalizedReason {
+        case "AUTH_REQUIRED":
+            return "로그인 후 팀원을 추가할 수 있어요."
+        case "GROUP_ACCESS_FORBIDDEN":
+            return "이 그룹의 멤버를 추가할 권한이 없어요."
+        default:
+            return "팀원 추가는 방장 또는 운영진만 할 수 있어요."
+        }
+    }
+
+    private func inviteMessage(for error: UserFacingError) -> String {
+        if error.isGroupNotFoundResource
+            || error.normalizedCode == "GROUP_NOT_FOUND"
+            || error.normalizedCode == "GROUP_UNAVAILABLE" {
+            return "더 이상 접근할 수 없는 그룹입니다."
+        }
+        if error.isUserNotFound || error.statusCode == 404 {
+            return "추가할 사용자를 찾을 수 없어요."
+        }
+        if error.isGroupMemberAlreadyExists || error.statusCode == 409 {
+            return "이미 그룹에 참여 중인 사용자예요."
+        }
+        if error.isGroupAccessForbidden || error.statusCode == 403 {
+            return "이 그룹의 멤버를 추가할 권한이 없어요."
+        }
+        if error.requiresAuthentication {
+            return "로그인 후 팀원을 추가할 수 있어요."
+        }
+        return "팀원 추가에 실패했어요. 잠시 후 다시 시도해 주세요."
+    }
+
+    private func applyUpdatedMembers(_ members: [GroupMember]) async {
+        guard let snapshot = state.value else {
+            await load(force: true, trigger: .memberInvited)
+            return
+        }
+
+        let updatedGroup = GroupSummary(
+            id: snapshot.group.id,
+            name: snapshot.group.name,
+            description: snapshot.group.description,
+            visibility: snapshot.group.visibility,
+            isMember: snapshot.group.isMember,
+            joinPolicy: snapshot.group.joinPolicy,
+            tags: snapshot.group.tags,
+            ownerUserID: snapshot.group.ownerUserID,
+            canInviteMembers: snapshot.group.canInviteMembers,
+            inviteMembersBlockedReason: snapshot.group.inviteMembersBlockedReason,
+            memberCount: members.count,
+            recentMatches: snapshot.group.recentMatches
+        )
+
+        var powerProfiles = snapshot.powerProfiles
+        let missingUserIDs = Set(members.map(\.userID)).subtracting(powerProfiles.keys)
+        let loadedProfiles = await loadPowerProfiles(for: Array(missingUserIDs))
+        powerProfiles.merge(loadedProfiles) { current, _ in current }
+
+        let updatedSnapshot = GroupDetailSnapshot(
+            group: updatedGroup,
+            members: members,
+            latestMatch: snapshot.latestMatch,
+            powerProfiles: powerProfiles
+        )
+        state = .content(updatedSnapshot)
+        session.container.localStore.trackGroup(id: updatedGroup.id, name: updatedGroup.name)
+        logManagementVisibility(for: updatedSnapshot)
     }
 
     private func canUseGroupContextForRequests(trigger: GroupDetailLoadTrigger) -> Bool {
@@ -3049,6 +3247,181 @@ final class GroupDetailViewModel: ObservableObject {
         #if DEBUG
         print("[GroupDetail] \(message)")
         #endif
+    }
+}
+
+@MainActor
+final class GroupMemberInviteViewModel: ObservableObject, Identifiable {
+    enum ViewState: Equatable {
+        case idle
+        case searching
+        case results([GroupMemberInviteUser])
+        case empty(String)
+        case error(UserFacingError)
+    }
+
+    let id = UUID()
+    @Published private(set) var state: ViewState = .idle
+    @Published private(set) var recentSearchKeywords: [RecentSearchKeyword] = []
+    @Published private(set) var selectedUserID: String?
+    @Published private(set) var isSubmitting = false
+    @Published private(set) var submissionErrorMessage: String?
+
+    private let session: AppSessionViewModel
+    private let currentUserID: String?
+    private let permission: GroupInvitePermissionState
+    private var existingMemberUserIDs: Set<String>
+    private var searchTask: Task<Void, Never>?
+
+    init(
+        session: AppSessionViewModel,
+        currentUserID: String?,
+        existingMemberUserIDs: Set<String>,
+        permission: GroupInvitePermissionState
+    ) {
+        self.session = session
+        self.currentUserID = currentUserID
+        self.existingMemberUserIDs = existingMemberUserIDs
+        self.permission = permission
+        refreshRecentSearchKeywords()
+    }
+
+    var permissionNote: String {
+        permission.note
+    }
+
+    var selectedUser: GroupMemberInviteUser? {
+        guard case let .results(items) = state else { return nil }
+        return items.first(where: { $0.id == selectedUserID })
+    }
+
+    var canSubmitSelection: Bool {
+        guard let selectedUser else { return false }
+        return availability(for: selectedUser).isSelectable && !isSubmitting
+    }
+
+    func refreshRecentSearchKeywords() {
+        recentSearchKeywords = session.container.localStore.recentSearchKeywords
+    }
+
+    func updateQuery(_ rawQuery: String) {
+        let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        searchTask?.cancel()
+
+        guard !trimmedQuery.isEmpty else {
+            state = .idle
+            selectedUserID = nil
+            submissionErrorMessage = nil
+            refreshRecentSearchKeywords()
+            return
+        }
+
+        state = .searching
+        searchTask = Task {
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            await performSearch(trimmedQuery)
+        }
+    }
+
+    func submitSearch(_ rawQuery: String) {
+        let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            state = .idle
+            return
+        }
+
+        recordRecentSearchKeyword(trimmedQuery)
+        searchTask?.cancel()
+        state = .searching
+        searchTask = Task {
+            await performSearch(trimmedQuery)
+        }
+    }
+
+    func deleteRecentSearchKeyword(id: String) {
+        session.container.localStore.deleteRecentSearchKeyword(id: id)
+        refreshRecentSearchKeywords()
+    }
+
+    func clearRecentSearchKeywords() {
+        session.container.localStore.clearRecentSearchKeywords()
+        refreshRecentSearchKeywords()
+    }
+
+    func recordRecentSearchKeyword(_ keyword: String) {
+        session.container.localStore.recordRecentSearchKeyword(keyword)
+        refreshRecentSearchKeywords()
+    }
+
+    func cancelPendingSearch() {
+        searchTask?.cancel()
+    }
+
+    func select(_ user: GroupMemberInviteUser) {
+        guard !isSubmitting else { return }
+        guard availability(for: user).isSelectable else { return }
+        selectedUserID = user.id
+        submissionErrorMessage = nil
+    }
+
+    func availability(for user: GroupMemberInviteUser) -> GroupMemberInviteRowAvailability {
+        if existingMemberUserIDs.contains(user.id) {
+            return .alreadyMember
+        }
+        if user.id == currentUserID {
+            return .selfUser
+        }
+        if !permission.isEnabled {
+            return .disabledByPermission
+        }
+        return .selectable
+    }
+
+    func beginSubmitting() {
+        isSubmitting = true
+        submissionErrorMessage = nil
+    }
+
+    func presentSubmissionError(_ message: String) {
+        isSubmitting = false
+        submissionErrorMessage = message
+    }
+
+    func completeInvite(userID: String) {
+        isSubmitting = false
+        submissionErrorMessage = nil
+        existingMemberUserIDs.insert(userID)
+        if selectedUserID == userID {
+            selectedUserID = nil
+        }
+        if case let .results(items) = state {
+            state = .results(items)
+        }
+    }
+
+    private func performSearch(_ query: String) async {
+        do {
+            let users = try await session.container.profileRepository.searchInviteUsers(query: query)
+            guard !Task.isCancelled else { return }
+
+            if users.isEmpty {
+                state = .empty("검색 결과가 없어요.")
+            } else {
+                state = .results(users)
+            }
+        } catch let error as UserFacingError {
+            guard !Task.isCancelled else { return }
+            state = .error(error)
+        } catch {
+            guard !Task.isCancelled else { return }
+            state = .error(
+                UserFacingError(
+                    title: "사용자 검색 실패",
+                    message: "사용자를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
+                )
+            )
+        }
     }
 }
 
@@ -3677,8 +4050,13 @@ final class RecruitDetailViewModel: ObservableObject {
                 return nil
             }
             if session.container.recruitingRepository.isCapabilityUnavailable(error) {
-                applyCapability = .unavailable("현재 서버에서 참가 신청 기능을 아직 지원하지 않습니다.")
+                applyCapability = .unavailable("지금은 참가 신청을 진행할 수 없어요.")
                 actionState = .idle
+                return nil
+            }
+            if error.isRecruitingClosed {
+                applyCapability = .unavailable("모집이 종료되어 더 이상 참가 신청을 받을 수 없습니다.")
+                actionState = .failure("모집이 종료되어 더 이상 참가 신청을 받을 수 없습니다.")
                 return nil
             }
             actionState = .failure(error.message)
@@ -3714,8 +4092,12 @@ final class RecruitDetailViewModel: ObservableObject {
             actionState = .success("내전이 생성되었습니다")
             return match
         } catch let error as UserFacingError {
-            if error.statusCode == 404 {
-                actionState = .failure("연결된 그룹을 찾을 수 없거나 서버에서 내전 생성 기능을 아직 지원하지 않습니다.")
+            if error.statusCode == 404 || error.isGroupNotFoundResource {
+                actionState = .failure("연결된 그룹을 찾을 수 없어요.")
+                return nil
+            }
+            if error.isRecruitingClosed {
+                actionState = .failure("모집이 종료되어 내전을 생성할 수 없습니다.")
                 return nil
             }
             session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
@@ -3878,7 +4260,7 @@ final class RecruitDetailViewModel: ObservableObject {
         case ("update", .forbidden):
             return "작성자 본인만 모집글을 수정할 수 있습니다."
         case ("update", .notFound):
-            return "수정할 모집글을 찾을 수 없거나 서버에서 수정 기능을 아직 지원하지 않습니다."
+            return "수정할 모집글을 찾을 수 없습니다."
         case ("update", .conflict):
             return "현재 모집 상태에서는 수정할 수 없습니다."
         case ("update", .server), ("update", .other):
@@ -3886,7 +4268,7 @@ final class RecruitDetailViewModel: ObservableObject {
         case ("delete", .forbidden):
             return "작성자 본인만 모집글을 삭제할 수 있습니다."
         case ("delete", .notFound):
-            return "이미 삭제되었거나 서버에서 삭제 기능을 아직 지원하지 않습니다."
+            return "이미 삭제되었거나 찾을 수 없는 모집글입니다."
         case ("delete", .conflict):
             return "현재 모집 상태에서는 삭제할 수 없습니다."
         case ("delete", .server), ("delete", .other):
@@ -6135,8 +6517,8 @@ struct GroupDetailScreen: View {
     @ObservedObject var router: AppRouter
     let onGroupUpdated: (GroupSummary) -> Void
     let onGroupDeleted: (String) -> Void
-    @State private var inviteUserID = ""
-    @State private var showsInviteSheet = false
+    @State private var inviteSheetViewModel: GroupMemberInviteViewModel?
+    @State private var isInviteSheetPresented = false
     @State private var showsPowerGuideSheet = false
     @State private var showsManagementDialog = false
     @State private var showsDeleteConfirmation = false
@@ -6199,20 +6581,32 @@ struct GroupDetailScreen: View {
                         .background(AppPalette.bgCard)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
 
-                        HStack(spacing: 8) {
-                            Button("내전 생성") {
-                                Task {
-                                    if let match = await viewModel.createMatch() {
-                                        router.push(.matchLobby(groupID: viewModel.groupID, matchID: match.id))
+                        VStack(alignment: .leading, spacing: 10) {
+                            HStack(spacing: 8) {
+                                Button("내전 생성") {
+                                    Task {
+                                        if let match = await viewModel.createMatch() {
+                                            router.push(.matchLobby(groupID: viewModel.groupID, matchID: match.id))
+                                        }
                                     }
                                 }
-                            }
-                            .buttonStyle(PrimaryButtonStyle())
+                                .buttonStyle(PrimaryButtonStyle())
 
-                            Button("멤버 초대") {
-                                showsInviteSheet = true
+                                Button("멤버 초대") {
+                                    presentInviteSheet()
+                                }
+                                .buttonStyle(SecondaryButtonStyle())
+                                .disabled(!viewModel.isInviteButtonEnabled)
                             }
-                            .buttonStyle(SecondaryButtonStyle())
+
+                            Text(viewModel.invitePermission.note)
+                                .font(AppTypography.body(12))
+                                .foregroundStyle(
+                                    viewModel.isInviteButtonEnabled
+                                        ? AppPalette.textSecondary
+                                        : AppPalette.accentGold
+                                )
+                                .fixedSize(horizontal: false, vertical: true)
                         }
 
                         VStack(alignment: .leading, spacing: 10) {
@@ -6239,6 +6633,21 @@ struct GroupDetailScreen: View {
 
                             GroupPowerGuideCard(guide: guide)
 
+                            if snapshot.members.count <= 1 {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text("팀원을 추가해 내전을 준비해보세요.")
+                                        .font(AppTypography.body(13, weight: .semibold))
+                                        .foregroundStyle(AppPalette.textPrimary)
+                                    Text("닉네임으로 검색하고 바로 추가하면 멤버 구성이 바로 반영돼요.")
+                                        .font(AppTypography.body(12))
+                                        .foregroundStyle(AppPalette.textSecondary)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(16)
+                                .appPanel(background: AppPalette.bgCard, radius: 12)
+                            }
+
                             VStack(spacing: 8) {
                                 ForEach(memberRows) { row in
                                     GroupPowerMemberRow(row: row)
@@ -6263,9 +6672,10 @@ struct GroupDetailScreen: View {
                                 }
                                 .buttonStyle(.plain)
                             } else {
-                                Text("그룹 단위 최근 경기 목록 API가 없어 현재는 내 기록 기준 최근 경기만 표시합니다.")
+                                Text("아직 기록된 내전이 없어요. 팀원을 모아 첫 내전을 시작해보세요.")
                                     .font(AppTypography.body(12))
                                     .foregroundStyle(AppPalette.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
                             }
                         }
                     }
@@ -6273,28 +6683,38 @@ struct GroupDetailScreen: View {
                 }
             }
         }
-        .sheet(isPresented: $showsInviteSheet) {
-            NavigationStack {
-                Form {
-                    TextField("추가할 사용자 ID", text: $inviteUserID)
-                    Text("실제 서버는 userId 기반 멤버 추가만 지원합니다.")
-                        .font(AppTypography.body(12))
-                        .foregroundStyle(AppPalette.textSecondary)
-                }
-                .toolbar {
-                    ToolbarItem(placement: .topBarLeading) {
-                        Button("닫기") { showsInviteSheet = false }
-                    }
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("추가") {
-                            Task {
-                                await viewModel.inviteMember(userID: inviteUserID)
-                                showsInviteSheet = false
+        .sheet(
+            isPresented: $isInviteSheetPresented,
+            onDismiss: {
+                inviteSheetViewModel = nil
+            }
+        ) {
+            if let inviteSheetViewModel {
+                GroupMemberInviteSheet(
+                    viewModel: inviteSheetViewModel,
+                    onClose: {
+                        isInviteSheetPresented = false
+                    },
+                    onInvite: { selectedUser in
+                        inviteSheetViewModel.beginSubmitting()
+
+                        let result = await viewModel.inviteMember(selectedUser)
+
+                        switch result {
+                        case .success:
+                            inviteSheetViewModel.completeInvite(userID: selectedUser.id)
+
+                            if let updatedGroup = viewModel.state.value?.group {
+                                onGroupUpdated(updatedGroup)
                             }
+
+                            isInviteSheetPresented = false
+
+                        case let .failure(message):
+                            inviteSheetViewModel.presentSubmissionError(message)
                         }
-                        .disabled(inviteUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
-                }
+                )
             }
         }
         .sheet(isPresented: $showsEditorSheet, onDismiss: clearGroupEditorError) {
@@ -6349,6 +6769,12 @@ struct GroupDetailScreen: View {
             Text("삭제한 내전 방은 복구할 수 없습니다.")
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsPowerGuideSheet)
+    }
+
+    private func presentInviteSheet() {
+        let createdViewModel = viewModel.makeInviteViewModel()
+        inviteSheetViewModel = createdViewModel
+        isInviteSheetPresented = createdViewModel != nil
     }
 
     private func statBlock(_ value: String, label: String) -> some View {
@@ -6416,6 +6842,497 @@ struct GroupDetailScreen: View {
     private func dismissInvalidGroupContext() {
         onGroupDeleted(viewModel.groupID)
         router.removeRoutes(referencingGroupID: viewModel.groupID)
+    }
+}
+
+private struct GroupMemberInviteSheet: View {
+    @ObservedObject var viewModel: GroupMemberInviteViewModel
+    let onClose: () -> Void
+    let onInvite: (GroupMemberInviteUser) async -> Void
+
+    @State private var searchText = ""
+    @FocusState private var isSearchFieldFocused: Bool
+
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            VStack(spacing: 16) {
+                headerSection
+                searchField
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 18)
+            .padding(.bottom, 12)
+
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 16) {
+                    if trimmedSearchText.isEmpty {
+                        inviteIntroCard
+                        recentSearchSection
+                    } else {
+                        resultContent
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 24)
+            }
+            .scrollDismissesKeyboard(.interactively)
+        }
+        .background(AppPalette.bgPrimary.ignoresSafeArea())
+        .safeAreaInset(edge: .bottom) {
+            bottomActionBar
+        }
+        .onAppear {
+            viewModel.refreshRecentSearchKeywords()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                isSearchFieldFocused = true
+            }
+        }
+        .onDisappear {
+            viewModel.cancelPendingSearch()
+        }
+        .onChange(of: searchText) { _, newValue in
+            viewModel.updateQuery(newValue)
+        }
+    }
+
+    private var headerSection: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("팀원 추가")
+                    .font(AppTypography.heading(20, weight: .bold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text("닉네임으로 검색해 팀원을 추가해보세요. 추가할 사용자를 선택하면 바로 초대할 수 있어요.")
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer()
+
+            Button("닫기", action: onClose)
+                .font(AppTypography.body(13, weight: .semibold))
+                .foregroundStyle(AppPalette.textSecondary)
+        }
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(AppPalette.textSecondary)
+
+            TextField("닉네임으로 팀원 검색", text: $searchText)
+                .font(AppTypography.body(15))
+                .foregroundStyle(AppPalette.textPrimary)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .submitLabel(.search)
+                .focused($isSearchFieldFocused)
+                .onSubmit {
+                    viewModel.submitSearch(searchText)
+                }
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(AppPalette.textMuted)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 52)
+        .background(AppPalette.bgCard)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(AppPalette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var inviteIntroCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("바로 추가하기")
+                .font(AppTypography.heading(16, weight: .bold))
+                .foregroundStyle(AppPalette.textPrimary)
+
+            Text(viewModel.permissionNote)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("닉네임으로 팀원을 검색해보세요.")
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(AppPalette.accentBlue)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 14)
+    }
+
+    @ViewBuilder
+    private var recentSearchSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("최근 검색")
+                    .font(AppTypography.heading(15, weight: .bold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Spacer()
+                if !viewModel.recentSearchKeywords.isEmpty {
+                    Button("전체 삭제") {
+                        viewModel.clearRecentSearchKeywords()
+                    }
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(AppPalette.accentRed)
+                }
+            }
+
+            if viewModel.recentSearchKeywords.isEmpty {
+                inviteInfoCard(
+                    title: "닉네임으로 팀원을 검색해보세요.",
+                    message: "최근 검색이 없으면 여기에서 바로 새 검색을 시작할 수 있어요."
+                )
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(viewModel.recentSearchKeywords) { keyword in
+                        HStack(spacing: 12) {
+                            Button {
+                                searchText = keyword.keyword
+                                isSearchFieldFocused = true
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "clock.arrow.circlepath")
+                                        .foregroundStyle(AppPalette.textMuted)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(keyword.keyword)
+                                            .font(AppTypography.body(13, weight: .semibold))
+                                            .foregroundStyle(AppPalette.textPrimary)
+                                        Text(keyword.searchedAt.shortDateText)
+                                            .font(AppTypography.body(10))
+                                            .foregroundStyle(AppPalette.textMuted)
+                                    }
+                                    Spacer()
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                viewModel.deleteRecentSearchKeyword(id: keyword.id)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(AppPalette.textMuted)
+                                    .frame(width: 24, height: 24)
+                                    .background(AppPalette.bgSecondary)
+                                    .clipShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .appPanel(background: AppPalette.bgCard, radius: 12)
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var resultContent: some View {
+        switch viewModel.state {
+        case .idle:
+            inviteInfoCard(
+                title: "닉네임으로 팀원을 검색해보세요.",
+                message: "검색어 입력을 잠시 멈추면 결과를 불러와요."
+            )
+        case .searching:
+            HStack(spacing: 10) {
+                ProgressView()
+                    .tint(AppPalette.accentBlue)
+                Text("검색 중입니다")
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+                Spacer()
+            }
+            .padding(16)
+            .appPanel(background: AppPalette.bgCard, radius: 12)
+        case let .results(users):
+            VStack(alignment: .leading, spacing: 10) {
+                Text("검색 결과")
+                    .font(AppTypography.heading(15, weight: .bold))
+                    .foregroundStyle(AppPalette.textPrimary)
+
+                ForEach(users) { user in
+                    inviteUserRow(user)
+                }
+            }
+        case .empty:
+            inviteInfoCard(
+                title: "검색 결과가 없어요.",
+                message: "다른 닉네임으로 다시 검색해보세요."
+            )
+        case let .error(error):
+            inviteInfoCard(
+                title: error.title,
+                message: error.message
+            )
+        }
+    }
+
+    private func inviteUserRow(_ user: GroupMemberInviteUser) -> some View {
+        let availability = viewModel.availability(for: user)
+        let isSelected = viewModel.selectedUserID == user.id
+        let isDisabled = !availability.isSelectable || viewModel.isSubmitting
+
+        return Button {
+            viewModel.select(user)
+        } label: {
+            HStack(spacing: 12) {
+                inviteAvatar(for: user)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(user.nickname)
+                            .font(AppTypography.body(14, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                            .lineLimit(1)
+
+                        inviteStatusBadge(availability)
+                    }
+
+                    if let riotDisplayName = user.riotDisplayName,
+                       !riotDisplayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(riotDisplayName)
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .lineLimit(1)
+                    }
+
+                    let metadata = inviteMetadata(for: user)
+                    if !metadata.isEmpty {
+                        Text(metadata.joined(separator: " · "))
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.textMuted)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer()
+
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(isSelected ? AppPalette.accentBlue : AppPalette.textMuted)
+            }
+            .padding(14)
+            .appPanel(
+                background: inviteRowBackground(availability: availability, isSelected: isSelected),
+                radius: 14,
+                stroke: inviteRowStroke(availability: availability, isSelected: isSelected)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(isDisabled)
+    }
+
+    private func inviteAvatar(for user: GroupMemberInviteUser) -> some View {
+        ZStack {
+            if let profileImageURL = user.profileImageURL {
+                AsyncImage(url: profileImageURL) { phase in
+                    switch phase {
+                    case let .success(image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    default:
+                        inviteAvatarFallback(for: user)
+                    }
+                }
+                .frame(width: 44, height: 44)
+                .clipShape(Circle())
+            } else {
+                inviteAvatarFallback(for: user)
+            }
+        }
+    }
+
+    private func inviteAvatarFallback(for user: GroupMemberInviteUser) -> some View {
+        ZStack {
+            Circle()
+                .fill(AppPalette.bgSecondary)
+                .frame(width: 44, height: 44)
+
+            Text(String(user.nickname.prefix(1)).uppercased())
+                .font(AppTypography.body(16, weight: .bold))
+                .foregroundStyle(AppPalette.accentBlue)
+        }
+    }
+
+    private func inviteMetadata(for user: GroupMemberInviteUser) -> [String] {
+        var items: [String] = []
+        if let primaryPosition = user.primaryPosition?.shortLabel {
+            if let secondaryPosition = user.secondaryPosition?.shortLabel {
+                items.append("\(primaryPosition) / \(secondaryPosition)")
+            } else {
+                items.append(primaryPosition)
+            }
+        }
+        if let recentPower = user.recentPower {
+            items.append("최근 파워 \(Int(recentPower.rounded()))")
+        }
+        return items
+    }
+
+    private func inviteStatusBadge(_ availability: GroupMemberInviteRowAvailability) -> some View {
+        Text(availability.badgeTitle)
+            .font(AppTypography.body(10, weight: .semibold))
+            .foregroundStyle(inviteBadgeForeground(availability))
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(inviteBadgeBackground(availability))
+            .clipShape(Capsule())
+    }
+
+    private func inviteBadgeForeground(_ availability: GroupMemberInviteRowAvailability) -> Color {
+        switch availability {
+        case .selectable:
+            return AppPalette.accentBlue
+        case .alreadyMember:
+            return AppPalette.accentGreen
+        case .selfUser:
+            return AppPalette.accentPurple
+        case .disabledByPermission:
+            return AppPalette.accentGold
+        }
+    }
+
+    private func inviteBadgeBackground(_ availability: GroupMemberInviteRowAvailability) -> Color {
+        switch availability {
+        case .selectable:
+            return AppPalette.accentBlue.opacity(0.12)
+        case .alreadyMember:
+            return AppPalette.accentGreen.opacity(0.14)
+        case .selfUser:
+            return AppPalette.accentPurple.opacity(0.14)
+        case .disabledByPermission:
+            return AppPalette.accentGold.opacity(0.14)
+        }
+    }
+
+    private func inviteRowBackground(
+        availability: GroupMemberInviteRowAvailability,
+        isSelected: Bool
+    ) -> Color {
+        if isSelected {
+            return AppPalette.accentBlue.opacity(0.08)
+        }
+        switch availability {
+        case .alreadyMember:
+            return AppPalette.accentGreen.opacity(0.08)
+        case .selfUser:
+            return AppPalette.accentPurple.opacity(0.08)
+        default:
+            return AppPalette.bgCard
+        }
+    }
+
+    private func inviteRowStroke(
+        availability: GroupMemberInviteRowAvailability,
+        isSelected: Bool
+    ) -> Color {
+        if isSelected {
+            return AppPalette.accentBlue
+        }
+        switch availability {
+        case .alreadyMember:
+            return AppPalette.accentGreen.opacity(0.45)
+        case .selfUser:
+            return AppPalette.accentPurple.opacity(0.45)
+        case .disabledByPermission:
+            return AppPalette.accentGold.opacity(0.45)
+        case .selectable:
+            return AppPalette.border
+        }
+    }
+
+    private var bottomActionBar: some View {
+        VStack(spacing: 10) {
+            if let errorMessage = viewModel.submissionErrorMessage {
+                inviteInfoCard(
+                    title: errorMessage,
+                    message: "선택한 사용자를 다시 확인한 뒤 한 번 더 시도해 주세요."
+                )
+            }
+
+            if let selectedUser = viewModel.selectedUser {
+                HStack {
+                    Text("선택된 팀원")
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                    Spacer()
+                    Text(selectedUser.nickname)
+                        .font(AppTypography.body(13, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                }
+                .padding(.horizontal, 4)
+            }
+
+            Button {
+                submitInvite()
+            } label: {
+                if viewModel.isSubmitting {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Text("팀원 추가")
+                }
+            }
+            .buttonStyle(
+                PrimaryButtonStyle(
+                    fill: viewModel.canSubmitSelection
+                        ? AppPalette.accentBlue
+                        : AppPalette.bgTertiary
+                )
+            )
+            .disabled(!viewModel.canSubmitSelection)
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+        .background(AppPalette.bgPrimary.opacity(0.98))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(AppPalette.border.opacity(0.8))
+                .frame(height: 1)
+        }
+    }
+
+    private func inviteInfoCard(title: String, message: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(AppTypography.body(14, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+            Text(message)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+
+    private func submitInvite() {
+        guard let selectedUser = viewModel.selectedUser, viewModel.canSubmitSelection else { return }
+        isSearchFieldFocused = false
+        Task {
+            await onInvite(selectedUser)
+        }
     }
 }
 
