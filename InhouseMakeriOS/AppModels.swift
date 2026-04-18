@@ -26,14 +26,13 @@ enum AppRoute: Hashable {
     case homeUpcomingMatches
     case homeGroups
     case powerDetail
+    case memberProfile(userID: String, nickname: String)
     case homeRecentMatches
     case groupDetail(String)
     case matchLobby(groupID: String, matchID: String)
     case teamBalance(groupID: String, matchID: String)
-    case teamBalancePreview
     case manualAdjust(matchID: String, draft: ManualAdjustDraft)
     case matchResult(matchID: String)
-    case resultPreview
     case matchDetail(matchID: String)
     case recruitDetail(postID: String)
 }
@@ -293,6 +292,8 @@ struct UserFacingError: Error, Equatable {
     var provider: String?
     var statusCode: Int?
     var details: [String: JSONValue]?
+    var endpoint: String?
+    var requestMethod: String?
 
     init(
         title: String,
@@ -300,7 +301,9 @@ struct UserFacingError: Error, Equatable {
         code: String? = nil,
         provider: String? = nil,
         statusCode: Int? = nil,
-        details: [String: JSONValue]? = nil
+        details: [String: JSONValue]? = nil,
+        endpoint: String? = nil,
+        requestMethod: String? = nil
     ) {
         self.title = title
         self.message = message
@@ -308,6 +311,8 @@ struct UserFacingError: Error, Equatable {
         self.provider = provider
         self.statusCode = statusCode
         self.details = details
+        self.endpoint = endpoint
+        self.requestMethod = requestMethod
     }
 }
 
@@ -324,6 +329,14 @@ extension UserFacingError {
             .uppercased() ?? ""
     }
 
+    var normalizedMessage: String {
+        message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased()
+    }
+
     var requiresAuthentication: Bool {
         serverContractCode == .authRequired
     }
@@ -337,199 +350,7 @@ extension UserFacingError {
     }
 
     var serverContractMapped: UserFacingError {
-        switch serverContractCode {
-        case .riotAccountAlreadyAddedByThisUser:
-            return UserFacingError(
-                title: "이미 추가한 Riot ID예요",
-                message: "같은 Riot ID를 내 목록에 두 번 추가할 수는 없어요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .riotAccountAddUnavailable:
-            return UserFacingError(
-                title: "Riot ID를 추가하지 못했어요",
-                message: "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .authRequired:
-            return UserFacingError(
-                title: "로그인이 필요해요",
-                message: "이 기능은 로그인 후 사용할 수 있어요. 이메일, Apple 또는 Google로 로그인해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .forbiddenFeature:
-            return UserFacingError(
-                title: "권한이 없어요",
-                message: "이 기능에 대한 권한이 없습니다.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .socialTokenInvalid:
-            return UserFacingError(
-                title: "소셜 로그인 실패",
-                message: "소셜 로그인 정보를 확인하지 못했어요. 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .accountExistsWithApple:
-            return UserFacingError(
-                title: "로그인 방법 안내",
-                message: "이 계정은 Apple 로그인으로 이용할 수 있어요. Apple로 계속해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .accountExistsWithGoogle:
-            return UserFacingError(
-                title: "로그인 방법 안내",
-                message: "이 계정은 Google 로그인으로 이용할 수 있어요. Google로 계속해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .authProviderMismatch:
-            return UserFacingError(
-                title: "로그인 방법 안내",
-                message: "이 계정은 다른 로그인 방식으로 연결되어 있어요. 올바른 로그인 방식으로 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .accountNotFound:
-            return UserFacingError(
-                title: "존재하지 않는 계정이에요",
-                message: "가입한 이메일인지 다시 확인해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .unsupportedProvider:
-            return UserFacingError(
-                title: "지원하지 않는 로그인 방식이에요",
-                message: "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .emailAlreadyExists:
-            return UserFacingError(
-                title: "이미 가입된 이메일이에요",
-                message: "다른 이메일을 사용하거나 로그인으로 계속해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .nicknameAlreadyExists:
-            return UserFacingError(
-                title: "이미 사용 중인 닉네임이에요",
-                message: "다른 닉네임으로 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .invalidEmailFormat:
-            return UserFacingError(
-                title: "이메일 형식을 확인해 주세요",
-                message: "올바른 이메일 형식으로 다시 입력해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .weakPassword:
-            return UserFacingError(
-                title: "비밀번호를 다시 확인해 주세요",
-                message: "비밀번호 조건을 만족하도록 다시 입력해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .requiredTermsNotAgreed:
-            return UserFacingError(
-                title: "필수 약관 동의가 필요해요",
-                message: "서비스 이용약관과 개인정보 처리방침에 동의해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .invalidPayload:
-            return UserFacingError(
-                title: "입력값을 다시 확인해 주세요",
-                message: "입력한 회원가입 정보를 다시 확인한 뒤 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .internalServerError:
-            return UserFacingError(
-                title: "서버에 잠시 문제가 있어요",
-                message: "잠시 후 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .invalidCredentials:
-            return UserFacingError(
-                title: "로그인 정보를 다시 확인해 주세요",
-                message: "로그인에 실패했어요. 선택한 계정으로 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .emailAuthDisabled:
-            return UserFacingError(
-                title: "이메일 회원가입을 사용할 수 없어요",
-                message: "현재 이메일 회원가입이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .passwordAuthDisabled:
-            return UserFacingError(
-                title: "이메일 로그인을 사용할 수 없어요",
-                message: "현재 이메일 로그인이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요.",
-                code: self.code,
-                provider: provider,
-                statusCode: statusCode,
-                details: details
-            )
-        case .rateLimited:
-            return UserFacingError(
-                title: "요청이 잠시 몰리고 있어요",
-                message: "요청이 많아 잠시 후 다시 시도해 주세요.",
-                code: self.code ?? "RATE_LIMITED",
-                provider: provider,
-                statusCode: statusCode ?? 429,
-                details: details
-            )
-        case .unknown:
-            return self
-        }
+        ErrorMapper.map(self)
     }
 
     static func authRequiredFallback(message: String = "세션이 만료되어 다시 로그인이 필요해요. 이메일, Apple 또는 Google로 다시 로그인해 주세요.") -> UserFacingError {
@@ -539,6 +360,287 @@ extension UserFacingError {
             code: "AUTH_REQUIRED",
             statusCode: 401
         ).serverContractMapped
+    }
+}
+
+private enum ErrorMappingContext {
+    case authSignup
+    case authLogin
+    case recruitingList
+    case genericForm
+    case generic
+}
+
+extension UserFacingError {
+    fileprivate var normalizedEndpoint: String {
+        let trimmed = endpoint?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return "" }
+        return trimmed.components(separatedBy: "?").first ?? trimmed
+    }
+
+    fileprivate var normalizedRequestMethod: String {
+        requestMethod?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased() ?? ""
+    }
+
+    var isGroupNotFoundResource: Bool {
+        guard statusCode == 404 else { return false }
+        guard normalizedCode == "RESOURCE_NOT_FOUND" else { return false }
+
+        if normalizedEndpoint.hasPrefix("/groups/") {
+            return true
+        }
+        return normalizedEndpoint == "/recruiting-posts"
+            && normalizedRequestMethod == "POST"
+    }
+
+    fileprivate var groupNotFoundPresentationMessage: String {
+        if normalizedEndpoint == "/recruiting-posts", normalizedRequestMethod == "POST" {
+            return "삭제되었거나 존재하지 않는 그룹입니다."
+        }
+        return "더 이상 접근할 수 없는 그룹입니다."
+    }
+
+    fileprivate var errorMappingContext: ErrorMappingContext {
+        switch (normalizedRequestMethod, normalizedEndpoint) {
+        case ("POST", "/auth/signup/email"):
+            return .authSignup
+        case ("POST", "/auth/login/email"):
+            return .authLogin
+        case ("GET", "/recruiting-posts"), ("GET", "/recruiting-posts/public"):
+            return .recruitingList
+        default:
+            if statusCode == 400 {
+                return .genericForm
+            }
+            return .generic
+        }
+    }
+
+    fileprivate func withPresentation(title: String, message: String) -> UserFacingError {
+        UserFacingError(
+            title: title,
+            message: message,
+            code: code,
+            provider: provider,
+            statusCode: statusCode,
+            details: details,
+            endpoint: endpoint,
+            requestMethod: requestMethod
+        )
+    }
+}
+
+enum ErrorMapper {
+    static func map(_ error: UserFacingError) -> UserFacingError {
+        if error.isGroupNotFoundResource {
+            #if DEBUG
+            print("[ErrorMapper] mapped group not found -> deleted or inaccessible group")
+            #endif
+            return error.withPresentation(
+                title: "접근할 수 없는 그룹이에요",
+                message: error.groupNotFoundPresentationMessage
+            )
+        }
+
+        if let mappedError = mapPermissionOrResourceError(error) {
+            return mappedError
+        }
+
+        if error.statusCode == 400, case .unknown = error.serverContractCode {
+            return mapInvalidPayload(error)
+        }
+
+        switch error.serverContractCode {
+        case .riotAccountAlreadyAddedByThisUser:
+            return error.withPresentation(
+                title: "이미 추가한 Riot ID예요",
+                message: "같은 Riot ID를 내 목록에 두 번 추가할 수는 없어요."
+            )
+        case .riotAccountAddUnavailable:
+            return error.withPresentation(
+                title: "Riot ID를 추가하지 못했어요",
+                message: "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요."
+            )
+        case .authRequired:
+            return error.withPresentation(
+                title: "로그인이 필요해요",
+                message: "이 기능은 로그인 후 사용할 수 있어요. 이메일, Apple 또는 Google로 로그인해 주세요."
+            )
+        case .forbiddenFeature:
+            return error.withPresentation(
+                title: "권한이 없어요",
+                message: "이 기능에 대한 권한이 없습니다."
+            )
+        case .socialTokenInvalid:
+            return error.withPresentation(
+                title: "소셜 로그인 실패",
+                message: "소셜 로그인 정보를 확인하지 못했어요. 다시 시도해 주세요."
+            )
+        case .accountExistsWithApple:
+            return error.withPresentation(
+                title: "로그인 방법 안내",
+                message: "이 계정은 Apple 로그인으로 이용할 수 있어요. Apple로 계속해 주세요."
+            )
+        case .accountExistsWithGoogle:
+            return error.withPresentation(
+                title: "로그인 방법 안내",
+                message: "이 계정은 Google 로그인으로 이용할 수 있어요. Google로 계속해 주세요."
+            )
+        case .authProviderMismatch:
+            return error.withPresentation(
+                title: "로그인 방법 안내",
+                message: "이 계정은 다른 로그인 방식으로 연결되어 있어요. 올바른 로그인 방식으로 다시 시도해 주세요."
+            )
+        case .accountNotFound:
+            return error.withPresentation(
+                title: "존재하지 않는 계정이에요",
+                message: "가입한 이메일인지 다시 확인해 주세요."
+            )
+        case .unsupportedProvider:
+            return error.withPresentation(
+                title: "지원하지 않는 로그인 방식이에요",
+                message: "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
+            )
+        case .emailAlreadyExists:
+            return error.withPresentation(
+                title: "이미 가입된 이메일이에요",
+                message: "다른 이메일을 사용하거나 로그인으로 계속해 주세요."
+            )
+        case .nicknameAlreadyExists:
+            return error.withPresentation(
+                title: "이미 사용 중인 닉네임이에요",
+                message: "다른 닉네임으로 다시 시도해 주세요."
+            )
+        case .invalidEmailFormat:
+            return error.withPresentation(
+                title: "이메일 형식을 확인해 주세요",
+                message: "올바른 이메일 형식으로 다시 입력해 주세요."
+            )
+        case .weakPassword:
+            return error.withPresentation(
+                title: "비밀번호를 다시 확인해 주세요",
+                message: "비밀번호 조건을 만족하도록 다시 입력해 주세요."
+            )
+        case .requiredTermsNotAgreed:
+            return error.withPresentation(
+                title: "필수 약관 동의가 필요해요",
+                message: "서비스 이용약관과 개인정보 처리방침에 동의해 주세요."
+            )
+        case .invalidPayload:
+            return mapInvalidPayload(error)
+        case .internalServerError:
+            return error.withPresentation(
+                title: "서버에 잠시 문제가 있어요",
+                message: "잠시 후 다시 시도해 주세요."
+            )
+        case .invalidCredentials:
+            return error.withPresentation(
+                title: "로그인 정보를 다시 확인해 주세요",
+                message: "로그인에 실패했어요. 선택한 계정으로 다시 시도해 주세요."
+            )
+        case .emailAuthDisabled:
+            return error.withPresentation(
+                title: "이메일 회원가입을 사용할 수 없어요",
+                message: "현재 이메일 회원가입이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요."
+            )
+        case .passwordAuthDisabled:
+            return error.withPresentation(
+                title: "이메일 로그인을 사용할 수 없어요",
+                message: "현재 이메일 로그인이 비활성화되어 있어요. 잠시 후 다시 시도해 주세요."
+            )
+        case .rateLimited:
+            var rateLimitedError = error.withPresentation(
+                title: "요청이 잠시 몰리고 있어요",
+                message: "요청이 많아 잠시 후 다시 시도해 주세요."
+            )
+            rateLimitedError.code = rateLimitedError.code ?? "RATE_LIMITED"
+            rateLimitedError.statusCode = rateLimitedError.statusCode ?? 429
+            return rateLimitedError
+        case .unknown:
+            return error
+        }
+    }
+
+    private static func mapPermissionOrResourceError(_ error: UserFacingError) -> UserFacingError? {
+        let rawMessage = error.message.lowercased()
+
+        if error.statusCode == 403 {
+            if rawMessage.contains("share the same inhouse group") {
+                return error.withPresentation(
+                    title: "같은 그룹 멤버만 볼 수 있어요",
+                    message: "같은 인하우스 그룹에 속한 사용자 기록만 확인할 수 있어요."
+                )
+            }
+
+            if error.normalizedEndpoint.contains("/profiles/") || error.normalizedEndpoint.contains("/history") {
+                return error.withPresentation(
+                    title: "기록을 볼 수 없어요",
+                    message: "같은 그룹 멤버이거나 공개된 기록만 확인할 수 있어요."
+                )
+            }
+
+            if error.normalizedEndpoint.hasPrefix("/groups/") {
+                return error.withPresentation(
+                    title: "그룹에 접근할 수 없어요",
+                    message: "참여 중인 그룹만 확인할 수 있어요."
+                )
+            }
+
+            return error.withPresentation(
+                title: "권한이 없어요",
+                message: "이 정보에 접근할 수 없습니다."
+            )
+        }
+
+        if error.statusCode == 404 {
+            if error.normalizedEndpoint.contains("/matches/") {
+                return error.withPresentation(
+                    title: "경기를 찾을 수 없어요",
+                    message: "삭제되었거나 더 이상 볼 수 없는 경기입니다."
+                )
+            }
+
+            if error.normalizedEndpoint.contains("/profiles/") || rawMessage.contains("user") {
+                return error.withPresentation(
+                    title: "사용자를 찾을 수 없어요",
+                    message: "삭제되었거나 확인할 수 없는 사용자입니다."
+                )
+            }
+        }
+
+        if error.statusCode == 400,
+           rawMessage.contains("validation") || rawMessage.contains("invalid") {
+            return mapInvalidPayload(error)
+        }
+
+        return nil
+    }
+
+    private static func mapInvalidPayload(_ error: UserFacingError) -> UserFacingError {
+        switch error.errorMappingContext {
+        case .authSignup:
+            return error.withPresentation(
+                title: "입력값을 다시 확인해 주세요",
+                message: "입력한 회원가입 정보를 다시 확인한 뒤 시도해 주세요."
+            )
+        case .authLogin:
+            return error.withPresentation(
+                title: "로그인 정보를 다시 확인해 주세요",
+                message: "입력한 로그인 정보를 다시 확인한 뒤 다시 시도해 주세요."
+            )
+        case .recruitingList:
+            return error.withPresentation(
+                title: "필터 조건을 다시 확인해 주세요",
+                message: "목록을 불러오는 조건이 올바르지 않습니다."
+            )
+        case .genericForm, .generic:
+            return error.withPresentation(
+                title: "입력값을 다시 확인해 주세요",
+                message: "입력한 내용을 다시 확인한 뒤 시도해 주세요."
+            )
+        }
     }
 }
 
@@ -700,6 +802,13 @@ enum ConfirmationAction: String, Codable, Hashable {
 enum GroupVisibility: String, Codable, Hashable {
     case `private` = "PRIVATE"
     case `public` = "PUBLIC"
+
+    var title: String {
+        switch self {
+        case .private: return "비공개"
+        case .public: return "공개"
+        }
+    }
 }
 
 enum JoinPolicy: String, Codable, Hashable, CaseIterable {
@@ -752,6 +861,51 @@ enum RecruitingPostStatus: String, Codable, Hashable {
     case open = "OPEN"
     case closed = "CLOSED"
     case cancelled = "CANCELLED"
+}
+
+enum RecruitDateFilterPreset: String, Codable, Hashable, CaseIterable {
+    case all
+    case today
+    case thisWeek
+    case specificDate
+}
+
+struct RecruitDateFilter: Codable, Hashable {
+    var preset: RecruitDateFilterPreset = .all
+    var selectedDate: Date = Date()
+    var includesUnscheduledPosts = true
+
+    var isDefault: Bool {
+        preset == .all && includesUnscheduledPosts
+    }
+}
+
+struct RecruitBoardFilterState: Codable, Hashable {
+    var selectedDateFilter = RecruitDateFilter()
+    var selectedPositions: Set<String> = []
+    var selectedRegions: Set<String> = []
+    var selectedTags: Set<String> = []
+
+    static let defaultValue = RecruitBoardFilterState()
+
+    var isDefault: Bool {
+        selectedDateFilter.isDefault
+            && selectedPositions.isEmpty
+            && selectedRegions.isEmpty
+            && selectedTags.isEmpty
+    }
+}
+
+struct RecruitPostListQuery: Hashable {
+    var postType: RecruitingPostType?
+    var groupID: String?
+    var status: RecruitingPostStatus? = .open
+    var scheduledFrom: Date?
+    var scheduledTo: Date?
+    var requiredPositions: [String] = []
+    var regions: [String] = []
+    var tags: [String] = []
+    var includeUnscheduledPosts = true
 }
 
 struct AuthUser: Codable, Hashable {
@@ -1075,11 +1229,56 @@ struct GroupSummary: Codable, Hashable, Identifiable {
     let name: String
     let description: String?
     let visibility: GroupVisibility
+    let isMember: Bool?
     let joinPolicy: JoinPolicy
     let tags: [String]
     let ownerUserID: String
     let memberCount: Int
     let recentMatches: Int
+
+    init(
+        id: String,
+        name: String,
+        description: String?,
+        visibility: GroupVisibility,
+        isMember: Bool? = nil,
+        joinPolicy: JoinPolicy,
+        tags: [String],
+        ownerUserID: String,
+        memberCount: Int,
+        recentMatches: Int
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.visibility = visibility
+        self.isMember = isMember
+        self.joinPolicy = joinPolicy
+        self.tags = tags
+        self.ownerUserID = ownerUserID
+        self.memberCount = memberCount
+        self.recentMatches = recentMatches
+    }
+
+    var isPubliclyVisible: Bool {
+        visibility == .public
+    }
+
+    func isAccessible(knownMember: Bool = false) -> Bool {
+        isPubliclyVisible || isMember == true || knownMember
+    }
+}
+
+extension Sequence where Element == GroupSummary {
+    func filterPubliclyVisible() -> [GroupSummary] {
+        filter(\.isPubliclyVisible)
+    }
+
+    func filterAccessible(knownMemberGroupIDs: Set<String> = []) -> [GroupSummary] {
+        filter { group in
+            group.isAccessible(knownMember: knownMemberGroupIDs.contains(group.id))
+        }
+    }
 }
 
 struct GroupMember: Codable, Hashable, Identifiable {
@@ -1283,14 +1482,14 @@ enum SearchResultKind: String, Hashable, Identifiable {
 
 enum SearchResultDestination: Hashable {
     case riotAccounts
-    case groupDetail(groupID: String)
+    case groupDetail(groupID: String, isAccessible: Bool)
     case recruitDetail(postID: String)
 
     var route: AppRoute {
         switch self {
         case .riotAccounts:
             return .riotAccounts
-        case let .groupDetail(groupID):
+        case let .groupDetail(groupID, _):
             return .groupDetail(groupID)
         case let .recruitDetail(postID):
             return .recruitDetail(postID: postID)
@@ -1305,6 +1504,15 @@ enum SearchResultDestination: Hashable {
             return .groupManagement
         case .recruitDetail:
             return .recruitingWrite
+        }
+    }
+
+    var isAccessible: Bool {
+        switch self {
+        case .riotAccounts, .recruitDetail:
+            return true
+        case let .groupDetail(_, isAccessible):
+            return isAccessible
         }
     }
 }
@@ -1587,12 +1795,13 @@ struct TeamBalanceSnapshot: Equatable {
     let candidates: [MatchCandidate]
 }
 
-struct ManualAdjustDraft: Hashable {
+struct ManualAdjustDraft: Codable, Hashable {
+    let mode: BalanceMode
     let blueRows: [ManualAdjustRow]
     let redRows: [ManualAdjustRow]
 }
 
-struct ManualAdjustRow: Hashable, Identifiable {
+struct ManualAdjustRow: Codable, Hashable, Identifiable {
     let id: String
     let userID: String
     let role: Position
@@ -1632,7 +1841,10 @@ struct RiotAccountSnapshot: Equatable {
 
 struct RecruitBoardSnapshot: Equatable {
     let selectedType: RecruitingPostType
+    let filterState: RecruitBoardFilterState
     let posts: [RecruitPost]
+    let groupNamesByID: [String: String]
+    let groupRegionsByID: [String: String]
 }
 
 enum HistoryContentState: Equatable {

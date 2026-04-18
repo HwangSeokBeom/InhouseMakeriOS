@@ -44,6 +44,13 @@ struct MatchResultFeature {
         var kdaInputs: [String: KDAInput] = [:]
         var pendingProtectedAction: PendingProtectedAction?
 
+        var isActionInFlight: Bool {
+            if case .inProgress = actionState {
+                return true
+            }
+            return false
+        }
+
         var mvpCandidates: [MatchPlayer] {
             guard let snapshot = loadState.value else { return [] }
             return snapshot.match.players.filter { $0.teamSide == winningTeam }
@@ -59,7 +66,7 @@ struct MatchResultFeature {
         }
     }
 
-    enum StatField: Equatable {
+    enum StatField: Equatable, Hashable {
         case kills
         case deaths
         case assists
@@ -75,6 +82,7 @@ struct MatchResultFeature {
         case balanceFeelingSelected(Int)
         case kdaChanged(userID: String, field: StatField, value: String)
         case saveLocallyTapped
+        case saveLocallyResponse(Result<CachedResultMetadata, UserFacingError>)
         case submitTapped
         case submitResponse(Result<MatchDetailSnapshot, UserFacingError>)
         case requestChangeTapped
@@ -95,7 +103,8 @@ struct MatchResultFeature {
                 let container = appContainer
                 return .run { send in
                     do {
-                        let snapshot = try await Self.makeSnapshot(container: container, matchID: matchID)
+                        let resolvedContainer = await container()
+                        let snapshot = try await Self.makeSnapshot(container: resolvedContainer, matchID: matchID)
                         await send(.loadResponse(.success(snapshot)))
                     } catch let error as UserFacingError {
                         await send(.loadResponse(.failure(error)))
@@ -108,6 +117,7 @@ struct MatchResultFeature {
                 state.loadState = .content(snapshot)
                 state.winningTeam = snapshot.result?.winningTeam ?? snapshot.cachedMetadata?.winningTeam ?? .blue
                 state.selectedMVPUserID = snapshot.cachedMetadata?.mvpUserID
+                state.balanceFeeling = snapshot.cachedMetadata?.balanceRating ?? 5
                 if state.selectedMVPUserID == nil {
                     state.selectedMVPUserID = snapshot.match.players.first(where: { $0.teamSide == state.winningTeam })?.userID
                 }
@@ -165,30 +175,54 @@ struct MatchResultFeature {
                 return .none
 
             case .saveLocallyTapped:
+                guard !state.isActionInFlight else { return .none }
                 guard let snapshot = state.loadState.value else { return .none }
                 guard let mvpUserID = state.selectedMVPUserID else {
                     state.actionState = .failure("MVP를 선택해주세요.")
                     return .none
                 }
 
-                appContainer.localStore.cacheResult(
-                    matchID: state.matchID,
-                    metadata: CachedResultMetadata(
-                        winningTeam: state.winningTeam,
-                        mvpUserID: mvpUserID,
-                        balanceRating: state.balanceFeeling,
-                        updatedAt: Date()
+                let matchID = state.matchID
+                let winningTeam = state.winningTeam
+                let balanceFeeling = state.balanceFeeling
+                let snapshotMatchID = snapshot.match.id
+                let metadata = CachedResultMetadata(
+                    winningTeam: winningTeam,
+                    mvpUserID: mvpUserID,
+                    balanceRating: balanceFeeling,
+                    updatedAt: Date()
+                )
+
+                state.actionState = .inProgress("이 기기에 저장하는 중입니다")
+
+                return .run { send in
+                    let container = await appContainer()
+                    await MainActor.run {
+                        container.localStore.cacheResult(matchID: matchID, metadata: metadata)
+                        container.localStore.appendNotification(
+                            title: "로컬 저장",
+                            body: "\(snapshotMatchID) 결과가 이 기기에 저장되었습니다.",
+                            symbol: "externaldrive.fill.badge.checkmark"
+                        )
+                    }
+                    await send(.saveLocallyResponse(.success(metadata)))
+                }
+
+            case let .saveLocallyResponse(.success(metadata)):
+                if let snapshot = state.loadState.value {
+                    state.loadState = .content(
+                        MatchDetailSnapshot(match: snapshot.match, result: snapshot.result, cachedMetadata: metadata)
                     )
-                )
-                appContainer.localStore.appendNotification(
-                    title: "로컬 저장",
-                    body: "\(snapshot.match.id) 결과가 이 기기에 저장되었습니다.",
-                    symbol: "externaldrive.fill.badge.checkmark"
-                )
+                }
                 state.actionState = .success("결과가 이 기기에 저장되었습니다")
                 return .none
 
+            case let .saveLocallyResponse(.failure(error)):
+                state.actionState = .failure(error.message)
+                return .none
+
             case .submitTapped:
+                guard !state.isActionInFlight else { return .none }
                 guard let snapshot = state.loadState.value else { return .none }
                 guard let mvpUserID = state.selectedMVPUserID else {
                     state.actionState = .failure("MVP를 선택해주세요.")
@@ -204,6 +238,7 @@ struct MatchResultFeature {
                 let container = appContainer
                 return .run { send in
                     do {
+                        let resolvedContainer = await container()
                         let payload = QuickResultRequestDTO(
                             winningTeam: winningTeam,
                             mvpUserId: mvpUserID,
@@ -215,18 +250,24 @@ struct MatchResultFeature {
                                 kdaInputs: kdaInputs
                             )
                         )
-                        let submission = try await container.matchRepository.submitQuickResult(matchID: matchID, payload: payload)
-                        container.localStore.cacheResult(
-                            matchID: matchID,
-                            metadata: CachedResultMetadata(
-                                winningTeam: winningTeam,
-                                mvpUserID: mvpUserID,
-                                balanceRating: balanceFeeling,
-                                updatedAt: Date()
+                        let submission = try await resolvedContainer.matchRepository.submitQuickResult(matchID: matchID, payload: payload)
+                        await MainActor.run {
+                            resolvedContainer.localStore.cacheResult(
+                                matchID: matchID,
+                                metadata: CachedResultMetadata(
+                                    winningTeam: winningTeam,
+                                    mvpUserID: mvpUserID,
+                                    balanceRating: balanceFeeling,
+                                    updatedAt: Date()
+                                )
                             )
-                        )
-                        container.localStore.appendNotification(title: "결과 저장", body: "결과가 \(submission.status.title) 상태로 저장되었습니다.", symbol: "checkmark.circle.fill")
-                        let refreshed = try await Self.makeSnapshot(container: container, matchID: matchID)
+                            resolvedContainer.localStore.appendNotification(
+                                title: "결과 저장",
+                                body: "결과가 \(submission.status.title) 상태로 저장되었습니다.",
+                                symbol: "checkmark.circle.fill"
+                            )
+                        }
+                        let refreshed = try await Self.makeSnapshot(container: resolvedContainer, matchID: matchID)
                         await send(.submitResponse(.success(refreshed)))
                     } catch let error as UserFacingError {
                         await send(.submitResponse(.failure(error)))
@@ -250,6 +291,7 @@ struct MatchResultFeature {
                 return .none
 
             case .requestChangeTapped:
+                guard !state.isActionInFlight else { return .none }
                 guard let resultID = state.loadState.value?.result?.id else {
                     state.actionState = .failure("수정 요청할 기존 결과가 없습니다.")
                     return .none
@@ -259,13 +301,14 @@ struct MatchResultFeature {
                 let container = appContainer
                 return .run { send in
                     do {
-                        _ = try await container.matchRepository.confirmResult(
+                        let resolvedContainer = await container()
+                        _ = try await resolvedContainer.matchRepository.confirmResult(
                             matchID: matchID,
                             resultID: resultID,
                             action: .suggestChange,
                             comment: "클라이언트에서 수정 요청"
                         )
-                        let refreshed = try await Self.makeSnapshot(container: container, matchID: matchID)
+                        let refreshed = try await Self.makeSnapshot(container: resolvedContainer, matchID: matchID)
                         await send(.requestChangeResponse(.success(refreshed)))
                     } catch let error as UserFacingError {
                         await send(.requestChangeResponse(.failure(error)))
@@ -293,6 +336,7 @@ struct MatchResultFeature {
                 return .none
 
             case .shareLinkTapped:
+                guard !state.isActionInFlight else { return .none }
                 state.actionState = .success("공유 링크 기능은 곧 연결됩니다")
                 return .none
             }
@@ -302,7 +346,7 @@ struct MatchResultFeature {
     private static func makeSnapshot(container: AppContainer, matchID: String) async throws -> MatchDetailSnapshot {
         let match = try await container.matchRepository.detail(matchID: matchID)
         let result = try? await container.matchRepository.result(matchID: matchID)
-        let cache = container.localStore.cachedResults[matchID]
+        let cache = await MainActor.run { container.localStore.cachedResults[matchID] }
         return MatchDetailSnapshot(match: match, result: result, cachedMetadata: cache)
     }
 
@@ -349,9 +393,15 @@ struct MatchResultFeature {
 }
 
 struct MatchResultFeatureView: View {
+    private struct KDAFocusField: Hashable {
+        let userID: String
+        let field: MatchResultFeature.StatField
+    }
+
     @Bindable var store: StoreOf<MatchResultFeature>
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
+    @FocusState private var focusedField: KDAFocusField?
 
     var body: some View {
         screenScaffold(title: "경기 결과 입력", onBack: router.pop, rightSystemImage: nil) {
@@ -367,8 +417,8 @@ struct MatchResultFeatureView: View {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 12) {
                         HStack(spacing: 4) {
-                            modeButton("간편 입력", isSelected: store.mode == .quick) { store.send(.modeSelected(.quick)) }
-                            modeButton("상세 입력", isSelected: store.mode == .detailed) { store.send(.modeSelected(.detailed)) }
+                            modeButton("간편 입력", isSelected: store.mode == .quick) { selectMode(.quick) }
+                            modeButton("상세 입력", isSelected: store.mode == .detailed) { selectMode(.detailed) }
                         }
                         .padding(3)
                         .appPanel(background: AppPalette.bgSecondary, radius: 10)
@@ -451,21 +501,24 @@ struct MatchResultFeatureView: View {
                                             binding: Binding(
                                                 get: { store.kdaInputs[player.userID]?.kills ?? "0" },
                                                 set: { store.send(.kdaChanged(userID: player.userID, field: .kills, value: $0)) }
-                                            )
+                                            ),
+                                            focusField: KDAFocusField(userID: player.userID, field: .kills)
                                         )
                                         numberField(
                                             "D",
                                             binding: Binding(
                                                 get: { store.kdaInputs[player.userID]?.deaths ?? "0" },
                                                 set: { store.send(.kdaChanged(userID: player.userID, field: .deaths, value: $0)) }
-                                            )
+                                            ),
+                                            focusField: KDAFocusField(userID: player.userID, field: .deaths)
                                         )
                                         numberField(
                                             "A",
                                             binding: Binding(
                                                 get: { store.kdaInputs[player.userID]?.assists ?? "0" },
                                                 set: { store.send(.kdaChanged(userID: player.userID, field: .assists, value: $0)) }
-                                            )
+                                            ),
+                                            focusField: KDAFocusField(userID: player.userID, field: .assists)
                                         )
                                     }
                                 }
@@ -483,42 +536,54 @@ struct MatchResultFeatureView: View {
                     }
                     .padding(16)
                 }
+                .scrollDismissesKeyboard(.immediately)
 
                 VStack(spacing: 8) {
                     if session.isAuthenticated {
                         HStack(spacing: 8) {
                             Button("내 계정에 저장") {
+                                focusedField = nil
                                 store.send(.submitTapped)
                             }
                             .buttonStyle(PrimaryButtonStyle())
+                            .disabled(store.isActionInFlight)
 
                             Button("공유 링크") {
+                                focusedField = nil
                                 store.send(.shareLinkTapped)
                             }
                             .buttonStyle(SecondaryButtonStyle())
                             .frame(maxWidth: 108)
+                            .disabled(store.isActionInFlight)
                         }
 
                         Button("수정 요청") {
+                            focusedField = nil
                             store.send(.requestChangeTapped)
                         }
                         .buttonStyle(SecondaryButtonStyle())
+                        .disabled(store.isActionInFlight)
                     } else {
                         HStack(spacing: 8) {
                             Button("로컬에 저장") {
+                                focusedField = nil
                                 store.send(.saveLocallyTapped)
                             }
                             .buttonStyle(PrimaryButtonStyle())
+                            .disabled(store.isActionInFlight)
 
                             Button("로그인하고 계정 저장") {
+                                focusedField = nil
                                 session.requireAuthentication(for: .resultSave) {
                                     store.send(.submitTapped)
                                 }
                             }
                             .buttonStyle(SecondaryButtonStyle())
+                            .disabled(store.isActionInFlight)
                         }
 
                         Button("로그인하고 공유하기") {
+                            focusedField = nil
                             session.requireAuthentication(for: .shareRecord) {
                                 store.send(.shareLinkTapped)
                             }
@@ -591,6 +656,7 @@ struct MatchResultFeatureView: View {
                 .frame(height: 34)
                 .background(isSelected ? AppPalette.accentBlue : .clear)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
@@ -645,11 +711,21 @@ struct MatchResultFeatureView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    private func numberField(_ placeholder: String, binding: Binding<String>) -> some View {
+    private func numberField(
+        _ placeholder: String,
+        binding: Binding<String>,
+        focusField: KDAFocusField
+    ) -> some View {
         TextField(placeholder, text: binding)
             .keyboardType(.numberPad)
             .textFieldStyle(.roundedBorder)
             .frame(width: 52)
+            .focused($focusedField, equals: focusField)
+    }
+
+    private func selectMode(_ mode: MatchResultFeature.State.Mode) {
+        focusedField = nil
+        store.send(.modeSelected(mode))
     }
 
     private func title(for phase: MatchResultFeature.State.ResultPhase) -> String {

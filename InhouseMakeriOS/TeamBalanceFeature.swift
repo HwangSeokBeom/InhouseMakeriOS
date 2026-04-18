@@ -51,6 +51,12 @@ struct TeamBalanceFeature {
             return snapshot.candidates.first(where: { $0.type == selectedMode }) ?? snapshot.candidates.first
         }
 
+        var selectedCandidateIsManual: Bool {
+            selectedCandidate?.candidateID.hasPrefix(Self.manualCandidateIDPrefix) == true
+        }
+
+        fileprivate static let manualCandidateIDPrefix = "manual-candidate:"
+
         func rows(for side: TeamSide) -> [TeamBalanceRow] {
             guard let candidate = selectedCandidate else { return [] }
             let players = side == .blue ? candidate.teamA : candidate.teamB
@@ -88,7 +94,7 @@ struct TeamBalanceFeature {
                     isOffRole: !(preferredPositions[player.userID] ?? [player.assignedRole]).contains(player.assignedRole)
                 )
             }
-            return ManualAdjustDraft(blueRows: blue, redRows: red)
+            return ManualAdjustDraft(mode: candidate.type, blueRows: blue, redRows: red)
         }
     }
 
@@ -123,23 +129,39 @@ struct TeamBalanceFeature {
                 let matchID = state.matchID
                 let container = appContainer
                 return .run { send in
+#if DEBUG
+                    print("[RouteFetch] fetch started screen=team_balance groupID=\(groupID) matchID=\(matchID)")
+#endif
                     do {
-                        let payload = try await Self.loadPayload(container: container, groupID: groupID, matchID: matchID)
+                        let resolvedContainer = await container()
+                        let payload = try await Self.loadPayload(container: resolvedContainer, groupID: groupID, matchID: matchID)
+#if DEBUG
+                        print("[RouteFetch] fetch success screen=team_balance groupID=\(groupID) matchID=\(matchID) source=live candidates=\(payload.snapshot.candidates.count)")
+#endif
                         await send(.loadResponse(.success(payload)))
                     } catch let error as UserFacingError {
+#if DEBUG
+                        print("[RouteFetch] fetch failure screen=team_balance groupID=\(groupID) matchID=\(matchID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+#endif
                         await send(.loadResponse(.failure(error)))
                     } catch {
+#if DEBUG
+                        print("[RouteFetch] fetch failure screen=team_balance groupID=\(groupID) matchID=\(matchID) source=live status=nil message=\(error.localizedDescription)")
+#endif
                         await send(.loadResponse(.failure(.unexpected("팀 밸런스 로딩 실패", message: "추천 조합을 불러오지 못했습니다."))))
                     }
                 }
 
             case let .loadResponse(.success(payload)):
+                let preferredMode = state.selectedMode
                 state.groupName = payload.groupName
                 state.preferredPositions = payload.preferredPositions
                 state.loadState = payload.snapshot.match.candidates.isEmpty
                     ? .empty("추천 조합이 없습니다.\n로비에서 자동 팀 생성을 다시 실행해주세요.")
                     : .content(payload.snapshot)
-                state.selectedMode = payload.snapshot.match.candidates.first?.type ?? .balanced
+                state.selectedMode = payload.snapshot.match.candidates.contains(where: { $0.type == preferredMode })
+                    ? preferredMode
+                    : (payload.snapshot.match.candidates.first?.type ?? .balanced)
                 return .none
 
             case let .loadResponse(.failure(error)):
@@ -161,15 +183,22 @@ struct TeamBalanceFeature {
                 let groupID = state.groupID
                 let matchID = state.matchID
                 let selectedMode = state.selectedMode
+                let currentSignature = Self.candidateSignature(candidate)
                 let container = appContainer
                 return .run { send in
                     do {
-                        _ = try await container.matchRepository.reroll(
+                        let resolvedContainer = await container()
+                        await MainActor.run {
+                            resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
+                        }
+                        let payload = try await Self.rerollPayload(
+                            container: resolvedContainer,
+                            groupID: groupID,
                             matchID: matchID,
                             mode: selectedMode,
-                            excludeCandidateIDs: [candidate.candidateID]
+                            currentSignature: currentSignature,
+                            excludedCandidateIDs: [candidate.candidateID]
                         )
-                        let payload = try await Self.loadPayload(container: container, groupID: groupID, matchID: matchID)
                         await send(.rerollResponse(.success(payload)))
                     } catch let error as UserFacingError {
                         await send(.rerollResponse(.failure(error)))
@@ -184,7 +213,9 @@ struct TeamBalanceFeature {
                 state.loadState = payload.snapshot.match.candidates.isEmpty
                     ? .empty("추천 조합이 없습니다.\n로비에서 자동 팀 생성을 다시 실행해주세요.")
                     : .content(payload.snapshot)
-                state.selectedMode = payload.snapshot.match.candidates.first?.type ?? state.selectedMode
+                if !payload.snapshot.match.candidates.contains(where: { $0.type == state.selectedMode }) {
+                    state.selectedMode = payload.snapshot.match.candidates.first?.type ?? state.selectedMode
+                }
                 state.actionState = .success("새 조합이 생성되었습니다")
                 return .none
 
@@ -205,12 +236,37 @@ struct TeamBalanceFeature {
                 let groupName = state.groupName
                 let container = appContainer
                 return .run { send in
+                    if candidate.candidateID.hasPrefix(State.manualCandidateIDPrefix) {
+                        let resolvedContainer = await container()
+                        await MainActor.run {
+                            resolvedContainer.localStore.trackMatch(
+                                RecentMatchContext(matchID: matchID, groupID: groupID, groupName: groupName, createdAt: Date())
+                            )
+                            resolvedContainer.localStore.appendNotification(
+                                title: "수동 조정 확정",
+                                body: "로컬에 저장한 수동 조정안을 기준으로 결과 입력 단계로 이동합니다.",
+                                symbol: "slider.horizontal.3"
+                            )
+                        }
+                        await send(.confirmSelectionSucceeded)
+                        return
+                    }
                     do {
-                        _ = try await container.matchRepository.selectCandidate(matchID: matchID, candidateNo: candidate.candidateNo)
-                        container.localStore.trackMatch(
-                            RecentMatchContext(matchID: matchID, groupID: groupID, groupName: groupName, createdAt: Date())
-                        )
-                        container.localStore.appendNotification(title: "팀 확정", body: "추천 조합 \(candidate.candidateNo)번이 확정되었습니다.", symbol: "checkmark.seal.fill")
+                        let resolvedContainer = await container()
+                        await MainActor.run {
+                            resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
+                        }
+                        _ = try await resolvedContainer.matchRepository.selectCandidate(matchID: matchID, candidateNo: candidate.candidateNo)
+                        await MainActor.run {
+                            resolvedContainer.localStore.trackMatch(
+                                RecentMatchContext(matchID: matchID, groupID: groupID, groupName: groupName, createdAt: Date())
+                            )
+                            resolvedContainer.localStore.appendNotification(
+                                title: "팀 확정",
+                                body: "추천 조합 \(candidate.candidateNo)번이 확정되었습니다.",
+                                symbol: "checkmark.seal.fill"
+                            )
+                        }
                         await send(.confirmSelectionSucceeded)
                     } catch let error as UserFacingError {
                         await send(.confirmSelectionFailed(error))
@@ -249,11 +305,58 @@ struct TeamBalanceFeature {
         async let match = container.matchRepository.detail(matchID: matchID)
         let (groupValue, matchValue) = try await (group, match)
         let preferred = await inferPreferredPositions(container: container, userIDs: matchValue.players.map(\.userID))
+        let manualDraft = await MainActor.run {
+            container.localStore.manualAdjustDraft(matchID: matchID)
+        }
+        let candidates = mergeCandidates(match: matchValue, manualDraft: manualDraft)
+        let effectiveMatch = Match(
+            id: matchValue.id,
+            groupID: matchValue.groupID,
+            status: matchValue.status,
+            scheduledAt: matchValue.scheduledAt,
+            balanceMode: matchValue.balanceMode,
+            selectedCandidateNo: matchValue.selectedCandidateNo,
+            players: matchValue.players,
+            candidates: candidates
+        )
         return LoadPayload(
-            snapshot: TeamBalanceSnapshot(match: matchValue, candidates: matchValue.candidates),
+            snapshot: TeamBalanceSnapshot(match: effectiveMatch, candidates: candidates),
             groupName: groupValue.name,
             preferredPositions: preferred
         )
+    }
+
+    private static func rerollPayload(
+        container: AppContainer,
+        groupID: String,
+        matchID: String,
+        mode: BalanceMode,
+        currentSignature: String,
+        excludedCandidateIDs: [String]
+    ) async throws -> LoadPayload {
+        var excludedIDs = Set(excludedCandidateIDs)
+        var latestPayload = try await loadPayload(container: container, groupID: groupID, matchID: matchID)
+
+        for _ in 0..<3 {
+            _ = try await container.matchRepository.reroll(
+                matchID: matchID,
+                mode: mode,
+                excludeCandidateIDs: Array(excludedIDs)
+            )
+            latestPayload = try await loadPayload(container: container, groupID: groupID, matchID: matchID)
+
+            if let candidate = latestPayload.snapshot.candidates.first(where: { $0.type == mode }) {
+                if candidateSignature(candidate) != currentSignature {
+                    return latestPayload
+                }
+                excludedIDs.insert(candidate.candidateID)
+                continue
+            }
+
+            return latestPayload
+        }
+
+        return latestPayload
     }
 
     private static func inferPreferredPositions(container: AppContainer, userIDs: [String]) async -> [String: [Position]] {
@@ -267,6 +370,71 @@ struct TeamBalanceFeature {
             }
         }
         return map
+    }
+
+    private static func mergeCandidates(match: Match, manualDraft: ManualAdjustDraft?) -> [MatchCandidate] {
+        guard let manualDraft else { return match.candidates }
+        let manualCandidate = makeManualCandidate(matchID: match.id, draft: manualDraft)
+        let manualSignature = candidateSignature(manualCandidate)
+        let remainingCandidates = match.candidates.filter { candidateSignature($0) != manualSignature }
+        return [manualCandidate] + remainingCandidates
+    }
+
+    private static func makeManualCandidate(matchID: String, draft: ManualAdjustDraft) -> MatchCandidate {
+        let bluePlayers = draft.blueRows.map { row in
+            CandidatePlayer(
+                userID: row.userID,
+                nickname: row.name,
+                teamSide: .blue,
+                assignedRole: row.role,
+                rolePower: Double(row.score),
+                isOffRole: row.isOffRole
+            )
+        }
+        let redPlayers = draft.redRows.map { row in
+            CandidatePlayer(
+                userID: row.userID,
+                nickname: row.name,
+                teamSide: .red,
+                assignedRole: row.role,
+                rolePower: Double(row.score),
+                isOffRole: row.isOffRole
+            )
+        }
+        let teamAPower = bluePlayers.map(\.rolePower).reduce(0, +)
+        let teamBPower = redPlayers.map(\.rolePower).reduce(0, +)
+        return MatchCandidate(
+            candidateID: "\(State.manualCandidateIDPrefix)\(matchID)",
+            candidateNo: 0,
+            type: draft.mode,
+            score: abs(teamAPower - teamBPower),
+            metrics: CandidateMetrics(
+                teamPowerGap: abs(teamAPower - teamBPower),
+                laneMatchupGap: 0,
+                offRolePenalty: Double((draft.blueRows + draft.redRows).filter(\.isOffRole).count),
+                repeatTeamPenalty: 0,
+                preferenceViolationPenalty: 0,
+                volatilityClusterPenalty: 0
+            ),
+            teamAPower: teamAPower,
+            teamBPower: teamBPower,
+            offRoleCount: (draft.blueRows + draft.redRows).filter(\.isOffRole).count,
+            explanationTags: ["수동 조정", "로컬 저장"],
+            teamA: bluePlayers,
+            teamB: redPlayers
+        )
+    }
+
+    private static func candidateSignature(_ candidate: MatchCandidate) -> String {
+        let blueSignature = candidate.teamA
+            .sorted { $0.assignedRole.rawValue < $1.assignedRole.rawValue }
+            .map { "\($0.userID):\($0.assignedRole.rawValue)" }
+            .joined(separator: "|")
+        let redSignature = candidate.teamB
+            .sorted { $0.assignedRole.rawValue < $1.assignedRole.rawValue }
+            .map { "\($0.userID):\($0.assignedRole.rawValue)" }
+            .joined(separator: "|")
+        return "\(candidate.type.rawValue)#blue[\(blueSignature)]#red[\(redSignature)]"
     }
 }
 
@@ -305,12 +473,14 @@ struct TeamBalanceFeatureView: View {
                         store.send(.confirmSelectionTapped)
                     }
                     .buttonStyle(PrimaryButtonStyle())
+                    .disabled(isActionInFlight)
 
                     HStack(spacing: 8) {
                         Button("다시 생성") {
                             store.send(.rerollTapped)
                         }
                         .buttonStyle(SecondaryButtonStyle())
+                        .disabled(isActionInFlight)
 
                         Button("수동 조정") {
                             if let draft = store.state.draftForManualAdjust() {
@@ -318,10 +488,15 @@ struct TeamBalanceFeatureView: View {
                             }
                         }
                         .buttonStyle(SecondaryButtonStyle())
+                        .disabled(isActionInFlight)
                     }
 
                     if let candidate = store.selectedCandidate {
-                        Text("추천 조합 \(candidate.candidateNo)번을 확정하면 결과 입력 단계로 이동합니다.")
+                        Text(
+                            candidate.candidateID.hasPrefix(TeamBalanceFeature.State.manualCandidateIDPrefix)
+                                ? "로컬에 저장한 수동 조정안을 기준으로 결과 입력 단계로 이동합니다."
+                                : "추천 조합 \(candidate.candidateNo)번을 확정하면 결과 입력 단계로 이동합니다."
+                        )
                             .font(AppTypography.body(11))
                             .foregroundStyle(AppPalette.textMuted)
                     }
@@ -332,6 +507,10 @@ struct TeamBalanceFeatureView: View {
             }
         }
         .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
+        .onAppear {
+            guard store.loadState.value != nil else { return }
+            store.send(.load(force: true))
+        }
         .onChange(of: store.pendingProtectedAction) { _, pendingAction in
             guard let pendingAction else { return }
             switch pendingAction {
@@ -374,7 +553,12 @@ struct TeamBalanceFeatureView: View {
                 }
                 Spacer()
                 if let candidate {
-                    tagChip("추천 \(candidate.candidateNo)", tint: AppPalette.accentBlue)
+                    tagChip(
+                        candidate.candidateID.hasPrefix(TeamBalanceFeature.State.manualCandidateIDPrefix)
+                            ? "수동 조정"
+                            : "추천 \(candidate.candidateNo)",
+                        tint: AppPalette.accentBlue
+                    )
                 }
             }
 
@@ -421,6 +605,13 @@ struct TeamBalanceFeatureView: View {
         )
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
         .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
+    private var isActionInFlight: Bool {
+        if case .inProgress = store.actionState {
+            return true
+        }
+        return false
     }
 
     private func modeTabs() -> some View {

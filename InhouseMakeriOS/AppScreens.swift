@@ -9,21 +9,112 @@ import UIKit
 @MainActor
 final class AppRouter: ObservableObject {
     @Published var path: [AppRoute] = []
+    private var pendingRouteRequest: AppRoute?
 
     func push(_ route: AppRoute) {
+        debugRoute("requested", route: route)
+
+        if pendingRouteRequest == route {
+            debugRoute("ignored duplicate", route: route, detail: "reason=same_runloop_request")
+            return
+        }
+        pendingRouteRequest = route
+        Task { @MainActor [weak self] in
+            self?.pendingRouteRequest = nil
+        }
+
+        if path.last == route {
+            debugRoute("ignored duplicate", route: route, detail: "reason=already_visible")
+            return
+        }
+
         if let existingIndex = path.lastIndex(of: route) {
-            path = Array(path.prefix(existingIndex + 1))
+            let nextPath = Array(path.prefix(existingIndex + 1))
+            guard nextPath != path else {
+                debugRoute("ignored duplicate", route: route, detail: "reason=no_path_change")
+                return
+            }
+            path = nextPath
+            debugRoute("reused", route: route, detail: "depth=\(existingIndex)")
             return
         }
         path.append(route)
+        debugRoute("accepted", route: route)
     }
 
     func pop() {
         _ = path.popLast()
     }
 
+    func removeRoutes(referencingGroupID groupID: String) {
+        guard let firstMatchIndex = path.firstIndex(where: { $0.references(groupID: groupID) }) else { return }
+        path = Array(path.prefix(firstMatchIndex))
+    }
+
     func reset() {
         path.removeAll()
+    }
+
+    private func debugRoute(_ event: String, route: AppRoute, detail: String? = nil) {
+#if DEBUG
+        if let detail {
+            print("[Route] \(event) route=\(route.debugDescription) \(detail)")
+        } else {
+            print("[Route] \(event) route=\(route.debugDescription)")
+        }
+#endif
+    }
+}
+
+private extension AppRoute {
+    var debugDescription: String {
+        switch self {
+        case .search:
+            return "search"
+        case .notifications:
+            return "notifications"
+        case .riotAccounts:
+            return "riot_accounts"
+        case .settings:
+            return "settings"
+        case .homeUpcomingMatches:
+            return "home_upcoming_matches"
+        case .homeGroups:
+            return "home_groups"
+        case .powerDetail:
+            return "power_detail"
+        case let .memberProfile(userID, nickname):
+            return "member_profile userID=\(userID) nickname=\(nickname)"
+        case .homeRecentMatches:
+            return "home_recent_matches"
+        case let .groupDetail(groupID):
+            return "group_detail groupID=\(groupID)"
+        case let .matchLobby(groupID, matchID):
+            return "match_lobby groupID=\(groupID) matchID=\(matchID)"
+        case let .teamBalance(groupID, matchID):
+            return "team_balance groupID=\(groupID) matchID=\(matchID)"
+        case let .manualAdjust(matchID, draft):
+            return "manual_adjust matchID=\(matchID) mode=\(draft.mode.rawValue)"
+        case let .matchResult(matchID):
+            return "match_result matchID=\(matchID)"
+        case let .matchDetail(matchID):
+            return "match_detail matchID=\(matchID)"
+        case let .recruitDetail(postID):
+            return "recruit_detail postID=\(postID)"
+        }
+    }
+
+    func references(groupID: String) -> Bool {
+        switch self {
+        case let .groupDetail(routeGroupID):
+            return routeGroupID == groupID
+        case let .matchLobby(routeGroupID, _):
+            return routeGroupID == groupID
+        case let .teamBalance(routeGroupID, _):
+            return routeGroupID == groupID
+        default:
+            return false
+        }
     }
 }
 
@@ -107,6 +198,12 @@ private final class InitialLoadTracker {
     }
 }
 
+private func debugSkipDeletedGroupReload(groupID: String) {
+    #if DEBUG
+    print("[InitialLoad] skip deleted group reload groupId=\(groupID)")
+    #endif
+}
+
 @MainActor
 final class AppSessionViewModel: ObservableObject {
     private struct PendingAuthAction {
@@ -128,6 +225,7 @@ final class AppSessionViewModel: ObservableObject {
     private var pendingAuthAction: PendingAuthAction?
     private var deferredAuthPrompt: AuthPromptContext?
     private var suppressNextAuthPromptDismissSync = false
+    private var deletedGroupIDs: Set<String> = []
 
     init(container: AppContainer) {
         self.container = container
@@ -179,6 +277,10 @@ final class AppSessionViewModel: ObservableObject {
 
     func bootstrap() async {
         guard case .bootstrapping = state else { return }
+        await bootstrapLiveSession()
+    }
+
+    private func bootstrapLiveSession() async {
         let persistedTokens = await container.authRepository.loadPersistedTokens()
 
         guard let persistedTokens else {
@@ -271,6 +373,37 @@ final class AppSessionViewModel: ObservableObject {
         requireAuthentication(for: requirement) {
             router.push(route)
         }
+    }
+
+    func canAccessGroupSummary(_ group: GroupSummary) -> Bool {
+        group.isAccessible(knownMember: container.localStore.containsGroup(id: group.id))
+    }
+
+    func openGroupDetailIfAccessible(_ group: GroupSummary, router: AppRouter) {
+        guard canAccessGroupSummary(group) else {
+            actionState = .failure("참여 중인 그룹만 확인할 수 있어요.")
+            return
+        }
+
+        openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+    }
+
+    func markGroupContextDeleted(_ groupID: String) {
+        deletedGroupIDs.insert(groupID)
+        container.localStore.removeGroup(id: groupID)
+    }
+
+    func isDeletedGroupContext(_ groupID: String) -> Bool {
+        deletedGroupIDs.contains(groupID)
+    }
+
+    func hasValidGroupContext(_ groupID: String?) -> Bool {
+        guard let groupID else { return false }
+        return !deletedGroupIDs.contains(groupID) && container.localStore.containsGroup(id: groupID)
+    }
+
+    func preferredGroupContextID() -> String? {
+        return container.localStore.storedGroupIDs.first { !deletedGroupIDs.contains($0) }
     }
 
     func requestModalPresentation(_ modal: AppModalKind) {
@@ -524,9 +657,96 @@ enum GroupCreationFlowResult {
 }
 
 enum RecruitPostCreationFlowResult {
-    case success
+    case success(RecruitPost)
     case failure(String)
+    case invalidGroupContext(String)
     case requiresAuthentication
+}
+
+enum RecruitBoardLoadTrigger: String {
+    case screenAppear = "screen_appear"
+    case retry = "retry"
+    case sessionScopeChange = "session_scope_change"
+    case createSheetDismissed = "create_sheet_dismissed"
+    case selectedTypeChanged = "type_switch"
+    case filtersChanged = "filters_changed"
+    case postUpdated = "post_updated"
+    case postDeleted = "post_deleted"
+}
+
+enum RecruitBoardSelectedTypeChangeReason: String {
+    case initialState = "initial_state"
+    case userSelection = "user_selection"
+    case createSuccess = "create_success"
+    case reset = "reset"
+}
+
+enum RecruitBoardFilterChangeReason: String {
+    case date = "date"
+    case positions = "positions"
+    case regions = "regions"
+    case tags = "tags"
+    case reset = "reset"
+}
+
+enum RecruitDetailLoadTrigger: String {
+    case screenAppear = "screen_appear"
+    case retry = "retry"
+}
+
+private enum RecruitDetailErrorType: String {
+    case authRequired = "auth_required"
+    case forbidden = "forbidden"
+    case notFound = "not_found"
+    case transient = "transient"
+    case other = "other"
+}
+
+private enum RecruitDetailMutationErrorType: String {
+    case authRequired = "auth_required"
+    case forbidden = "forbidden"
+    case notFound = "not_found"
+    case conflict = "conflict"
+    case server = "server"
+    case other = "other"
+}
+
+enum RecruitApplyCapability: Equatable {
+    case unknown
+    case available
+    case unavailable(String)
+
+    var note: String? {
+        switch self {
+        case .unknown:
+            return "참가 신청은 서버 지원 여부에 따라 동작합니다."
+        case .available:
+            return "참가 신청이 가능하면 즉시 요청을 보내고 상세 화면을 새로고칩니다."
+        case let .unavailable(message):
+            return message
+        }
+    }
+}
+
+struct RecruitDetailViewState: Equatable {
+    let postID: String
+    let groupID: String
+    let postType: RecruitingPostType
+    let title: String
+    let groupName: String
+    let authorName: String?
+    let requiredPositionsText: String
+    let statusText: String
+    let moodTagsText: String
+    let scheduledAtText: String
+    let bodyText: String
+    let isOwner: Bool
+}
+
+private enum RecruitOptionCatalog {
+    static let positions = ["TOP", "JUNGLE", "MID", "ADC", "SUPPORT"]
+    static let regions = ["서울", "경기", "인천", "부산", "대구", "광주", "대전", "울산", "세종", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주"]
+    static let moodTags = ["빡겜", "즐겜", "친목", "초보환영", "주말", "평일", "급구"]
 }
 
 @MainActor
@@ -550,7 +770,7 @@ final class HomeViewModel: ObservableObject {
             do {
                 let groups = try await loadTrackedGroups()
                 let currentMatch = try await loadCurrentMatch()
-                let posts = try await session.container.recruitingRepository.list(status: .open)
+                let posts = try await loadRecruitingPostsForHome(isAuthenticated: true)
                 let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
                 if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
                     throw error
@@ -591,8 +811,8 @@ final class HomeViewModel: ObservableObject {
             return
         }
 
-        let groups = (try? await session.container.groupRepository.listPublic()) ?? []
-        let posts = (try? await session.container.recruitingRepository.listPublic(status: .open)) ?? []
+        let groups = ((try? await session.container.groupRepository.listPublic()) ?? []).filterPubliclyVisible()
+        let posts = (try? await loadRecruitingPostsForHome(isAuthenticated: false)) ?? []
         let guestSnapshot = GuestHomeSnapshot(
             groups: Array(groups.prefix(4)),
             currentMatch: nil,
@@ -601,7 +821,7 @@ final class HomeViewModel: ObservableObject {
         )
 
         if groups.isEmpty && guestSnapshot.latestLocalResult == nil && posts.isEmpty {
-            state = .empty("아직 둘러볼 공개 그룹이나 모집글이 없습니다.\n팀 밸런스 프리뷰나 결과 프리뷰부터 시작해 보세요.")
+            state = .empty("아직 둘러볼 공개 그룹이나 모집글이 없습니다.\n공개 그룹을 확인하거나 실제 내전 흐름을 시작해 보세요.")
         } else {
             state = .content(.guest(guestSnapshot))
         }
@@ -623,8 +843,14 @@ final class HomeViewModel: ObservableObject {
     }
 
     private func loadTrackedGroups() async throws -> [GroupSummary] {
+        let knownMemberGroupIDs = Set(session.container.localStore.storedGroupIDs)
         var groups: [GroupSummary] = []
         for id in session.container.localStore.storedGroupIDs {
+            if session.isDeletedGroupContext(id) {
+                session.markGroupContextDeleted(id)
+                debugSkipDeletedGroupReload(groupID: id)
+                continue
+            }
             do {
                 let group = try await session.container.groupRepository.detail(groupID: id)
                 groups.append(group)
@@ -632,14 +858,44 @@ final class HomeViewModel: ObservableObject {
                 if error.requiresAuthentication {
                     throw error
                 }
+                if error.isGroupNotFoundResource {
+                    session.markGroupContextDeleted(id)
+                    debugSkipDeletedGroupReload(groupID: id)
+                }
             }
         }
-        return groups
+        return groups.filterAccessible(knownMemberGroupIDs: knownMemberGroupIDs)
     }
 
     private func loadCurrentMatch() async throws -> Match? {
         guard let context = session.container.localStore.recentMatches.first else { return nil }
         return try await session.container.matchRepository.detail(matchID: context.matchID)
+    }
+
+    private func loadRecruitingPostsForHome(isAuthenticated: Bool) async throws -> [RecruitPost] {
+        do {
+            if isAuthenticated {
+                return try await session.container.recruitingRepository.list(status: .open)
+            }
+            return try await session.container.recruitingRepository.listPublic(status: .open)
+        } catch let error as UserFacingError {
+            if isAuthenticated, error.requiresAuthentication {
+                throw error
+            }
+            debugHomeLoad(
+                "recruiting section failed but screen continues endpoint=\(error.endpoint ?? "nil") status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)"
+            )
+            return []
+        } catch {
+            debugHomeLoad("recruiting section failed but screen continues endpoint=unknown status=nil message=\(error.localizedDescription)")
+            return []
+        }
+    }
+
+    private func debugHomeLoad(_ message: String) {
+#if DEBUG
+        print("[HomeLoad] \(message)")
+#endif
     }
 }
 
@@ -663,9 +919,10 @@ final class GroupMainViewModel: ObservableObject {
         if session.isGuest {
             do {
                 let groups = try await session.container.groupRepository.listPublic()
-                state = groups.isEmpty
+                let visibleGroups = groups.filterPubliclyVisible()
+                state = visibleGroups.isEmpty
                     ? .empty("공개 그룹이 아직 없습니다.\n나중에 다시 확인하거나 로그인 후 직접 그룹을 만들어 보세요.")
-                    : .content(groups)
+                    : .content(visibleGroups)
                 didSucceed = true
             } catch let error as UserFacingError {
                 state = .error(error)
@@ -676,8 +933,14 @@ final class GroupMainViewModel: ObservableObject {
         }
 
         do {
+            let knownMemberGroupIDs = Set(session.container.localStore.storedGroupIDs)
             var groups: [GroupSummary] = []
             for id in session.container.localStore.storedGroupIDs {
+                if session.isDeletedGroupContext(id) {
+                    session.markGroupContextDeleted(id)
+                    debugSkipDeletedGroupReload(groupID: id)
+                    continue
+                }
                 do {
                     let group = try await session.container.groupRepository.detail(groupID: id)
                     groups.append(group)
@@ -685,9 +948,16 @@ final class GroupMainViewModel: ObservableObject {
                     if error.requiresAuthentication {
                         throw error
                     }
+                    if error.isGroupNotFoundResource {
+                        session.markGroupContextDeleted(id)
+                        debugSkipDeletedGroupReload(groupID: id)
+                    }
                 }
             }
-            state = groups.isEmpty ? .empty("추적 중인 그룹이 없습니다.\n그룹을 생성하면 이 탭에서 다시 불러옵니다.") : .content(groups)
+            let accessibleGroups = groups.filterAccessible(knownMemberGroupIDs: knownMemberGroupIDs)
+            state = accessibleGroups.isEmpty
+                ? .empty("추적 중인 그룹이 없습니다.\n그룹을 생성하면 이 탭에서 다시 불러옵니다.")
+                : .content(accessibleGroups)
             didSucceed = true
         } catch let error as UserFacingError {
             session.handleProtectedLoadError(
@@ -712,7 +982,7 @@ final class GroupMainViewModel: ObservableObject {
                 joinPolicy: .inviteOnly,
                 tags: tags
             )
-            session.container.localStore.trackGroup(id: group.id)
+            session.container.localStore.trackGroup(id: group.id, name: group.name)
             session.container.localStore.appendNotification(title: "그룹 생성", body: "\(group.name) 그룹이 생성되었습니다.", symbol: "person.3.fill")
             await load(force: true, trigger: "group_created_refresh")
             actionState = .success("그룹이 생성되었습니다")
@@ -733,6 +1003,29 @@ final class GroupMainViewModel: ObservableObject {
         }
     }
 
+    func handleGroupUpdated(_ group: GroupSummary) {
+        session.container.localStore.trackGroup(id: group.id, name: group.name)
+        guard let groups = state.value else { return }
+        let updatedGroups = groups.map { existingGroup in
+            existingGroup.id == group.id ? group : existingGroup
+        }
+        state = .content(updatedGroups)
+        actionState = .success("내전 방 정보가 수정되었습니다")
+    }
+
+    func handleGroupDeleted(groupID: String) {
+        session.markGroupContextDeleted(groupID)
+        guard let groups = state.value else {
+            actionState = .success("내전 방이 삭제되었습니다")
+            return
+        }
+        let remainingGroups = groups.filter { $0.id != groupID }
+        state = remainingGroups.isEmpty
+            ? .empty("추적 중인 그룹이 없습니다.\n그룹을 생성하면 이 탭에서 다시 불러옵니다.")
+            : .content(remainingGroups)
+        actionState = .success("내전 방이 삭제되었습니다")
+    }
+
     func reset() {
         state = .initial
         actionState = .idle
@@ -751,29 +1044,79 @@ final class RecruitBoardViewModel: ObservableObject {
     @Published private(set) var state: ScreenLoadState<RecruitBoardSnapshot> = .initial
     @Published var actionState: AsyncActionState = .idle
     @Published var selectedType: RecruitingPostType
+    @Published private(set) var filterState = RecruitBoardFilterState.defaultValue
 
     private let session: AppSessionViewModel
     private let initialLoadTracker = InitialLoadTracker(screen: "recruit")
+    private var pendingForcedLoadTrigger: RecruitBoardLoadTrigger?
+    private var lastLoadedQuery: RecruitPostListQuery?
 
     init(session: AppSessionViewModel) {
         self.session = session
         self.selectedType = session.container.localStore.recruitFilterType
+        debugRecruitScreen(
+            "selectedPostType initial value=\(selectedType.rawValue) reason=\(RecruitBoardSelectedTypeChangeReason.initialState.rawValue)"
+        )
     }
 
-    func load(force: Bool = false, trigger: String = "unknown") async {
-        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+    func load(force: Bool = false, trigger: RecruitBoardLoadTrigger) async {
+        let requestedType = selectedType
+        let requestedFilterState = filterState
+        let query = buildListQuery(for: requestedType, filters: requestedFilterState)
+        if !force, let lastLoadedQuery, lastLoadedQuery == query, state.value != nil {
+            debugRecruitScreen("ignored duplicate load trigger=\(trigger.rawValue) currentPostType=\(requestedType.rawValue)")
+            return
+        }
+        debugRecruitScreen(
+            "load trigger=\(trigger.rawValue) currentPostType=\(requestedType.rawValue) force=\(force) query=\(debugDescription(for: query))"
+        )
+        if force, initialLoadTracker.isInFlight {
+            pendingForcedLoadTrigger = trigger
+            debugRecruitScreen("queuedLoad trigger=\(trigger.rawValue) currentPostType=\(requestedType.rawValue)")
+            return
+        }
+        guard initialLoadTracker.begin(force: force, trigger: trigger.rawValue) else { return }
         var didSucceed = false
-        defer { initialLoadTracker.finish(success: didSucceed) }
-        state = .loading
+        defer {
+            initialLoadTracker.finish(success: didSucceed)
+            if let pendingForcedLoadTrigger {
+                self.pendingForcedLoadTrigger = nil
+                Task { await self.load(force: true, trigger: pendingForcedLoadTrigger) }
+            }
+        }
+        if force, let current = state.value {
+            state = .refreshing(current)
+        } else {
+            state = .loading
+        }
         do {
             let posts: [RecruitPost]
             if session.isGuest {
-                posts = try await session.container.recruitingRepository.listPublic(type: selectedType, status: .open)
+                posts = try await session.container.recruitingRepository.listPublic(query: query)
             } else {
-                posts = try await session.container.recruitingRepository.list(type: selectedType, status: .open)
+                posts = try await session.container.recruitingRepository.list(query: query)
             }
-            let snapshot = RecruitBoardSnapshot(selectedType: selectedType, posts: posts)
-            state = posts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(snapshot)
+            let groupMetadata = await resolveGroupMetadata(for: posts)
+            let filteredPosts = applyClientSideFilters(
+                posts,
+                query: query,
+                groupRegionsByID: groupMetadata.groupRegionsByID
+            )
+            guard requestedType == selectedType, requestedFilterState == filterState else {
+                debugRecruitScreen(
+                    "discardLoadResult requestedPostType=\(requestedType.rawValue) currentPostType=\(selectedType.rawValue) trigger=\(trigger.rawValue)"
+                )
+                return
+            }
+            let snapshot = RecruitBoardSnapshot(
+                selectedType: requestedType,
+                filterState: requestedFilterState,
+                posts: filteredPosts,
+                groupNamesByID: groupMetadata.groupNamesByID,
+                groupRegionsByID: groupMetadata.groupRegionsByID
+            )
+            state = filteredPosts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(snapshot)
+            lastLoadedQuery = query
             didSucceed = true
         } catch let error as UserFacingError {
             if session.isAuthenticated {
@@ -792,32 +1135,64 @@ final class RecruitBoardViewModel: ObservableObject {
     }
 
     func switchType(_ type: RecruitingPostType) async {
-        selectedType = type
-        session.container.localStore.setRecruitFilterType(type)
-        await load(force: true, trigger: "type_switch")
+        debugRecruitScreen("segment tap target=\(type.rawValue)")
+        guard updateSelectedTypeIfNeeded(type, reason: .userSelection) else { return }
+        await load(force: true, trigger: .selectedTypeChanged)
     }
 
-    func createPost(groupID: String, title: String, body: String, tags: [String], positions: [String]) async -> RecruitPostCreationFlowResult {
+    func applyFilters(_ nextFilterState: RecruitBoardFilterState, reason: RecruitBoardFilterChangeReason) async {
+        guard updateFilterStateIfNeeded(nextFilterState, reason: reason) else { return }
+        await load(force: true, trigger: .filtersChanged)
+    }
+
+    func resolveCreatePostGroupContext() -> String? {
+        guard let groupID = session.preferredGroupContextID(), session.hasValidGroupContext(groupID) else {
+            handleInvalidCreatePostGroupContext(message: createPostGroupContextErrorMessage())
+            return nil
+        }
+        return groupID
+    }
+
+    func validateCreatePostGroupContext(_ groupID: String?) -> String? {
+        guard let groupID, session.hasValidGroupContext(groupID) else {
+            handleInvalidCreatePostGroupContext(message: createPostGroupContextErrorMessage())
+            return nil
+        }
+        return groupID
+    }
+
+    func createPost(groupID: String, title: String, body: String, tags: [String], scheduledAt: Date?, positions: [String]) async -> RecruitPostCreationFlowResult {
+        guard session.hasValidGroupContext(groupID) else {
+            let message = createPostGroupContextErrorMessage()
+            handleInvalidCreatePostGroupContext(message: message)
+            return .invalidGroupContext(message)
+        }
+
         actionState = .inProgress("모집글을 등록하는 중입니다")
         debugCreateRecruitingPost("request POST /recruiting-posts groupId=\(groupID)")
+        let requestedType = selectedType
         do {
             let post = try await session.container.recruitingRepository.create(
                 groupID: groupID,
-                type: selectedType,
+                type: requestedType,
                 title: title,
                 body: body.isEmpty ? nil : body,
                 tags: tags,
-                scheduledAt: nil,
+                scheduledAt: scheduledAt,
                 requiredPositions: positions
             )
             session.container.localStore.appendNotification(title: "모집글 등록", body: "\(post.title) 글이 등록되었습니다.", symbol: "megaphone.fill")
             actionState = .success("모집글이 등록되었습니다")
-            await load(force: true, trigger: "post_created_refresh")
-            debugCreateRecruitingPost("response success postId=\(post.id)")
-            return .success
+            debugCreateRecruitingPost("response success postId=\(post.id) postType=\(post.postType.rawValue)")
+            return .success(post)
         } catch let error as UserFacingError {
             debugCreateRecruitingPost("response failure: \(error.message)")
             actionState = .idle
+            if error.isGroupNotFoundResource {
+                session.markGroupContextDeleted(groupID)
+                handleInvalidCreatePostGroupContext(message: error.message)
+                return .invalidGroupContext(error.message)
+            }
             if error.requiresAuthentication {
                 session.requireReauthentication(for: .recruitingWrite)
                 return .requiresAuthentication
@@ -830,16 +1205,261 @@ final class RecruitBoardViewModel: ObservableObject {
         }
     }
 
+    func handleCreateSuccess(_ post: RecruitPost) {
+        debugRecruitScreen("createSuccess postId=\(post.id) postType=\(post.postType.rawValue)")
+        _ = updateSelectedTypeIfNeeded(post.postType, reason: .createSuccess)
+        guard filterState.isDefault else { return }
+        let existingPosts = currentPosts(for: post.postType)
+        let mergedPosts = [post] + existingPosts.filter { $0.id != post.id }
+        let existingSnapshot = currentSnapshot(for: post.postType)
+        var groupNamesByID = existingSnapshot?.groupNamesByID ?? [:]
+        if let groupName = session.container.localStore.groupName(for: post.groupID) {
+            groupNamesByID[post.groupID] = groupName
+        }
+        state = .content(
+            RecruitBoardSnapshot(
+                selectedType: post.postType,
+                filterState: filterState,
+                posts: mergedPosts,
+                groupNamesByID: groupNamesByID,
+                groupRegionsByID: existingSnapshot?.groupRegionsByID ?? [:]
+            )
+        )
+    }
+
+    func handleUpdateSuccess(_ post: RecruitPost) {
+        debugRecruitScreen("updateSuccess postId=\(post.id) postType=\(post.postType.rawValue)")
+        actionState = .success("모집글이 수정되었습니다")
+
+        guard selectedType == post.postType, let snapshot = currentSnapshot(for: selectedType) else { return }
+        let updatedPosts = snapshot.posts.map { existingPost in
+            existingPost.id == post.id ? post : existingPost
+        }
+        let updatedSnapshot = RecruitBoardSnapshot(
+            selectedType: snapshot.selectedType,
+            filterState: snapshot.filterState,
+            posts: updatedPosts,
+            groupNamesByID: snapshot.groupNamesByID,
+            groupRegionsByID: snapshot.groupRegionsByID
+        )
+        state = updatedPosts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(updatedSnapshot)
+        Task { await load(force: true, trigger: .postUpdated) }
+    }
+
+    func handleDeleteSuccess(_ post: RecruitPost) {
+        debugRecruitScreen("deleteSuccess postId=\(post.id) postType=\(post.postType.rawValue)")
+        actionState = .success("모집글이 삭제되었습니다")
+
+        guard selectedType == post.postType, let snapshot = currentSnapshot(for: selectedType) else { return }
+
+        let remainingPosts = snapshot.posts.filter { $0.id != post.id }
+        state = remainingPosts.isEmpty
+            ? .empty("현재 조건에 맞는 모집글이 없습니다.")
+            : .content(
+                RecruitBoardSnapshot(
+                    selectedType: selectedType,
+                    filterState: filterState,
+                    posts: remainingPosts,
+                    groupNamesByID: snapshot.groupNamesByID,
+                    groupRegionsByID: snapshot.groupRegionsByID
+                )
+            )
+
+        Task { await load(force: true, trigger: .postDeleted) }
+    }
+
     func reset() {
         state = .initial
         actionState = .idle
-        selectedType = session.container.localStore.recruitFilterType
+        syncSelectedTypeFromStoredPreference(reason: .reset)
+        filterState = .defaultValue
         initialLoadTracker.reset()
+        pendingForcedLoadTrigger = nil
+        lastLoadedQuery = nil
     }
 
     private func debugCreateRecruitingPost(_ message: String) {
         #if DEBUG
         print("[CreateRecruitingPost] \(message)")
+        #endif
+    }
+
+    private func updateSelectedTypeIfNeeded(
+        _ type: RecruitingPostType,
+        reason: RecruitBoardSelectedTypeChangeReason,
+        persist: Bool = true
+    ) -> Bool {
+        let oldValue = selectedType
+        guard oldValue != type else {
+            debugRecruitScreen("ignored duplicate selectedPostType=\(type.rawValue) reason=\(reason.rawValue)")
+            return false
+        }
+        selectedType = type
+        if persist {
+            session.container.localStore.setRecruitFilterType(type)
+        }
+        debugRecruitScreen("selectedPostType changed \(oldValue.rawValue) -> \(type.rawValue) reason=\(reason.rawValue)")
+        return true
+    }
+
+    private func updateFilterStateIfNeeded(
+        _ nextFilterState: RecruitBoardFilterState,
+        reason: RecruitBoardFilterChangeReason
+    ) -> Bool {
+        guard filterState != nextFilterState else {
+            debugRecruitScreen("ignored duplicate filters reason=\(reason.rawValue) query=\(debugDescription(for: buildListQuery(for: selectedType, filters: nextFilterState)))")
+            return false
+        }
+        filterState = nextFilterState
+        let query = buildListQuery(for: selectedType, filters: nextFilterState)
+        debugRecruitScreen("filter changed reason=\(reason.rawValue) query=\(debugDescription(for: query))")
+        return true
+    }
+
+    private func syncSelectedTypeFromStoredPreference(reason: RecruitBoardSelectedTypeChangeReason) {
+        let storedType = session.container.localStore.recruitFilterType
+        if selectedType == storedType {
+            return
+        }
+        let oldValue = selectedType
+        selectedType = storedType
+        debugRecruitScreen("selectedPostType changed \(oldValue.rawValue) -> \(storedType.rawValue) reason=\(reason.rawValue)")
+    }
+
+    private func currentPosts(for type: RecruitingPostType) -> [RecruitPost] {
+        guard let snapshot = currentSnapshot(for: type) else { return [] }
+        return snapshot.posts
+    }
+
+    private func currentSnapshot(for type: RecruitingPostType) -> RecruitBoardSnapshot? {
+        guard let snapshot = state.value, snapshot.selectedType == type else { return nil }
+        return snapshot
+    }
+
+    private func buildListQuery(for type: RecruitingPostType, filters: RecruitBoardFilterState) -> RecruitPostListQuery {
+        let calendar = Calendar.current
+        let sortedPositions = filters.selectedPositions.sorted()
+        let sortedRegions = filters.selectedRegions.sorted()
+        let sortedTags = filters.selectedTags.sorted()
+        let dateFilter = filters.selectedDateFilter
+
+        let scheduledFrom: Date?
+        let scheduledTo: Date?
+        switch dateFilter.preset {
+        case .all:
+            scheduledFrom = nil
+            scheduledTo = nil
+        case .today:
+            scheduledFrom = calendar.startOfDay(for: Date())
+            scheduledTo = calendar.date(byAdding: DateComponents(day: 1, second: -1), to: scheduledFrom!)
+        case .thisWeek:
+            let interval = calendar.dateInterval(of: .weekOfYear, for: Date())
+            scheduledFrom = interval?.start
+            scheduledTo = interval?.end.addingTimeInterval(-1)
+        case .specificDate:
+            let startOfDay = calendar.startOfDay(for: dateFilter.selectedDate)
+            scheduledFrom = startOfDay
+            scheduledTo = calendar.date(byAdding: DateComponents(day: 1, second: -1), to: startOfDay)
+        }
+
+        return RecruitPostListQuery(
+            postType: type,
+            status: .open,
+            scheduledFrom: scheduledFrom,
+            scheduledTo: scheduledTo,
+            requiredPositions: sortedPositions,
+            regions: sortedRegions,
+            tags: sortedTags,
+            includeUnscheduledPosts: dateFilter.includesUnscheduledPosts
+        )
+    }
+
+    private func resolveGroupMetadata(for posts: [RecruitPost]) async -> (groupNamesByID: [String: String], groupRegionsByID: [String: String]) {
+        let uniqueGroupIDs = Array(Set(posts.map(\.groupID)))
+        var groupNamesByID: [String: String] = [:]
+        var groupRegionsByID: [String: String] = [:]
+
+        for groupID in uniqueGroupIDs {
+            if let cachedGroupName = session.container.localStore.groupName(for: groupID) {
+                groupNamesByID[groupID] = cachedGroupName
+            }
+        }
+
+        guard session.isAuthenticated, !uniqueGroupIDs.isEmpty else {
+            return (groupNamesByID, groupRegionsByID)
+        }
+
+        if let groups = try? await session.container.groupRepository.details(groupIDs: uniqueGroupIDs) {
+            for group in groups {
+                groupNamesByID[group.id] = group.name
+                if let region = extractRegion(from: group.tags) {
+                    groupRegionsByID[group.id] = region
+                }
+            }
+        }
+
+        return (groupNamesByID, groupRegionsByID)
+    }
+
+    private func applyClientSideFilters(
+        _ posts: [RecruitPost],
+        query: RecruitPostListQuery,
+        groupRegionsByID: [String: String]
+    ) -> [RecruitPost] {
+        posts.filter { post in
+            if !query.requiredPositions.isEmpty && Set(post.requiredPositions).intersection(query.requiredPositions).isEmpty {
+                return false
+            }
+            if !query.tags.isEmpty && Set(post.tags).intersection(query.tags).isEmpty {
+                return false
+            }
+            if !query.regions.isEmpty {
+                guard let region = groupRegionsByID[post.groupID], query.regions.contains(region) else {
+                    return false
+                }
+            }
+            if query.scheduledFrom != nil || query.scheduledTo != nil {
+                guard let scheduledAt = post.scheduledAt else {
+                    return query.includeUnscheduledPosts
+                }
+                if let scheduledFrom = query.scheduledFrom, scheduledAt < scheduledFrom {
+                    return false
+                }
+                if let scheduledTo = query.scheduledTo, scheduledAt > scheduledTo {
+                    return false
+                }
+            }
+            return true
+        }
+    }
+
+    private func extractRegion(from tags: [String]) -> String? {
+        tags.first(where: { RecruitOptionCatalog.regions.contains($0) })
+    }
+
+    private func debugDescription(for query: RecruitPostListQuery) -> String {
+        let positions = query.requiredPositions.isEmpty ? "-" : query.requiredPositions.joined(separator: ",")
+        let regions = query.regions.isEmpty ? "-" : query.regions.joined(separator: ",")
+        let tags = query.tags.isEmpty ? "-" : query.tags.joined(separator: ",")
+        let scheduledFrom = query.scheduledFrom?.shortDateText ?? "-"
+        let scheduledTo = query.scheduledTo?.shortDateText ?? "-"
+        return "type=\(query.postType?.rawValue ?? "-") positions=\(positions) regions=\(regions) tags=\(tags) scheduledFrom=\(scheduledFrom) scheduledTo=\(scheduledTo) includeUnscheduled=\(query.includeUnscheduledPosts)"
+    }
+
+    private func handleInvalidCreatePostGroupContext(message: String) {
+        debugCreateRecruitingPost("blocked because group context is invalid")
+        actionState = .failure(message)
+    }
+
+    private func createPostGroupContextErrorMessage() -> String {
+        session.container.localStore.storedGroupIDs.isEmpty
+            ? "모집글을 연결할 그룹이 없습니다. 먼저 그룹을 생성해주세요."
+            : "삭제되었거나 존재하지 않는 그룹입니다."
+    }
+
+    private func debugRecruitScreen(_ message: String) {
+        #if DEBUG
+        print("[RecruitScreen] \(message)")
         #endif
     }
 }
@@ -1786,10 +2406,20 @@ fileprivate final class PowerDetailViewModel: ObservableObject {
     @Published var state: ScreenLoadState<PowerDetailViewState> = .initial
 
     private let session: AppSessionViewModel
-    private let initialLoadTracker = InitialLoadTracker(screen: "power_detail")
+    private let targetUserID: String?
+    private let displayName: String
+    private let initialLoadTracker: InitialLoadTracker
 
-    init(session: AppSessionViewModel) {
+    init(
+        session: AppSessionViewModel,
+        targetUserID: String? = nil,
+        displayName: String? = nil
+    ) {
         self.session = session
+        self.targetUserID = targetUserID
+        let normalizedDisplayName = displayName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        self.displayName = normalizedDisplayName.isEmpty ? "멤버 프로필" : normalizedDisplayName
+        self.initialLoadTracker = InitialLoadTracker(screen: targetUserID == nil ? "power_detail" : "member_profile")
     }
 
     func load(force: Bool = false, trigger: String = "unknown") async {
@@ -1797,12 +2427,40 @@ fileprivate final class PowerDetailViewModel: ObservableObject {
         var didSucceed = false
         defer { initialLoadTracker.finish(success: didSucceed) }
 
-        guard let userID = session.currentUserID else {
-            state = .empty("로그인 후 파워 상세를 확인할 수 있어요.")
+        let isCurrentUser = targetUserID == nil || targetUserID == session.currentUserID
+        let resolvedUserID = targetUserID ?? session.currentUserID
+
+        guard let userID = resolvedUserID else {
+            state = .empty("로그인 후 \(displayName)을 확인할 수 있어요.")
+            didSucceed = true
             return
         }
 
         state = .loading
+
+        if !isCurrentUser {
+            #if DEBUG
+            print("[RouteFetch] fetch started screen=member_profile userID=\(userID)")
+            #endif
+            let power = try? await session.container.profileRepository.powerProfile(userID: userID)
+            let history = (try? await session.container.profileRepository.history(userID: userID, limit: 10)) ?? []
+            if power == nil && history.isEmpty {
+                state = .empty("\(displayName)의 공개 프로필 데이터가 아직 없습니다.")
+            } else {
+                state = .content(
+                    PowerViewStateBuilder.detail(
+                        power: power,
+                        history: history,
+                        hasLinkedRiotAccount: power != nil || !history.isEmpty
+                    )
+                )
+            }
+            #if DEBUG
+            print("[RouteFetch] fetch success screen=member_profile userID=\(userID) historyCount=\(history.count) hasPower=\(power != nil)")
+            #endif
+            didSucceed = true
+            return
+        }
 
         let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
         if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
@@ -1849,7 +2507,7 @@ fileprivate final class PowerDetailViewModel: ObservableObject {
     }
 }
 
-fileprivate struct HomeUpcomingMatchItem: Hashable, Identifiable {
+struct HomeUpcomingMatchItem: Hashable, Identifiable {
     let match: Match
     let groupName: String
 
@@ -1871,7 +2529,6 @@ fileprivate final class HomeUpcomingMatchesViewModel: ObservableObject {
         guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
         var didSucceed = false
         defer { initialLoadTracker.finish(success: didSucceed) }
-
         state = .loading
 
         let contexts = session.container.localStore.recentMatches
@@ -1921,16 +2578,35 @@ fileprivate final class HomeGroupsViewModel: ObservableObject {
         guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
         var didSucceed = false
         defer { initialLoadTracker.finish(success: didSucceed) }
-
         state = .loading
 
         do {
             let groups: [GroupSummary]
             if session.isGuest {
-                groups = try await session.container.groupRepository.listPublic()
+                groups = (try await session.container.groupRepository.listPublic()).filterPubliclyVisible()
             } else {
                 let trackedIDs = session.container.localStore.storedGroupIDs
-                groups = trackedIDs.isEmpty ? [] : try await session.container.groupRepository.details(groupIDs: trackedIDs)
+                var loadedGroups: [GroupSummary] = []
+                for id in trackedIDs {
+                    if session.isDeletedGroupContext(id) {
+                        session.markGroupContextDeleted(id)
+                        debugSkipDeletedGroupReload(groupID: id)
+                        continue
+                    }
+                    do {
+                        let group = try await session.container.groupRepository.detail(groupID: id)
+                        loadedGroups.append(group)
+                    } catch let error as UserFacingError {
+                        if error.requiresAuthentication {
+                            throw error
+                        }
+                        if error.isGroupNotFoundResource {
+                            session.markGroupContextDeleted(id)
+                            debugSkipDeletedGroupReload(groupID: id)
+                        }
+                    }
+                }
+                groups = loadedGroups.filterAccessible(knownMemberGroupIDs: Set(trackedIDs))
             }
 
             state = groups.isEmpty
@@ -1969,7 +2645,6 @@ fileprivate final class HomeRecentMatchesViewModel: ObservableObject {
         guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
         var didSucceed = false
         defer { initialLoadTracker.finish(success: didSucceed) }
-
         guard let userID = session.currentUserID else {
             state = .empty("로그인 후 최근 경기 전체 목록을 확인할 수 있어요.")
             didSucceed = true
@@ -1996,25 +2671,71 @@ fileprivate final class HomeRecentMatchesViewModel: ObservableObject {
 
 // MARK: - Restored Shell View Models
 
+enum GroupDetailLoadTrigger: String {
+    case screenAppear = "screen_appear"
+    case retry = "retry"
+    case memberInvited = "member_invited"
+    case groupUpdated = "group_updated"
+}
+
+private enum GroupDetailMutationErrorType: String {
+    case authRequired = "auth_required"
+    case forbidden = "forbidden"
+    case notFound = "not_found"
+    case conflict = "conflict"
+    case server = "server"
+    case other = "other"
+}
+
 @MainActor
 final class GroupDetailViewModel: ObservableObject {
     @Published var state: ScreenLoadState<GroupDetailSnapshot> = .initial
     @Published var actionState: AsyncActionState = .idle
 
     private let session: AppSessionViewModel
+    private var activeLoadToken = 0
+    private var isGroupContextActive = true
     let groupID: String
+
+    var isEditVisible: Bool {
+        guard let snapshot = state.value else { return false }
+        return canManage(snapshot)
+    }
+
+    var isDeleteVisible: Bool {
+        isEditVisible
+    }
+
+    var isMutationInFlight: Bool {
+        if case .inProgress = actionState {
+            return true
+        }
+        return false
+    }
 
     init(session: AppSessionViewModel, groupID: String) {
         self.session = session
         self.groupID = groupID
     }
 
-    func load(force: Bool = false) async {
+    func load(force: Bool = false, trigger: GroupDetailLoadTrigger = .screenAppear) async {
+        guard canUseGroupContextForRequests(trigger: trigger) else { return }
         if !force, case .content = state { return }
-        state = .loading
+        let loadToken = beginLoad()
+        debugGroupDetail("load trigger=\(trigger.rawValue) groupId=\(groupID)")
+        #if DEBUG
+        print("[RouteFetch] fetch started screen=group_detail groupID=\(groupID)")
+        #endif
+        if force, let current = state.value {
+            state = .refreshing(current)
+        } else {
+            state = .loading
+        }
         do {
             let group = try await session.container.groupRepository.detail(groupID: groupID)
+            guard isCurrentLoad(loadToken) else { return }
             let members = try await session.container.groupRepository.members(groupID: groupID)
+            guard isCurrentLoad(loadToken) else { return }
             let latestHistory: [MatchHistoryItem]?
             if let userID = session.currentUserID {
                 latestHistory = try? await session.container.profileRepository.history(
@@ -2025,17 +2746,35 @@ final class GroupDetailViewModel: ObservableObject {
             } else {
                 latestHistory = nil
             }
+            guard isCurrentLoad(loadToken) else { return }
             let powerProfiles = await loadPowerProfiles(for: members.map(\.userID))
-            state = .content(
-                GroupDetailSnapshot(
-                    group: group,
-                    members: members,
-                    latestMatch: latestHistory?.first,
-                    powerProfiles: powerProfiles
-                )
+            guard isCurrentLoad(loadToken) else { return }
+            let snapshot = GroupDetailSnapshot(
+                group: group,
+                members: members,
+                latestMatch: latestHistory?.first,
+                powerProfiles: powerProfiles
             )
-            session.container.localStore.trackGroup(id: groupID)
+            state = .content(snapshot)
+            if isCurrentUserMember(of: group, members: members) {
+                session.container.localStore.trackGroup(id: groupID, name: group.name)
+            } else {
+                session.container.localStore.removeGroup(id: groupID)
+            }
+            logManagementVisibility(for: snapshot)
+            #if DEBUG
+            print("[RouteFetch] fetch success screen=group_detail groupID=\(groupID) source=live members=\(members.count)")
+            #endif
         } catch let error as UserFacingError {
+            guard isCurrentLoad(loadToken) else { return }
+            #if DEBUG
+            print("[RouteFetch] fetch failure screen=group_detail groupID=\(groupID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+            #endif
+            if error.isGroupNotFoundResource {
+                clearActiveGroupContext()
+                state = .error(error)
+                return
+            }
             session.handleProtectedLoadError(
                 error,
                 requirement: .groupManagement,
@@ -2043,11 +2782,16 @@ final class GroupDetailViewModel: ObservableObject {
                 fallbackMessage: "로그인 후 그룹 상세를 다시 확인할 수 있어요."
             )
         } catch {
+            guard isCurrentLoad(loadToken) else { return }
+            #if DEBUG
+            print("[RouteFetch] fetch failure screen=group_detail groupID=\(groupID) source=live status=nil message=\(error.localizedDescription)")
+            #endif
             state = .error(UserFacingError(title: "그룹 상세 로딩 실패", message: "그룹 정보를 불러오지 못했습니다."))
         }
     }
 
     func createMatch() async -> Match? {
+        guard ensureActiveGroupContextForMutation() else { return nil }
         actionState = .inProgress("내전 로비를 생성하는 중입니다")
         do {
             let match = try await session.container.matchRepository.create(groupID: groupID, title: "내전 로비")
@@ -2068,17 +2812,227 @@ final class GroupDetailViewModel: ObservableObject {
         }
     }
 
+    func updateGroup(
+        name: String,
+        description: String,
+        visibility: GroupVisibility,
+        joinPolicy: JoinPolicy,
+        tags: [String]
+    ) async -> GroupSummary? {
+        guard ensureActiveGroupContextForMutation() else { return nil }
+        guard let snapshot = state.value, canManage(snapshot) else {
+            actionState = .failure("방장 또는 운영진만 내전 방을 수정할 수 있습니다.")
+            return nil
+        }
+
+        actionState = .inProgress("내전 방 정보를 저장하는 중입니다")
+        debugGroupDetail("request PATCH /groups/\(groupID)")
+
+        do {
+            let updatedGroup = try await session.container.groupRepository.update(
+                groupID: groupID,
+                name: name,
+                description: description.isEmpty ? nil : description,
+                visibility: visibility,
+                joinPolicy: joinPolicy,
+                tags: tags
+            )
+            let updatedSnapshot = GroupDetailSnapshot(
+                group: updatedGroup,
+                members: snapshot.members,
+                latestMatch: snapshot.latestMatch,
+                powerProfiles: snapshot.powerProfiles
+            )
+            state = .content(updatedSnapshot)
+            session.container.localStore.trackGroup(id: updatedGroup.id, name: updatedGroup.name)
+            actionState = .success("내전 방 정보가 수정되었습니다")
+            logManagementVisibility(for: updatedSnapshot)
+            return updatedGroup
+        } catch let error as UserFacingError {
+            let errorType = mutationErrorType(for: error)
+            debugGroupDetail(
+                "response failure endpoint=/groups/\(groupID) groupId=\(groupID) responseCode=\(error.statusCode.map(String.init) ?? "nil") mappedErrorType=\(errorType.rawValue)"
+            )
+            if errorType == .notFound {
+                debugGroupDetail("endpoint_missing_possible endpoint=/groups/\(groupID) groupId=\(groupID)")
+            }
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .groupManagement)
+                return nil
+            }
+            actionState = .failure(message(for: errorType, operation: "update", error: error))
+            return nil
+        } catch {
+            debugGroupDetail("response failure endpoint=/groups/\(groupID) groupId=\(groupID) responseCode=nil mappedErrorType=\(GroupDetailMutationErrorType.other.rawValue)")
+            actionState = .failure("내전 방 수정에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            return nil
+        }
+    }
+
+    func deleteGroup() async -> String? {
+        guard ensureActiveGroupContextForMutation() else { return nil }
+        guard let snapshot = state.value, canManage(snapshot) else {
+            actionState = .failure("방장 또는 운영진만 내전 방을 삭제할 수 있습니다.")
+            return nil
+        }
+        guard !isMutationInFlight else { return nil }
+
+        actionState = .inProgress("내전 방을 삭제하는 중입니다")
+        debugGroupDetail("request DELETE /groups/\(groupID)")
+
+        do {
+            try await session.container.groupRepository.delete(groupID: groupID)
+            debugGroupDetail("delete success groupId=\(groupID)")
+            clearActiveGroupContext()
+            actionState = .success("내전 방이 삭제되었습니다")
+            return groupID
+        } catch let error as UserFacingError {
+            let errorType = mutationErrorType(for: error)
+            debugGroupDetail(
+                "response failure endpoint=/groups/\(groupID) groupId=\(groupID) responseCode=\(error.statusCode.map(String.init) ?? "nil") mappedErrorType=\(errorType.rawValue)"
+            )
+            if errorType == .notFound {
+                debugGroupDetail("endpoint_missing_possible endpoint=/groups/\(groupID) groupId=\(groupID)")
+            }
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .groupManagement)
+                return nil
+            }
+            actionState = .failure(message(for: errorType, operation: "delete", error: error))
+            return nil
+        } catch {
+            debugGroupDetail("response failure endpoint=/groups/\(groupID) groupId=\(groupID) responseCode=nil mappedErrorType=\(GroupDetailMutationErrorType.other.rawValue)")
+            actionState = .failure("내전 방 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            return nil
+        }
+    }
+
     func inviteMember(userID: String) async {
+        guard ensureActiveGroupContextForMutation() else { return }
         actionState = .inProgress("멤버를 초대하는 중입니다")
         do {
             _ = try await session.container.groupRepository.addMember(groupID: groupID, userID: userID)
             actionState = .success("멤버가 추가되었습니다")
-            await load(force: true)
+            await load(force: true, trigger: .memberInvited)
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .groupManagement, actionState: &actionState)
         } catch {
             actionState = .failure("멤버 추가에 실패했습니다")
         }
+    }
+
+    private func canManage(_ snapshot: GroupDetailSnapshot) -> Bool {
+        guard let currentUserID = session.currentUserID else { return false }
+        if snapshot.group.ownerUserID == currentUserID {
+            return true
+        }
+        guard let currentMember = snapshot.members.first(where: { $0.userID == currentUserID }) else {
+            return false
+        }
+        return currentMember.role == .owner || currentMember.role == .admin
+    }
+
+    private func isCurrentUserMember(of group: GroupSummary, members: [GroupMember]) -> Bool {
+        guard let currentUserID = session.currentUserID else { return false }
+        if group.ownerUserID == currentUserID {
+            return true
+        }
+        return members.contains { $0.userID == currentUserID }
+    }
+
+    private func logManagementVisibility(for snapshot: GroupDetailSnapshot) {
+        let canEdit = canManage(snapshot)
+        debugGroupDetail("edit visible canEdit=\(canEdit)")
+        debugGroupDetail("delete visible canDelete=\(canEdit)")
+    }
+
+    private func mutationErrorType(for error: UserFacingError) -> GroupDetailMutationErrorType {
+        if error.requiresAuthentication {
+            return .authRequired
+        }
+        switch error.statusCode {
+        case 403:
+            return .forbidden
+        case 404:
+            return .notFound
+        case 409:
+            return .conflict
+        case let statusCode? where statusCode >= 500:
+            return .server
+        default:
+            return .other
+        }
+    }
+
+    private func message(for errorType: GroupDetailMutationErrorType, operation: String, error: UserFacingError) -> String {
+        if error.isGroupNotFoundResource {
+            return error.message
+        }
+
+        switch (operation, errorType) {
+        case ("update", .forbidden):
+            return "방장 또는 운영진만 내전 방을 수정할 수 있습니다."
+        case ("update", .notFound):
+            return "수정할 내전 방을 찾을 수 없거나 서버에서 수정 기능을 아직 지원하지 않습니다."
+        case ("update", .conflict):
+            return "현재 방 상태에서는 수정할 수 없습니다. 잠시 후 다시 시도해 주세요."
+        case ("update", .server), ("update", .other):
+            return "내전 방 수정에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        case ("delete", .forbidden):
+            return "방장 또는 운영진만 내전 방을 삭제할 수 있습니다."
+        case ("delete", .notFound):
+            return "이미 삭제되었거나 서버에서 삭제 기능을 아직 지원하지 않습니다."
+        case ("delete", .conflict):
+            return "진행 중인 상태 때문에 내전 방을 삭제할 수 없습니다."
+        case ("delete", .server), ("delete", .other):
+            return "내전 방 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        case (_, .authRequired):
+            return "로그인이 필요합니다."
+        default:
+            return "요청 처리에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        }
+    }
+
+    private func canUseGroupContextForRequests(trigger: GroupDetailLoadTrigger) -> Bool {
+        guard isGroupContextActive, !session.isDeletedGroupContext(groupID) else {
+            debugSkipDeletedGroupReload(groupID: groupID)
+            debugGroupDetail("load skipped trigger=\(trigger.rawValue) groupId=\(groupID)")
+            return false
+        }
+        return true
+    }
+
+    private func beginLoad() -> Int {
+        activeLoadToken += 1
+        return activeLoadToken
+    }
+
+    private func isCurrentLoad(_ loadToken: Int) -> Bool {
+        loadToken == activeLoadToken && isGroupContextActive && !session.isDeletedGroupContext(groupID)
+    }
+
+    private func ensureActiveGroupContextForMutation() -> Bool {
+        guard isGroupContextActive, !session.isDeletedGroupContext(groupID) else {
+            actionState = .failure("삭제되었거나 존재하지 않는 그룹입니다.")
+            return false
+        }
+        return true
+    }
+
+    private func clearActiveGroupContext() {
+        guard isGroupContextActive || !session.isDeletedGroupContext(groupID) else { return }
+        isGroupContextActive = false
+        session.markGroupContextDeleted(groupID)
+        debugGroupDetail("clear active group context groupId=\(groupID)")
+        cancelStaleRequests()
+        state = .empty("삭제된 그룹입니다.")
+    }
+
+    private func cancelStaleRequests() {
+        activeLoadToken += 1
+        debugGroupDetail("cancel stale requests groupId=\(groupID)")
     }
 
     private func loadPowerProfiles(for userIDs: [String]) async -> [String: PowerProfile] {
@@ -2089,6 +3043,12 @@ final class GroupDetailViewModel: ObservableObject {
             }
         }
         return profiles
+    }
+
+    private func debugGroupDetail(_ message: String) {
+        #if DEBUG
+        print("[GroupDetail] \(message)")
+        #endif
     }
 }
 
@@ -2107,13 +3067,22 @@ final class MatchDetailViewModel: ObservableObject {
 
     func load(force: Bool = false) async {
         if !force, case .content = state { return }
+        #if DEBUG
+        print("[RouteFetch] fetch started screen=match_detail matchID=\(matchID)")
+        #endif
         state = .loading
         do {
             let match = try await session.container.matchRepository.detail(matchID: matchID)
             let result = try? await session.container.matchRepository.result(matchID: matchID)
             let cache = session.container.localStore.cachedResults[matchID]
             state = .content(MatchDetailSnapshot(match: match, result: result, cachedMetadata: cache))
+            #if DEBUG
+            print("[RouteFetch] fetch success screen=match_detail matchID=\(matchID) source=live")
+            #endif
         } catch let error as UserFacingError {
+            #if DEBUG
+            print("[RouteFetch] fetch failure screen=match_detail matchID=\(matchID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+            #endif
             session.handleProtectedLoadError(
                 error,
                 requirement: .resultSave,
@@ -2121,16 +3090,28 @@ final class MatchDetailViewModel: ObservableObject {
                 fallbackMessage: "로그인 후 경기 상세를 다시 확인할 수 있어요."
             )
         } catch {
+            #if DEBUG
+            print("[RouteFetch] fetch failure screen=match_detail matchID=\(matchID) source=live status=nil message=\(error.localizedDescription)")
+            #endif
             state = .error(UserFacingError(title: "경기 상세 로딩 실패", message: "경기 상세를 불러오지 못했습니다."))
         }
     }
 
     func rematch() async -> Match? {
         guard let snapshot = state.value else { return nil }
+        guard snapshot.match.players.isEmpty == false else {
+            actionState = .failure("재매칭할 참가자 정보가 없습니다.")
+            return nil
+        }
         actionState = .inProgress("같은 인원으로 재매칭을 준비하는 중입니다")
         do {
-            let newMatch = try await session.container.matchRepository.create(groupID: snapshot.match.groupID, title: "재매칭")
-            _ = try await session.container.matchRepository.addPlayers(
+            let repository = session.container.matchRepository
+            let localStore = session.container.localStore
+            let preferredMode = snapshot.match.balanceMode ?? .balanced
+            let originalSignature = currentCompositionSignature(for: snapshot.match)
+
+            let newMatch = try await repository.create(groupID: snapshot.match.groupID, title: "재매칭")
+            _ = try await repository.addPlayers(
                 matchID: newMatch.id,
                 players: snapshot.match.players.map {
                     MatchPlayerInputDTO(
@@ -2143,7 +3124,30 @@ final class MatchDetailViewModel: ObservableObject {
                     )
                 }
             )
-            actionState = .success("재매칭 로비를 생성했습니다")
+
+            let lockedMatch = try await repository.lock(matchID: newMatch.id)
+            _ = try await repository.autoBalance(matchID: newMatch.id, mode: preferredMode)
+            _ = try await ensureDifferentCandidateIfNeeded(
+                repository: repository,
+                matchID: newMatch.id,
+                preferredMode: preferredMode,
+                originalSignature: originalSignature
+            )
+
+            localStore.trackMatch(
+                RecentMatchContext(
+                    matchID: newMatch.id,
+                    groupID: newMatch.groupID,
+                    groupName: groupName(for: newMatch.groupID),
+                    createdAt: lockedMatch.scheduledAt ?? Date()
+                )
+            )
+            localStore.appendNotification(
+                title: "재매칭 생성",
+                body: "같은 인원으로 새 추천 조합을 생성했습니다.",
+                symbol: "arrow.triangle.2.circlepath"
+            )
+            actionState = .success("새 추천 조합을 생성했습니다")
             return newMatch
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
@@ -2152,6 +3156,119 @@ final class MatchDetailViewModel: ObservableObject {
             actionState = .failure("재매칭 생성에 실패했습니다")
             return nil
         }
+    }
+
+    func groupName(for groupID: String) -> String {
+        if let name = session.container.localStore.groupName(for: groupID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !name.isEmpty {
+            return name
+        }
+
+        if let recentGroupName = session.container.localStore.recentMatches
+            .first(where: { $0.groupID == groupID })?
+            .groupName
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !recentGroupName.isEmpty {
+            return recentGroupName
+        }
+
+        return "내전"
+    }
+
+    private func ensureDifferentCandidateIfNeeded(
+        repository: MatchRepository,
+        matchID: String,
+        preferredMode: BalanceMode,
+        originalSignature: String?
+    ) async throws -> Match {
+        guard let originalSignature else {
+            return try await repository.detail(matchID: matchID)
+        }
+
+        var refreshedMatch = try await repository.detail(matchID: matchID)
+        var excludedCandidateIDs: Set<String> = []
+
+        for _ in 0..<3 {
+            if let candidate = preferredCandidate(in: refreshedMatch, mode: preferredMode) {
+                if candidateSignature(candidate) != originalSignature {
+                    return refreshedMatch
+                }
+                excludedCandidateIDs.insert(candidate.candidateID)
+            } else {
+                return refreshedMatch
+            }
+
+            _ = try await repository.reroll(
+                matchID: matchID,
+                mode: preferredMode,
+                excludeCandidateIDs: Array(excludedCandidateIDs)
+            )
+            refreshedMatch = try await repository.detail(matchID: matchID)
+        }
+
+        return refreshedMatch
+    }
+
+    private func preferredCandidate(in match: Match, mode: BalanceMode) -> MatchCandidate? {
+        if let selectedCandidateNo = match.selectedCandidateNo,
+           let selectedCandidate = match.candidates.first(where: { $0.candidateNo == selectedCandidateNo }) {
+            return selectedCandidate
+        }
+        return match.candidates.first(where: { $0.type == mode }) ?? match.candidates.first
+    }
+
+    private func currentCompositionSignature(for match: Match) -> String? {
+        let assignedPlayers = match.players.compactMap { player -> CandidatePlayer? in
+            guard let teamSide = player.teamSide, let assignedRole = player.assignedRole else { return nil }
+            return CandidatePlayer(
+                userID: player.userID,
+                nickname: player.nickname,
+                teamSide: teamSide,
+                assignedRole: assignedRole,
+                rolePower: 0,
+                isOffRole: false
+            )
+        }
+
+        guard assignedPlayers.count == match.players.count else { return nil }
+        let blueTeam = assignedPlayers.filter { $0.teamSide == .blue }
+        let redTeam = assignedPlayers.filter { $0.teamSide == .red }
+        guard blueTeam.isEmpty == false, redTeam.isEmpty == false else { return nil }
+
+        let candidate = MatchCandidate(
+            candidateID: "current-match",
+            candidateNo: 0,
+            type: match.balanceMode ?? .balanced,
+            score: 0,
+            metrics: CandidateMetrics(
+                teamPowerGap: 0,
+                laneMatchupGap: 0,
+                offRolePenalty: 0,
+                repeatTeamPenalty: 0,
+                preferenceViolationPenalty: 0,
+                volatilityClusterPenalty: 0
+            ),
+            teamAPower: 0,
+            teamBPower: 0,
+            offRoleCount: 0,
+            explanationTags: [],
+            teamA: blueTeam,
+            teamB: redTeam
+        )
+        return candidateSignature(candidate)
+    }
+
+    private func candidateSignature(_ candidate: MatchCandidate) -> String {
+        let blueSignature = candidate.teamA
+            .sorted { $0.assignedRole.rawValue < $1.assignedRole.rawValue }
+            .map { "\($0.userID):\($0.assignedRole.rawValue)" }
+            .joined(separator: "|")
+        let redSignature = candidate.teamB
+            .sorted { $0.assignedRole.rawValue < $1.assignedRole.rawValue }
+            .map { "\($0.userID):\($0.assignedRole.rawValue)" }
+            .joined(separator: "|")
+        return "\(candidate.type.rawValue)#blue[\(blueSignature)]#red[\(redSignature)]"
     }
 }
 
@@ -2408,49 +3525,468 @@ final class RiotAccountsViewModel: ObservableObject {
 
 @MainActor
 final class RecruitDetailViewModel: ObservableObject {
-    @Published var state: ScreenLoadState<RecruitPost> = .initial
+    @Published var state: ScreenLoadState<RecruitDetailViewState> = .initial
     @Published var actionState: AsyncActionState = .idle
+    @Published private(set) var applyCapability: RecruitApplyCapability = .unknown
 
     private let session: AppSessionViewModel
     let postID: String
+    private var loadedPost: RecruitPost?
+
+    var isEditVisible: Bool {
+        state.value?.isOwner ?? false
+    }
+
+    var isDeleteVisible: Bool {
+        state.value?.isOwner ?? false
+    }
+
+    var isMutationInFlight: Bool {
+        if case .inProgress = actionState {
+            return true
+        }
+        return false
+    }
+
+    var isDeleteInFlight: Bool {
+        isMutationInFlight
+    }
+
+    var isApplyButtonEnabled: Bool {
+        guard let loadedPost else { return false }
+        guard loadedPost.status == .open else { return false }
+        if case .inProgress = actionState {
+            return false
+        }
+        if case .unavailable = applyCapability {
+            return false
+        }
+        return true
+    }
+
+    var applyCapabilityNote: String? {
+        applyCapability.note
+    }
+
+    var isCreateMatchButtonEnabled: Bool {
+        guard let loadedPost else { return false }
+        guard loadedPost.status == .open else { return false }
+        if case .inProgress = actionState {
+            return false
+        }
+        return true
+    }
 
     init(session: AppSessionViewModel, postID: String) {
         self.session = session
         self.postID = postID
     }
 
-    func load(force: Bool = false) async {
+    func load(force: Bool = false, trigger: RecruitDetailLoadTrigger = .screenAppear) async {
         if !force, case .content = state { return }
-        state = .loading
+        debugRecruitDetail("requested postId=\(postID) trigger=\(trigger.rawValue)")
+        #if DEBUG
+        print("[RouteFetch] fetch started screen=recruit_detail postID=\(postID)")
+        #endif
+        if force, let current = state.value {
+            state = .refreshing(current)
+        } else {
+            state = .loading
+        }
         do {
             let post = try await session.container.recruitingRepository.detail(postID: postID)
-            state = .content(post)
+            loadedPost = post
+            applyCapability = .unknown
+            let viewState = await buildViewState(from: post)
+            debugRecruitDetail("response status=200")
+            state = .content(viewState)
+            #if DEBUG
+            print("[RouteFetch] fetch success screen=recruit_detail postID=\(postID) source=live groupID=\(post.groupID)")
+            #endif
         } catch let error as UserFacingError {
-            session.handleProtectedLoadError(
-                error,
-                requirement: .recruitingWrite,
-                state: &state,
-                fallbackMessage: "로그인 후 모집 상세를 다시 확인할 수 있어요."
-            )
+            debugRecruitDetail("response status=\(error.statusCode.map(String.init) ?? "nil")")
+            let mappedErrorType = recruitDetailErrorType(for: error)
+            debugRecruitDetail("mapped error type=\(mappedErrorType.rawValue)")
+            #if DEBUG
+            print("[RouteFetch] fetch failure screen=recruit_detail postID=\(postID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+            #endif
+            switch mappedErrorType {
+            case .authRequired:
+                session.handleProtectedLoadError(
+                    error,
+                    requirement: .recruitingWrite,
+                    state: &state,
+                    fallbackMessage: "로그인 후 모집 상세를 다시 확인할 수 있어요."
+                )
+            case .forbidden:
+                state = .error(
+                    UserFacingError(
+                        title: "권한이 없어요",
+                        message: "이 모집글을 볼 수 있는 권한이 없습니다.",
+                        code: error.code,
+                        provider: error.provider,
+                        statusCode: error.statusCode,
+                        details: error.details
+                    )
+                )
+            case .notFound:
+                state = .empty("이 모집글을 찾을 수 없습니다.")
+            case .transient, .other:
+                state = .error(
+                    UserFacingError(
+                        title: "모집 상세 로딩 실패",
+                        message: "모집 상세를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.",
+                        code: error.code,
+                        provider: error.provider,
+                        statusCode: error.statusCode,
+                        details: error.details
+                    )
+                )
+            }
         } catch {
+            debugRecruitDetail("response status=nil")
+            debugRecruitDetail("mapped error type=\(RecruitDetailErrorType.other.rawValue)")
+            #if DEBUG
+            print("[RouteFetch] fetch failure screen=recruit_detail postID=\(postID) source=live status=nil message=\(error.localizedDescription)")
+            #endif
             state = .error(UserFacingError(title: "모집 상세 로딩 실패", message: "모집 상세를 불러오지 못했습니다."))
         }
     }
 
+    func applyToRecruit() async -> RecruitPost? {
+        guard let post = loadedPost else { return nil }
+        guard post.status == .open else {
+            applyCapability = .unavailable("모집이 종료되어 더 이상 참가 신청을 받을 수 없습니다.")
+            return nil
+        }
+
+        actionState = .inProgress("참가 신청을 보내는 중입니다")
+        debugRecruitDetail("request apply postId=\(post.id)")
+
+        do {
+            let updatedPost = try await session.container.recruitingRepository.apply(postID: post.id)
+            loadedPost = updatedPost
+            applyCapability = .available
+            state = .content(await buildViewState(from: updatedPost))
+            actionState = .success("참가 신청을 보냈습니다")
+            return updatedPost
+        } catch let error as UserFacingError {
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .recruitingWrite)
+                return nil
+            }
+            if session.container.recruitingRepository.isCapabilityUnavailable(error) {
+                applyCapability = .unavailable("현재 서버에서 참가 신청 기능을 아직 지원하지 않습니다.")
+                actionState = .idle
+                return nil
+            }
+            actionState = .failure(error.message)
+            return nil
+        } catch {
+            actionState = .failure("참가 신청에 실패했습니다")
+            return nil
+        }
+    }
+
     func createMatch() async -> Match? {
-        guard let post = state.value else { return nil }
+        guard let post = loadedPost else { return nil }
+        guard post.status == .open else {
+            actionState = .failure("모집이 종료되어 내전을 생성할 수 없습니다.")
+            return nil
+        }
         actionState = .inProgress("모집글 기반 내전을 생성하는 중입니다")
         do {
             let match = try await session.container.matchRepository.create(groupID: post.groupID, title: post.title)
+            session.container.localStore.trackMatch(
+                RecentMatchContext(
+                    matchID: match.id,
+                    groupID: post.groupID,
+                    groupName: state.value?.groupName ?? "모집 연결 그룹",
+                    createdAt: Date()
+                )
+            )
+            session.container.localStore.appendNotification(
+                title: "모집 기반 내전 생성",
+                body: "\(post.title) 모집글에서 새 내전 로비를 생성했습니다.",
+                symbol: "shield.lefthalf.filled"
+            )
             actionState = .success("내전이 생성되었습니다")
             return match
         } catch let error as UserFacingError {
+            if error.statusCode == 404 {
+                actionState = .failure("연결된 그룹을 찾을 수 없거나 서버에서 내전 생성 기능을 아직 지원하지 않습니다.")
+                return nil
+            }
             session.handleProtectedActionError(error, requirement: .matchSave, actionState: &actionState)
             return nil
         } catch {
             actionState = .failure("내전 생성에 실패했습니다")
             return nil
         }
+    }
+
+    fileprivate func makeEditorDraft() -> RecruitEditorDraft? {
+        guard let loadedPost else { return nil }
+        return RecruitEditorDraft(postType: loadedPost.postType, post: loadedPost)
+    }
+
+    func updatePost(
+        title: String,
+        body: String,
+        tags: [String],
+        scheduledAt: Date?,
+        requiredPositions: [String]
+    ) async -> RecruitPost? {
+        guard let post = loadedPost, isOwner(of: post) else {
+            actionState = .failure("작성자 본인만 모집글을 수정할 수 있습니다.")
+            return nil
+        }
+        guard !isDeleteInFlight else { return nil }
+
+        actionState = .inProgress("모집글을 수정하는 중입니다")
+        debugRecruitDetail("request PATCH /recruiting-posts/\(post.id)")
+
+        do {
+            let updatedPost = try await session.container.recruitingRepository.update(
+                postID: post.id,
+                type: post.postType,
+                title: title,
+                body: body.isEmpty ? nil : body,
+                tags: tags,
+                scheduledAt: scheduledAt,
+                requiredPositions: requiredPositions
+            )
+            loadedPost = updatedPost
+            let viewState = await buildViewState(from: updatedPost)
+            state = .content(viewState)
+            actionState = .success("모집글이 수정되었습니다")
+            return updatedPost
+        } catch let error as UserFacingError {
+            let errorType = mutationErrorType(for: error)
+            debugRecruitDetail(
+                "response failure endpoint=/recruiting-posts/\(post.id) postId=\(post.id) responseCode=\(error.statusCode.map(String.init) ?? "nil") mappedErrorType=\(errorType.rawValue)"
+            )
+            if errorType == .notFound {
+                debugRecruitDetail("endpoint_missing_possible endpoint=/recruiting-posts/\(post.id) postId=\(post.id)")
+            }
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .recruitingWrite)
+                return nil
+            }
+            actionState = .failure(message(for: errorType, operation: "update"))
+            return nil
+        } catch {
+            debugRecruitDetail("response failure endpoint=/recruiting-posts/\(postID) postId=\(postID) responseCode=nil mappedErrorType=\(RecruitDetailMutationErrorType.other.rawValue)")
+            actionState = .failure("모집글 수정에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            return nil
+        }
+    }
+
+    func beginDeleteConfirmation() -> Bool {
+        guard !isDeleteInFlight, let post = loadedPost, isOwner(of: post) else { return false }
+        debugRecruitDetail("delete tap postId=\(post.id)")
+        return true
+    }
+
+    func deletePost() async -> RecruitPost? {
+        guard !isDeleteInFlight else {
+            debugRecruitDetail("delete ignored reason=in_flight postId=\(postID)")
+            return nil
+        }
+        guard let post = loadedPost else { return nil }
+        guard isOwner(of: post) else {
+            debugRecruitDetail("delete blocked reason=not_owner postId=\(post.id)")
+            actionState = .failure("작성자 본인만 모집글을 삭제할 수 있습니다.")
+            return nil
+        }
+
+        actionState = .inProgress("모집글을 삭제하는 중입니다")
+        debugRecruitDetail("delete confirm")
+        debugRecruitDetail("request DELETE /recruiting-posts/\(post.id)")
+
+        do {
+            try await session.container.recruitingRepository.delete(postID: post.id)
+            loadedPost = nil
+            actionState = .success("모집글이 삭제되었습니다")
+            debugRecruitDetail("response success")
+            debugRecruitDetail("delete success postId=\(post.id)")
+            return post
+        } catch let error as UserFacingError {
+            let errorType = mutationErrorType(for: error)
+            debugRecruitDetail(
+                "response failure endpoint=/recruiting-posts/\(post.id) postId=\(post.id) responseCode=\(error.statusCode.map(String.init) ?? "nil") mappedErrorType=\(errorType.rawValue)"
+            )
+            if errorType == .notFound {
+                debugRecruitDetail("endpoint_missing_possible endpoint=/recruiting-posts/\(post.id) postId=\(post.id)")
+            }
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .recruitingWrite)
+                return nil
+            }
+            actionState = .failure(message(for: errorType, operation: "delete"))
+            return nil
+        } catch {
+            debugRecruitDetail("response failure endpoint=/recruiting-posts/\(postID) postId=\(postID) responseCode=nil mappedErrorType=\(RecruitDetailMutationErrorType.other.rawValue)")
+            actionState = .failure("모집글 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            return nil
+        }
+    }
+
+    func didNavigateBackAfterDelete() {
+        debugRecruitDetail("navigate back after delete")
+    }
+
+    private func recruitDetailErrorType(for error: UserFacingError) -> RecruitDetailErrorType {
+        if error.requiresAuthentication {
+            return .authRequired
+        }
+        if error.statusCode == 404 {
+            return .notFound
+        }
+        if error.statusCode == 403 || error.isForbiddenFeature {
+            return .forbidden
+        }
+        if let statusCode = error.statusCode, statusCode >= 500 {
+            return .transient
+        }
+        return .other
+    }
+
+    private func mutationErrorType(for error: UserFacingError) -> RecruitDetailMutationErrorType {
+        if error.requiresAuthentication {
+            return .authRequired
+        }
+        switch error.statusCode {
+        case 403:
+            return .forbidden
+        case 404:
+            return .notFound
+        case 409:
+            return .conflict
+        case let statusCode? where statusCode >= 500:
+            return .server
+        default:
+            return .other
+        }
+    }
+
+    private func message(for errorType: RecruitDetailMutationErrorType, operation: String) -> String {
+        switch (operation, errorType) {
+        case ("update", .forbidden):
+            return "작성자 본인만 모집글을 수정할 수 있습니다."
+        case ("update", .notFound):
+            return "수정할 모집글을 찾을 수 없거나 서버에서 수정 기능을 아직 지원하지 않습니다."
+        case ("update", .conflict):
+            return "현재 모집 상태에서는 수정할 수 없습니다."
+        case ("update", .server), ("update", .other):
+            return "모집글 수정에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        case ("delete", .forbidden):
+            return "작성자 본인만 모집글을 삭제할 수 있습니다."
+        case ("delete", .notFound):
+            return "이미 삭제되었거나 서버에서 삭제 기능을 아직 지원하지 않습니다."
+        case ("delete", .conflict):
+            return "현재 모집 상태에서는 삭제할 수 없습니다."
+        case ("delete", .server), ("delete", .other):
+            return "모집글 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        case (_, .authRequired):
+            return "로그인이 필요합니다."
+        default:
+            return "요청 처리에 실패했습니다. 잠시 후 다시 시도해 주세요."
+        }
+    }
+
+    private func buildViewState(from post: RecruitPost) async -> RecruitDetailViewState {
+        let groupName = await resolveGroupName(for: post.groupID)
+        let authorName = resolveAuthorName(from: post.createdBy)
+        let viewState = RecruitDetailViewState(
+            postID: post.id,
+            groupID: post.groupID,
+            postType: post.postType,
+            title: post.title,
+            groupName: groupName,
+            authorName: authorName,
+            requiredPositionsText: joinedDisplayValue(post.requiredPositions, fallback: "미정"),
+            statusText: displayStatusText(for: post.status),
+            moodTagsText: joinedDisplayValue(post.tags, fallback: "미설정"),
+            scheduledAtText: post.scheduledAt?.shortDateText ?? "미정",
+            bodyText: normalizedDisplayValue(post.body) ?? "상세 설명이 없습니다.",
+            isOwner: isOwner(of: post)
+        )
+        debugRecruitDetail("render title=\(viewState.title)")
+        debugRecruitDetail("render groupName=\(viewState.groupName)")
+        debugRecruitDetail("edit visible isOwner=\(viewState.isOwner)")
+        debugRecruitDetail("delete visible isOwner=\(viewState.isOwner)")
+        return viewState
+    }
+
+    private func resolveGroupName(for groupID: String) async -> String {
+        if let cachedGroupName = normalizedDisplayValue(session.container.localStore.groupName(for: groupID)) {
+            return cachedGroupName
+        }
+        if let group = try? await session.container.groupRepository.detail(groupID: groupID) {
+            if let fetchedGroupName = normalizedDisplayValue(group.name) {
+                return fetchedGroupName
+            }
+        }
+        return "그룹 정보 없음"
+    }
+
+    private func resolveAuthorName(from createdBy: String?) -> String? {
+        guard let normalizedValue = normalizedDisplayValue(createdBy) else { return nil }
+        if normalizedValue == session.currentUserID {
+            return normalizedDisplayValue(session.profile?.nickname) ?? "나"
+        }
+        if looksLikeInternalIdentifier(normalizedValue) {
+            return nil
+        }
+        return normalizedValue
+    }
+
+    private func isOwner(of post: RecruitPost) -> Bool {
+        guard
+            let currentUserID = session.currentUserID,
+            let createdBy = normalizedDisplayValue(post.createdBy)
+        else {
+            return false
+        }
+        return createdBy == currentUserID
+    }
+
+    private func joinedDisplayValue(_ values: [String], fallback: String) -> String {
+        let normalizedValues = values.compactMap(normalizedDisplayValue)
+        return normalizedValues.isEmpty ? fallback : normalizedValues.joined(separator: ", ")
+    }
+
+    private func normalizedDisplayValue(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmedValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedValue.isEmpty ? nil : trimmedValue
+    }
+
+    private func displayStatusText(for status: RecruitingPostStatus) -> String {
+        status == .open ? "모집 중" : status.rawValue
+    }
+
+    private func looksLikeInternalIdentifier(_ value: String) -> Bool {
+        if value.contains("-") || value.contains("_") {
+            return true
+        }
+        if value.range(of: "^[A-Za-z0-9]{16,}$", options: .regularExpression) != nil {
+            return true
+        }
+        if value.range(of: "^[0-9a-fA-F-]{8,}$", options: .regularExpression) != nil {
+            return true
+        }
+        return false
+    }
+
+    private func debugRecruitDetail(_ message: String) {
+        #if DEBUG
+        print("[RecruitDetail] \(message)")
+        #endif
     }
 }
 
@@ -2463,6 +3999,7 @@ struct AppShellView: View {
     @StateObject private var recruitViewModel: RecruitBoardViewModel
     @StateObject private var historyViewModel: HistoryViewModel
     @StateObject private var profileViewModel: ProfileViewModel
+    @State private var lastSessionScopeKey: String?
 
     init(session: AppSessionViewModel, router: AppRouter) {
         self.session = session
@@ -2481,9 +4018,6 @@ struct AppShellView: View {
                 .safeAreaInset(edge: .bottom, spacing: 0) {
                     AppTabBar(selectedTab: session.selectedTab) { tab in
                         session.selectedTab = tab
-                        Task {
-                            await loadSelectedTab()
-                        }
                     }
                 }
                 .navigationDestination(for: AppRoute.self) { route in
@@ -2493,15 +4027,17 @@ struct AppShellView: View {
                     AuthGateSheet(session: session, prompt: prompt)
                 }
                 .task(id: session.dataScopeKey) {
+                    guard lastSessionScopeKey != session.dataScopeKey else { return }
+                    lastSessionScopeKey = session.dataScopeKey
                     resetViewModelsForSessionChange()
-                    await loadSelectedTab(force: true)
+                    await loadSelectedTab(force: true, trigger: .sessionScopeChange)
                 }
                 .task(id: session.riotLinkedDataRevision) {
                     guard session.riotLinkedDataRevision > 0 else { return }
                     homeViewModel.reset()
                     profileViewModel.reset()
                     if session.selectedTab == .home || session.selectedTab == .profile {
-                        await loadSelectedTab(force: true)
+                        await loadSelectedTab(force: true, trigger: .riotLinkedDataRevision)
                     }
                 }
         }
@@ -2523,8 +4059,13 @@ struct AppShellView: View {
         }
     }
 
-    @ViewBuilder
     private func destinationView(_ route: AppRoute) -> some View {
+        logDestinationBuilt(route)
+        return buildDestinationView(route)
+    }
+
+    @ViewBuilder
+    private func buildDestinationView(_ route: AppRoute) -> some View {
         switch route {
         case .search:
             SearchScreen(viewModel: SearchViewModel(session: session), session: session, router: router, onBack: router.pop)
@@ -2550,6 +4091,19 @@ struct AppShellView: View {
         case .powerDetail:
             PowerDetailScreen(
                 viewModel: PowerDetailViewModel(session: session),
+                title: "파워 상세",
+                emptyTitle: "파워 상세",
+                onBack: router.pop
+            )
+        case let .memberProfile(userID, nickname):
+            PowerDetailScreen(
+                viewModel: PowerDetailViewModel(
+                    session: session,
+                    targetUserID: userID,
+                    displayName: nickname
+                ),
+                title: nickname.isEmpty ? "멤버 프로필" : nickname,
+                emptyTitle: "멤버 프로필",
                 onBack: router.pop
             )
         case .homeRecentMatches:
@@ -2559,7 +4113,18 @@ struct AppShellView: View {
                 onBack: router.pop
             )
         case let .groupDetail(groupID):
-            GroupDetailScreen(viewModel: GroupDetailViewModel(session: session, groupID: groupID), router: router)
+            GroupDetailScreen(
+                viewModel: GroupDetailViewModel(session: session, groupID: groupID),
+                router: router,
+                onGroupUpdated: { updatedGroup in
+                    groupViewModel.handleGroupUpdated(updatedGroup)
+                },
+                onGroupDeleted: { deletedGroupID in
+                    homeViewModel.reset()
+                    profileViewModel.reset()
+                    groupViewModel.handleGroupDeleted(groupID: deletedGroupID)
+                }
+            )
         case let .matchLobby(groupID, matchID):
             MatchLobbyFeatureView(
                 store: Store(
@@ -2567,7 +4132,7 @@ struct AppShellView: View {
                 ) {
                     MatchLobbyFeature()
                 } withDependencies: {
-                    $0.appContainer = session.container
+                    $0.appContainer = { session.container }
                 },
                 session: session,
                 router: router
@@ -2579,21 +4144,22 @@ struct AppShellView: View {
                 ) {
                     TeamBalanceFeature()
                 } withDependencies: {
-                    $0.appContainer = session.container
+                    $0.appContainer = { session.container }
                 },
                 session: session,
                 router: router
             )
-        case .teamBalancePreview:
-            TeamBalancePreviewScreen(session: session, router: router)
         case let .manualAdjust(matchID, draft):
             ManualAdjustFeatureView(
                 store: Store(
                     initialState: ManualAdjustFeature.State(matchID: matchID, draft: draft)
                 ) {
                     ManualAdjustFeature()
+                } withDependencies: {
+                    $0.appContainer = { session.container }
                 },
-                onBack: router.pop
+                onBack: router.pop,
+                onSaved: router.pop
             )
         case let .matchResult(matchID):
             MatchResultFeatureView(
@@ -2602,32 +4168,39 @@ struct AppShellView: View {
                 ) {
                     MatchResultFeature()
                 } withDependencies: {
-                    $0.appContainer = session.container
+                    $0.appContainer = { session.container }
                 },
                 session: session,
                 router: router
             )
-        case .resultPreview:
-            ResultPreviewScreen(session: session, router: router)
         case let .matchDetail(matchID):
             MatchDetailScreen(viewModel: MatchDetailViewModel(session: session, matchID: matchID), router: router)
         case let .recruitDetail(postID):
-            RecruitDetailScreen(viewModel: RecruitDetailViewModel(session: session, postID: postID), router: router)
+            RecruitDetailScreen(
+                viewModel: RecruitDetailViewModel(session: session, postID: postID),
+                router: router,
+                onUpdateSuccess: { updatedPost in
+                    recruitViewModel.handleUpdateSuccess(updatedPost)
+                },
+                onDeleteSuccess: { deletedPost in
+                    recruitViewModel.handleDeleteSuccess(deletedPost)
+                }
+            )
         }
     }
 
-    private func loadSelectedTab(force: Bool = false) async {
+    private func loadSelectedTab(force: Bool = false, trigger: AppShellLoadTrigger) async {
         switch session.selectedTab {
         case .home:
-            await homeViewModel.load(force: force)
+            await homeViewModel.load(force: force, trigger: trigger.rawValue)
         case .match:
-            await groupViewModel.load(force: force)
+            await groupViewModel.load(force: force, trigger: trigger.rawValue)
         case .recruit:
-            await recruitViewModel.load(force: force)
+            await recruitViewModel.load(force: force, trigger: trigger.recruitBoardTrigger)
         case .history:
-            await historyViewModel.load(force: force)
+            await historyViewModel.load(force: force, trigger: trigger.rawValue)
         case .profile:
-            await profileViewModel.load(force: force)
+            await profileViewModel.load(force: force, trigger: trigger.rawValue)
         }
     }
 
@@ -2637,6 +4210,26 @@ struct AppShellView: View {
         recruitViewModel.reset()
         historyViewModel.reset()
         profileViewModel.reset()
+    }
+
+    private func logDestinationBuilt(_ route: AppRoute) {
+#if DEBUG
+        print("[Route] destination built route=\(route.debugDescription)")
+#endif
+    }
+}
+
+private enum AppShellLoadTrigger: String {
+    case sessionScopeChange = "session_scope_change"
+    case riotLinkedDataRevision = "riot_linked_data_revision"
+
+    var recruitBoardTrigger: RecruitBoardLoadTrigger {
+        switch self {
+        case .sessionScopeChange:
+            return .sessionScopeChange
+        case .riotLinkedDataRevision:
+            return .screenAppear
+        }
     }
 }
 
@@ -2726,14 +4319,14 @@ struct HomeScreen: View {
                                 if let match = currentMatch {
                                     router.push(.teamBalance(groupID: match.groupID, matchID: match.id))
                                 } else {
-                                    router.push(.teamBalancePreview)
+                                    session.selectedTab = .match
                                 }
                             }
                             quickAction(symbol: "checkmark.circle", title: "결과\n입력", tint: AppPalette.accentGreen) {
                                 if let match = currentMatch {
                                     router.push(.matchResult(matchID: match.id))
                                 } else {
-                                    router.push(.resultPreview)
+                                    session.selectedTab = .match
                                 }
                             }
                             quickAction(symbol: "megaphone", title: "상대팀\n모집", tint: AppPalette.accentOrange) {
@@ -2779,7 +4372,7 @@ struct HomeScreen: View {
                             HStack(spacing: 10) {
                                 ForEach(Array(groups.prefix(2))) { group in
                                     Button {
-                                        session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                        session.openGroupDetailIfAccessible(group, router: router)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 8) {
                                             Text(group.name)
@@ -2823,14 +4416,19 @@ struct HomeScreen: View {
                                 openHomeSection(.homeRecentMatches, section: "최근 경기", destination: "최근 경기 전체 목록")
                             } content: {
                                 if let latestHistory = snapshot.latestHistory {
-                                    MatchCardView(
-                                        title: snapshot.groups.first?.name ?? "롤내전모임",
-                                        dateText: latestHistory.scheduledAt.dottedDateText,
-                                        isWin: latestHistory.result == "WIN",
-                                        blueSummary: "블루 팀",
-                                        redSummary: "레드 팀",
-                                        detail: "KDA \(latestHistory.kda) · MMR \(Int(latestHistory.deltaMMR))"
-                                    )
+                                    Button {
+                                        router.push(.matchDetail(matchID: latestHistory.matchID))
+                                    } label: {
+                                        MatchCardView(
+                                            title: snapshot.groups.first?.name ?? "롤내전모임",
+                                            dateText: latestHistory.scheduledAt.dottedDateText,
+                                            isWin: latestHistory.result == "WIN",
+                                            blueSummary: "블루 팀",
+                                            redSummary: "레드 팀",
+                                            detail: "KDA \(latestHistory.kda) · MMR \(Int(latestHistory.deltaMMR))"
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
                                 } else {
                                     guestBenefitCard(
                                         title: "아직 계정 기록이 없어요",
@@ -2840,7 +4438,7 @@ struct HomeScreen: View {
                                         if let match = currentMatch {
                                             router.push(.matchResult(matchID: match.id))
                                         } else {
-                                            router.push(.resultPreview)
+                                            session.selectedTab = .match
                                         }
                                     }
                                 }
@@ -2874,7 +4472,7 @@ struct HomeScreen: View {
                                     if let match = currentMatch {
                                         router.push(.matchResult(matchID: match.id))
                                     } else {
-                                        router.push(.resultPreview)
+                                        session.selectedTab = .match
                                     }
                                 }
                             }
@@ -3486,7 +5084,7 @@ fileprivate struct HomeGroupsScreen: View {
                                     #if DEBUG
                                     print("[HomeSectionMore] itemTap=최근 참여 그룹 groupID=\(group.id)")
                                     #endif
-                                    session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                    session.openGroupDetailIfAccessible(group, router: router)
                                 } label: {
                                     VStack(alignment: .leading, spacing: 10) {
                                         HStack {
@@ -3531,16 +5129,25 @@ fileprivate struct HomeGroupsScreen: View {
 
 fileprivate struct PowerDetailScreen: View {
     @StateObject private var viewModel: PowerDetailViewModel
+    let title: String
+    let emptyTitle: String
     let onBack: () -> Void
     @State private var showsCalculationSheet = false
 
-    init(viewModel: PowerDetailViewModel, onBack: @escaping () -> Void) {
+    init(
+        viewModel: PowerDetailViewModel,
+        title: String = "파워 상세",
+        emptyTitle: String = "파워 상세",
+        onBack: @escaping () -> Void
+    ) {
         _viewModel = StateObject(wrappedValue: viewModel)
+        self.title = title
+        self.emptyTitle = emptyTitle
         self.onBack = onBack
     }
 
     var body: some View {
-        screenScaffold(title: "파워 상세", onBack: onBack, rightSystemImage: nil) {
+        screenScaffold(title: title, onBack: onBack, rightSystemImage: nil) {
             Group {
                 switch viewModel.state {
                 case .initial, .loading:
@@ -3549,7 +5156,7 @@ fileprivate struct PowerDetailScreen: View {
                 case let .error(error):
                     ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: "retry") } }
                 case let .empty(message):
-                    EmptyStateView(title: "파워 상세", message: message)
+                    EmptyStateView(title: emptyTitle, message: message)
                 case let .content(detail), let .refreshing(detail):
                     ScrollView(showsIndicators: false) {
                         VStack(spacing: 18) {
@@ -3957,6 +5564,362 @@ fileprivate extension MatchStatus {
     }
 }
 
+fileprivate struct SelectableChipButton: View {
+    let title: String
+    let tint: Color
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            FilterChipView(title: title, tint: tint, isSelected: isSelected)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+fileprivate enum GroupEditorMode {
+    case create
+    case edit
+
+    var title: String {
+        switch self {
+        case .create: return "내전 방 생성"
+        case .edit: return "내전 방 수정"
+        }
+    }
+
+    var submitTitle: String {
+        switch self {
+        case .create: return "생성"
+        case .edit: return "저장"
+        }
+    }
+}
+
+fileprivate struct GroupEditorDraft {
+    var name = ""
+    var description = ""
+    var selectedRegion = "서울"
+    var selectedMoodTags: Set<String> = ["빡겜"]
+    var additionalTags = ""
+    var visibility: GroupVisibility = .private
+    var joinPolicy: JoinPolicy = .inviteOnly
+
+    init(group: GroupSummary? = nil) {
+        guard let group else { return }
+        name = group.name
+        description = group.description ?? ""
+        selectedRegion = group.tags.first(where: { RecruitOptionCatalog.regions.contains($0) }) ?? "서울"
+        let moodTags = Set(group.tags.filter { RecruitOptionCatalog.moodTags.contains($0) })
+        selectedMoodTags = moodTags.isEmpty ? ["빡겜"] : moodTags
+        additionalTags = group.tags
+            .filter { !RecruitOptionCatalog.regions.contains($0) && !RecruitOptionCatalog.moodTags.contains($0) }
+            .joined(separator: ",")
+        visibility = group.visibility
+        joinPolicy = group.joinPolicy
+    }
+
+    var normalizedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var normalizedDescription: String {
+        description.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var normalizedAdditionalTags: [String] {
+        additionalTags
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var composedTags: [String] {
+        Array(([selectedRegion] + selectedMoodTags.sorted() + normalizedAdditionalTags).prefix(8))
+    }
+}
+
+fileprivate struct GroupEditorSheet: View {
+    let mode: GroupEditorMode
+    @Binding var draft: GroupEditorDraft
+    let errorMessage: String?
+    let isSubmitting: Bool
+    let onClose: () -> Void
+    let onSubmit: () -> Void
+
+    private let gridColumns = [GridItem(.adaptive(minimum: 84), spacing: 8)]
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("기본 정보") {
+                    TextField("방 이름", text: $draft.name)
+                    TextField("설명", text: $draft.description, axis: .vertical)
+                }
+
+                Section("지역") {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 8) {
+                        ForEach(RecruitOptionCatalog.regions, id: \.self) { region in
+                            SelectableChipButton(
+                                title: region,
+                                tint: AppPalette.accentBlue,
+                                isSelected: draft.selectedRegion == region
+                            ) {
+                                draft.selectedRegion = region
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section("성향 태그") {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 8) {
+                        ForEach(RecruitOptionCatalog.moodTags, id: \.self) { tag in
+                            SelectableChipButton(
+                                title: tag,
+                                tint: AppPalette.accentPurple,
+                                isSelected: draft.selectedMoodTags.contains(tag)
+                            ) {
+                                if draft.selectedMoodTags.contains(tag) {
+                                    draft.selectedMoodTags.remove(tag)
+                                } else {
+                                    draft.selectedMoodTags.insert(tag)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    TextField("추가 태그 (쉼표 구분)", text: $draft.additionalTags)
+                }
+
+                Section("공개 설정") {
+                    Picker("공개 여부", selection: $draft.visibility) {
+                        Text(GroupVisibility.private.title).tag(GroupVisibility.private)
+                        Text(GroupVisibility.public.title).tag(GroupVisibility.public)
+                    }
+                    Picker("참여 방식", selection: $draft.joinPolicy) {
+                        ForEach(JoinPolicy.allCases, id: \.self) { policy in
+                            Text(policy.title).tag(policy)
+                        }
+                    }
+                }
+
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .font(AppTypography.body(12, weight: .semibold))
+                            .foregroundStyle(AppPalette.accentRed)
+                    }
+                }
+            }
+            .navigationTitle(mode.title)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("닫기", action: onClose)
+                        .disabled(isSubmitting)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: onSubmit) {
+                        if isSubmitting {
+                            ProgressView()
+                                .tint(AppPalette.accentBlue)
+                        } else {
+                            Text(mode.submitTitle)
+                        }
+                    }
+                    .disabled(draft.normalizedName.count < 2 || isSubmitting)
+                }
+            }
+        }
+    }
+}
+
+fileprivate enum RecruitEditorMode {
+    case create
+    case edit
+
+    var title: String {
+        switch self {
+        case .create: return "모집글 작성"
+        case .edit: return "모집글 수정"
+        }
+    }
+
+    var submitTitle: String {
+        switch self {
+        case .create: return "등록"
+        case .edit: return "저장"
+        }
+    }
+}
+
+fileprivate struct RecruitEditorDraft {
+    var postType: RecruitingPostType
+    var title = ""
+    var body = ""
+    var selectedPositions: Set<String> = ["MID", "SUPPORT"]
+    var selectedTags: Set<String> = ["빡겜"]
+    var additionalTags = ""
+    var isScheduledAtEnabled = false
+    var scheduledAt = Date()
+
+    init(postType: RecruitingPostType, post: RecruitPost? = nil) {
+        self.postType = postType
+        guard let post else { return }
+        self.postType = post.postType
+        title = post.title
+        body = post.body ?? ""
+        let positions = Set(post.requiredPositions.filter { RecruitOptionCatalog.positions.contains($0) })
+        selectedPositions = positions.isEmpty ? ["MID", "SUPPORT"] : positions
+        let knownTags = Set(post.tags.filter { RecruitOptionCatalog.moodTags.contains($0) })
+        selectedTags = knownTags.isEmpty ? ["빡겜"] : knownTags
+        additionalTags = post.tags
+            .filter { !RecruitOptionCatalog.moodTags.contains($0) }
+            .joined(separator: ",")
+        if let scheduledAt = post.scheduledAt {
+            isScheduledAtEnabled = true
+            self.scheduledAt = scheduledAt
+        }
+    }
+
+    var normalizedTitle: String {
+        title.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var normalizedBody: String {
+        body.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var normalizedAdditionalTags: [String] {
+        additionalTags
+            .split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    var requiredPositions: [String] {
+        selectedPositions.sorted()
+    }
+
+    var composedTags: [String] {
+        Array((selectedTags.sorted() + normalizedAdditionalTags).prefix(8))
+    }
+
+    var effectiveScheduledAt: Date? {
+        isScheduledAtEnabled ? scheduledAt : nil
+    }
+}
+
+fileprivate struct RecruitEditorSheet: View {
+    let mode: RecruitEditorMode
+    @Binding var draft: RecruitEditorDraft
+    let errorMessage: String?
+    let isSubmitting: Bool
+    let onClose: () -> Void
+    let onSubmit: () -> Void
+
+    private let gridColumns = [GridItem(.adaptive(minimum: 88), spacing: 8)]
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("기본 정보") {
+                    HStack {
+                        Text("모집 유형")
+                        Spacer()
+                        Text(draft.postType.title)
+                            .foregroundStyle(AppPalette.textSecondary)
+                    }
+                    TextField("제목", text: $draft.title)
+                    TextField("본문", text: $draft.body, axis: .vertical)
+                }
+
+                Section("포지션") {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 8) {
+                        ForEach(RecruitOptionCatalog.positions, id: \.self) { position in
+                            SelectableChipButton(
+                                title: position,
+                                tint: AppPalette.accentBlue,
+                                isSelected: draft.selectedPositions.contains(position)
+                            ) {
+                                if draft.selectedPositions.contains(position) {
+                                    draft.selectedPositions.remove(position)
+                                } else {
+                                    draft.selectedPositions.insert(position)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Section("성향 태그") {
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: 8) {
+                        ForEach(RecruitOptionCatalog.moodTags, id: \.self) { tag in
+                            SelectableChipButton(
+                                title: tag,
+                                tint: AppPalette.accentPurple,
+                                isSelected: draft.selectedTags.contains(tag)
+                            ) {
+                                if draft.selectedTags.contains(tag) {
+                                    draft.selectedTags.remove(tag)
+                                } else {
+                                    draft.selectedTags.insert(tag)
+                                }
+                            }
+                        }
+                    }
+                    .padding(.vertical, 4)
+                    TextField("추가 태그 (쉼표 구분)", text: $draft.additionalTags)
+                }
+
+                Section("예정 시간") {
+                    Toggle("예정 시간 설정", isOn: $draft.isScheduledAtEnabled)
+                    if draft.isScheduledAtEnabled {
+                        DatePicker("예정 시간", selection: $draft.scheduledAt, displayedComponents: [.date, .hourAndMinute])
+                    }
+                }
+
+                if let errorMessage {
+                    Section {
+                        Text(errorMessage)
+                            .font(AppTypography.body(12, weight: .semibold))
+                            .foregroundStyle(AppPalette.accentRed)
+                    }
+                }
+            }
+            .navigationTitle(mode.title)
+            .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("닫기", action: onClose)
+                        .disabled(isSubmitting)
+                }
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button(action: onSubmit) {
+                        if isSubmitting {
+                            ProgressView()
+                                .tint(AppPalette.accentBlue)
+                        } else {
+                            Text(mode.submitTitle)
+                        }
+                    }
+                    .disabled(draft.normalizedTitle.count < 2 || draft.requiredPositions.isEmpty || isSubmitting)
+                }
+            }
+        }
+    }
+}
+
+fileprivate enum RecruitFilterSheet: String, Identifiable {
+    case date
+    case positions
+    case regions
+    case tags
+
+    var id: String { rawValue }
+}
+
 struct GroupMainScreen: View {
     private enum ActiveSheet: String, Identifiable {
         case createGroup
@@ -3968,9 +5931,7 @@ struct GroupMainScreen: View {
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
     @State private var activeSheet: ActiveSheet?
-    @State private var newGroupName = ""
-    @State private var newGroupDescription = ""
-    @State private var newGroupTags = "빡겜,서울"
+    @State private var groupEditorDraft = GroupEditorDraft()
     @State private var createGroupErrorMessage: String?
     @State private var pendingCreatedGroupID: String?
 
@@ -3996,7 +5957,7 @@ struct GroupMainScreen: View {
                             VStack(spacing: 16) {
                                 ForEach(groups) { group in
                                     Button {
-                                        session.openProtectedRoute(.groupDetail(group.id), requirement: .groupManagement, router: router)
+                                        session.openGroupDetailIfAccessible(group, router: router)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 10) {
                                             HStack {
@@ -4052,59 +6013,14 @@ struct GroupMainScreen: View {
     }
 
     private var groupCreationSheet: some View {
-        NavigationStack {
-            Form {
-                TextField("그룹 이름", text: $newGroupName)
-                TextField("설명", text: $newGroupDescription, axis: .vertical)
-                TextField("태그 (쉼표 구분)", text: $newGroupTags)
-                if let createGroupErrorMessage {
-                    Text(createGroupErrorMessage)
-                        .font(AppTypography.body(12, weight: .semibold))
-                        .foregroundStyle(AppPalette.accentRed)
-                }
-                Text("실제 서버에는 그룹 목록 API가 없어, 생성 또는 방문한 groupId를 클라이언트에 저장한 뒤 이 탭에서 다시 조회합니다.")
-                    .font(AppTypography.body(12))
-                    .foregroundStyle(AppPalette.textSecondary)
-            }
-            .scrollContentBackground(.hidden)
-            .background(AppPalette.bgPrimary)
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("닫기") {
-                        dismissCreateGroupSheet(reason: "close_button")
-                    }
-                    .disabled(isCreateGroupSubmitInFlight)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        submitCreateGroup()
-                    } label: {
-                        if isCreateGroupSubmitInFlight {
-                            ProgressView()
-                                .tint(AppPalette.accentBlue)
-                        } else {
-                            Text("생성")
-                        }
-                    }
-                    .disabled(isCreateGroupSubmitDisabled)
-                }
-            }
-        }
-    }
-
-    private var normalizedNewGroupName: String {
-        newGroupName.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedNewGroupDescription: String {
-        newGroupDescription.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedNewGroupTags: [String] {
-        newGroupTags
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        GroupEditorSheet(
+            mode: .create,
+            draft: $groupEditorDraft,
+            errorMessage: createGroupErrorMessage,
+            isSubmitting: isCreateGroupSubmitInFlight,
+            onClose: { dismissCreateGroupSheet(reason: "close_button") },
+            onSubmit: submitCreateGroup
+        )
     }
 
     private var isCreateGroupSubmitInFlight: Bool {
@@ -4115,7 +6031,7 @@ struct GroupMainScreen: View {
     }
 
     private var isCreateGroupSubmitDisabled: Bool {
-        normalizedNewGroupName.count < 2 || isCreateGroupSubmitInFlight
+        groupEditorDraft.normalizedName.count < 2 || isCreateGroupSubmitInFlight
     }
 
     private func presentCreateGroupEntry(source: String) {
@@ -4136,7 +6052,7 @@ struct GroupMainScreen: View {
         debugCreateGroup("tap")
         createGroupErrorMessage = nil
 
-        guard normalizedNewGroupName.count >= 2 else {
+        guard groupEditorDraft.normalizedName.count >= 2 else {
             debugCreateGroup("validation=failed reason=name_too_short")
             createGroupErrorMessage = "그룹 이름은 2자 이상 입력해주세요."
             debugCreateGroup("showInlineError")
@@ -4157,9 +6073,9 @@ struct GroupMainScreen: View {
 
         Task {
             let result = await viewModel.createGroup(
-                name: normalizedNewGroupName,
-                description: normalizedNewGroupDescription,
-                tags: normalizedNewGroupTags
+                name: groupEditorDraft.normalizedName,
+                description: groupEditorDraft.normalizedDescription,
+                tags: groupEditorDraft.composedTags
             )
 
             switch result {
@@ -4193,9 +6109,7 @@ struct GroupMainScreen: View {
     }
 
     private func resetCreateGroupDraft() {
-        newGroupName = ""
-        newGroupDescription = ""
-        newGroupTags = "빡겜,서울"
+        groupEditorDraft = GroupEditorDraft()
         createGroupErrorMessage = nil
     }
 
@@ -4219,18 +6133,38 @@ struct GroupMainScreen: View {
 struct GroupDetailScreen: View {
     @ObservedObject var viewModel: GroupDetailViewModel
     @ObservedObject var router: AppRouter
+    let onGroupUpdated: (GroupSummary) -> Void
+    let onGroupDeleted: (String) -> Void
     @State private var inviteUserID = ""
     @State private var showsInviteSheet = false
     @State private var showsPowerGuideSheet = false
+    @State private var showsManagementDialog = false
+    @State private var showsDeleteConfirmation = false
+    @State private var showsEditorSheet = false
+    @State private var groupEditorDraft = GroupEditorDraft()
+    @State private var groupEditorErrorMessage: String?
 
     var body: some View {
-        screenScaffold(title: "롤내전모임", onBack: router.pop) {
+        screenScaffold(
+            title: "롤내전모임",
+            onBack: router.pop,
+            rightSystemImage: viewModel.isEditVisible ? "ellipsis.circle" : nil,
+            onRightTap: { showsManagementDialog = true }
+        ) {
             switch viewModel.state {
-            case .initial, .loading:
+            case .initial:
                 LoadingStateView(title: "그룹 상세를 불러오는 중입니다")
-                    .task { await viewModel.load() }
+                    .task { await viewModel.load(trigger: .screenAppear) }
+            case .loading:
+                LoadingStateView(title: "그룹 상세를 불러오는 중입니다")
             case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                ErrorStateView(
+                    error: error,
+                    retry: { Task { await viewModel.load(force: true, trigger: .retry) } },
+                    secondaryAction: error.isGroupNotFoundResource
+                        ? ErrorStateAction(title: "목록으로 돌아가기", action: dismissInvalidGroupContext)
+                        : nil
+                )
             case .empty:
                 EmptyStateView(title: "그룹", message: "표시할 그룹이 없습니다.")
             case let .content(snapshot), let .refreshing(snapshot):
@@ -4315,14 +6249,19 @@ struct GroupDetailScreen: View {
                         VStack(alignment: .leading, spacing: 10) {
                             SectionHeaderView(title: "지난 내전", showsTrailing: false)
                             if let history = snapshot.latestMatch {
-                                MatchCardView(
-                                    title: snapshot.group.name,
-                                    dateText: history.scheduledAt.dottedDateText,
-                                    isWin: history.result == "WIN",
-                                    blueSummary: "블루 팀",
-                                    redSummary: "레드 팀",
-                                    detail: "KDA \(history.kda) · \(history.role.shortLabel)"
-                                )
+                                Button {
+                                    router.push(.matchDetail(matchID: history.matchID))
+                                } label: {
+                                    MatchCardView(
+                                        title: snapshot.group.name,
+                                        dateText: history.scheduledAt.dottedDateText,
+                                        isWin: history.result == "WIN",
+                                        blueSummary: "블루 팀",
+                                        redSummary: "레드 팀",
+                                        detail: "KDA \(history.kda) · \(history.role.shortLabel)"
+                                    )
+                                }
+                                .buttonStyle(.plain)
                             } else {
                                 Text("그룹 단위 최근 경기 목록 API가 없어 현재는 내 기록 기준 최근 경기만 표시합니다.")
                                     .font(AppTypography.body(12))
@@ -4343,7 +6282,9 @@ struct GroupDetailScreen: View {
                         .foregroundStyle(AppPalette.textSecondary)
                 }
                 .toolbar {
-                    ToolbarItem(placement: .topBarLeading) { Button("닫기") { showsInviteSheet = false } }
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("닫기") { showsInviteSheet = false }
+                    }
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("추가") {
                             Task {
@@ -4351,9 +6292,20 @@ struct GroupDetailScreen: View {
                                 showsInviteSheet = false
                             }
                         }
+                        .disabled(inviteUserID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
             }
+        }
+        .sheet(isPresented: $showsEditorSheet, onDismiss: clearGroupEditorError) {
+            GroupEditorSheet(
+                mode: .edit,
+                draft: $groupEditorDraft,
+                errorMessage: groupEditorErrorMessage,
+                isSubmitting: viewModel.isMutationInFlight,
+                onClose: { showsEditorSheet = false },
+                onSubmit: submitGroupUpdate
+            )
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
         .overlay {
@@ -4383,6 +6335,19 @@ struct GroupDetailScreen: View {
                 }
             }
         }
+        .confirmationDialog("내전 방 관리", isPresented: $showsManagementDialog, titleVisibility: .visible) {
+            Button("수정") { presentGroupEditor() }
+            Button("삭제", role: .destructive) { showsDeleteConfirmation = true }
+            Button("취소", role: .cancel) {}
+        }
+        .alert("이 내전 방을 삭제할까요?", isPresented: $showsDeleteConfirmation) {
+            Button("취소", role: .cancel) {}
+            Button("삭제", role: .destructive) {
+                Task { await confirmGroupDelete() }
+            }
+        } message: {
+            Text("삭제한 내전 방은 복구할 수 없습니다.")
+        }
         .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsPowerGuideSheet)
     }
 
@@ -4406,6 +6371,52 @@ struct GroupDetailScreen: View {
             .background(AppPalette.bgTertiary)
             .clipShape(Capsule())
     }
+
+    private func presentGroupEditor() {
+        guard let snapshot = viewModel.state.value else { return }
+        groupEditorDraft = GroupEditorDraft(group: snapshot.group)
+        groupEditorErrorMessage = nil
+        showsEditorSheet = true
+    }
+
+    private func submitGroupUpdate() {
+        groupEditorErrorMessage = nil
+        Task {
+            let updatedGroup = await viewModel.updateGroup(
+                name: groupEditorDraft.normalizedName,
+                description: groupEditorDraft.normalizedDescription,
+                visibility: groupEditorDraft.visibility,
+                joinPolicy: groupEditorDraft.joinPolicy,
+                tags: groupEditorDraft.composedTags
+            )
+            if let updatedGroup {
+                onGroupUpdated(updatedGroup)
+                showsEditorSheet = false
+                return
+            }
+            if case let .failure(message) = viewModel.actionState {
+                groupEditorErrorMessage = message
+            }
+        }
+    }
+
+    private func confirmGroupDelete() async {
+        guard let deletedGroupID = await viewModel.deleteGroup() else { return }
+        showsDeleteConfirmation = false
+        showsManagementDialog = false
+        showsEditorSheet = false
+        onGroupDeleted(deletedGroupID)
+        router.removeRoutes(referencingGroupID: deletedGroupID)
+    }
+
+    private func clearGroupEditorError() {
+        groupEditorErrorMessage = nil
+    }
+
+    private func dismissInvalidGroupContext() {
+        onGroupDeleted(viewModel.groupID)
+        router.removeRoutes(referencingGroupID: viewModel.groupID)
+    }
 }
 
 struct RecruitBoardScreen: View {
@@ -4419,115 +6430,28 @@ struct RecruitBoardScreen: View {
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
     @State private var activeSheet: ActiveSheet?
-    @State private var createTitle = ""
-    @State private var createBody = ""
-    @State private var createPositions = "MID,SUP"
+    @State private var recruitEditorDraft = RecruitEditorDraft(postType: .memberRecruit)
     @State private var createPostErrorMessage: String?
+    @State private var pendingCreatedPost: RecruitPost?
+    @State private var activeCreateGroupID: String?
+    @State private var activeFilterSheet: RecruitFilterSheet?
+    @State private var filterDraft = RecruitBoardFilterState.defaultValue
 
     var body: some View {
         TabRootScaffold(title: AppTab.recruit.title, trailingAction: createRecruitHeaderAction) {
             Group {
                 switch viewModel.state {
-                case .initial, .loading:
+                case .initial:
                     LoadingStateView(title: "모집글을 불러오는 중입니다")
-                        .task { await viewModel.load() }
+                        .task { await viewModel.load(trigger: .screenAppear) }
+                case .loading:
+                    LoadingStateView(title: "모집글을 불러오는 중입니다")
                 case let .error(error):
-                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: .retry) } }
                 case let .empty(message):
-                    VStack(spacing: 0) {
-                        StatusBarView()
-                        EmptyStateView(title: "모집", message: message, actionTitle: "글 작성") {
-                            presentCreateRecruitEntry(source: "empty_state")
-                        }
-                    }
+                    recruitBoardContent(snapshot: nil, emptyMessage: message)
                 case let .content(snapshot), let .refreshing(snapshot):
-                    ScrollView(showsIndicators: false) {
-                        VStack(spacing: 0) {
-                            VStack(spacing: 16) {
-                                HStack(spacing: 4) {
-                                    typeButton(.memberRecruit)
-                                    typeButton(.opponentRecruit)
-                                }
-                                .padding(3)
-                                .background(AppPalette.bgSecondary)
-                                .clipShape(RoundedRectangle(cornerRadius: 10))
-
-                                HStack(spacing: 8) {
-                                    FilterChipView(title: "날짜", tint: AppPalette.textMuted)
-                                    FilterChipView(title: "포지션", tint: AppPalette.textMuted)
-                                    FilterChipView(title: "지역", tint: AppPalette.textMuted)
-                                    FilterChipView(title: "성향", tint: AppPalette.textMuted)
-                                }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-
-                                ForEach(snapshot.posts) { post in
-                                    Button {
-                                        session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
-                                    } label: {
-                                        VStack(alignment: .leading, spacing: 10) {
-                                            HStack {
-                                                Text(post.title)
-                                                    .font(AppTypography.body(14, weight: .semibold))
-                                                    .foregroundStyle(AppPalette.textPrimary)
-                                                Spacer()
-                                                if post.tags.contains("급구") {
-                                                    Text("급구")
-                                                        .font(AppTypography.body(11, weight: .semibold))
-                                                        .foregroundStyle(AppPalette.bgPrimary)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 3)
-                                                        .background(AppPalette.accentGreen)
-                                                        .clipShape(Capsule())
-                                                }
-                                            }
-
-                                            HStack(spacing: 8) {
-                                                Text(post.groupID)
-                                                if let scheduledAt = post.scheduledAt {
-                                                    Text(scheduledAt.shortDateText)
-                                                        .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
-                                                }
-                                            }
-                                            .font(AppTypography.body(12))
-                                            .foregroundStyle(AppPalette.textSecondary)
-
-                                            HStack(spacing: 6) {
-                                                ForEach(post.requiredPositions, id: \.self) { value in
-                                                    Text(value)
-                                                        .font(AppTypography.body(11))
-                                                        .foregroundStyle(AppPalette.accentBlue)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 3)
-                                                        .background(AppPalette.bgTertiary)
-                                                        .clipShape(Capsule())
-                                                }
-                                                ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
-                                                    Text(value)
-                                                        .font(AppTypography.body(11))
-                                                        .foregroundStyle(AppPalette.accentPurple)
-                                                        .padding(.horizontal, 8)
-                                                        .padding(.vertical, 3)
-                                                        .background(AppPalette.bgTertiary)
-                                                        .clipShape(Capsule())
-                                                }
-                                            }
-                                            Text(post.status == .open ? "모집 중" : post.status.rawValue)
-                                                .font(AppTypography.body(12, weight: .semibold))
-                                                .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
-                                        }
-                                        .padding(16)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .background(AppPalette.bgCard)
-                                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
-                                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                            .padding(.horizontal, 24)
-                            .padding(.top, 8)
-                        }
-                    }
+                    recruitBoardContent(snapshot: snapshot, emptyMessage: nil)
                 }
             }
         }
@@ -4542,7 +6466,22 @@ struct RecruitBoardScreen: View {
             debugCreateRecruitingPost("showModal=createRecruitingPost")
             session.requestModalPresentation(.recruitCreate)
         }
+        .onAppear {
+            debugRecruitScreen("onAppear currentPostType=\(viewModel.selectedType.rawValue)")
+        }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .overlay {
+            if let activeFilterSheet {
+                DimmedBottomSheet(
+                    title: filterSheetTitle(for: activeFilterSheet),
+                    onDismiss: { self.activeFilterSheet = nil },
+                    maxHeightRatio: 0.66
+                ) {
+                    filterSheetContent(activeFilterSheet)
+                }
+            }
+        }
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: activeFilterSheet)
     }
 
     private var createRecruitHeaderAction: TabHeaderAction {
@@ -4552,69 +6491,31 @@ struct RecruitBoardScreen: View {
     }
 
     private func typeButton(_ type: RecruitingPostType) -> some View {
-        Button(type.title) {
+        Button {
             Task { await viewModel.switchType(type) }
+        } label: {
+            Text(type.title)
+                .font(AppTypography.body(13, weight: viewModel.selectedType == type ? .semibold : .regular))
+                .foregroundStyle(viewModel.selectedType == type ? Color.white : AppPalette.textMuted)
+                .frame(maxWidth: .infinity)
+                .frame(minHeight: 40)
+                .contentShape(Rectangle())
         }
-        .font(AppTypography.body(13, weight: viewModel.selectedType == type ? .semibold : .regular))
-        .foregroundStyle(viewModel.selectedType == type ? Color.white : AppPalette.textMuted)
-        .frame(maxWidth: .infinity)
-        .frame(height: 32)
+        .buttonStyle(.plain)
         .background(viewModel.selectedType == type ? AppPalette.accentBlue : .clear)
         .clipShape(RoundedRectangle(cornerRadius: 8))
+        .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
     private var createSheet: some View {
-        NavigationStack {
-            Form {
-                TextField("제목", text: $createTitle)
-                TextField("본문", text: $createBody, axis: .vertical)
-                TextField("포지션 (쉼표 구분)", text: $createPositions)
-                if let createPostErrorMessage {
-                    Text(createPostErrorMessage)
-                        .font(AppTypography.body(12, weight: .semibold))
-                        .foregroundStyle(AppPalette.accentRed)
-                }
-                Text("모집글 생성은 실제 서버를 호출합니다. groupId는 로컬에 저장된 첫 그룹을 사용합니다.")
-                    .font(AppTypography.body(12))
-                    .foregroundStyle(AppPalette.textSecondary)
-            }
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    Button("닫기") {
-                        dismissCreateRecruitSheet(reason: "close_button")
-                    }
-                    .disabled(isCreateRecruitSubmitInFlight)
-                }
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        submitCreateRecruitingPost()
-                    } label: {
-                        if isCreateRecruitSubmitInFlight {
-                            ProgressView()
-                                .tint(AppPalette.accentBlue)
-                        } else {
-                            Text("등록")
-                        }
-                    }
-                    .disabled(isCreateRecruitSubmitDisabled)
-                }
-            }
-        }
-    }
-
-    private var normalizedCreateTitle: String {
-        createTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedCreateBody: String {
-        createBody.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var normalizedCreatePositions: [String] {
-        createPositions
-            .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
+        RecruitEditorSheet(
+            mode: .create,
+            draft: $recruitEditorDraft,
+            errorMessage: createPostErrorMessage,
+            isSubmitting: isCreateRecruitSubmitInFlight,
+            onClose: { dismissCreateRecruitSheet(reason: "close_button") },
+            onSubmit: submitCreateRecruitingPost
+        )
     }
 
     private var isCreateRecruitSubmitInFlight: Bool {
@@ -4622,10 +6523,6 @@ struct RecruitBoardScreen: View {
             return true
         }
         return false
-    }
-
-    private var isCreateRecruitSubmitDisabled: Bool {
-        normalizedCreateTitle.count < 2 || isCreateRecruitSubmitInFlight
     }
 
     private func presentCreateRecruitEntry(source: String) {
@@ -4638,7 +6535,9 @@ struct RecruitBoardScreen: View {
             return
         }
         debugCreateRecruitingPost("auth=authenticated")
+        guard let groupID = viewModel.resolveCreatePostGroupContext() else { return }
         resetCreateRecruitDraft()
+        activeCreateGroupID = groupID
         activeSheet = .createPost
     }
 
@@ -4646,24 +6545,22 @@ struct RecruitBoardScreen: View {
         debugCreateRecruitingPost("tap")
         createPostErrorMessage = nil
 
-        guard normalizedCreateTitle.count >= 2 else {
+        guard recruitEditorDraft.normalizedTitle.count >= 2 else {
             debugCreateRecruitingPost("validation=failed reason=title_too_short")
             createPostErrorMessage = "제목은 2자 이상 입력해주세요."
             debugCreateRecruitingPost("showInlineError")
             return
         }
 
-        guard !normalizedCreatePositions.isEmpty else {
+        guard !recruitEditorDraft.requiredPositions.isEmpty else {
             debugCreateRecruitingPost("validation=failed reason=positions_empty")
             createPostErrorMessage = "최소 한 개 이상의 포지션을 입력해주세요."
             debugCreateRecruitingPost("showInlineError")
             return
         }
 
-        guard let groupID = session.container.localStore.storedGroupIDs.first else {
-            debugCreateRecruitingPost("validation=failed reason=missing_group")
-            createPostErrorMessage = "모집글을 연결할 그룹이 없습니다. 먼저 그룹을 생성해주세요."
-            debugCreateRecruitingPost("showInlineError")
+        guard let groupID = viewModel.validateCreatePostGroupContext(activeCreateGroupID) else {
+            dismissCreateRecruitSheet(reason: "invalid_group_context")
             return
         }
 
@@ -4682,15 +6579,19 @@ struct RecruitBoardScreen: View {
         Task {
             let result = await viewModel.createPost(
                 groupID: groupID,
-                title: normalizedCreateTitle,
-                body: normalizedCreateBody,
-                tags: ["빡겜"],
-                positions: normalizedCreatePositions
+                title: recruitEditorDraft.normalizedTitle,
+                body: recruitEditorDraft.normalizedBody,
+                tags: recruitEditorDraft.composedTags,
+                scheduledAt: recruitEditorDraft.effectiveScheduledAt,
+                positions: recruitEditorDraft.requiredPositions
             )
 
             switch result {
-            case .success:
+            case let .success(post):
+                pendingCreatedPost = post
                 dismissCreateRecruitSheet(reason: "success")
+            case .invalidGroupContext:
+                dismissCreateRecruitSheet(reason: "invalid_group_context")
             case let .failure(message):
                 createPostErrorMessage = message
                 debugCreateRecruitingPost("showInlineError")
@@ -4709,15 +6610,352 @@ struct RecruitBoardScreen: View {
 
     private func handleCreateRecruitSheetDismissed() {
         debugCreateRecruitingPost("dismiss")
+        debugRecruitScreen("dismiss create sheet")
         session.handleModalDismissed(.recruitCreate)
         resetCreateRecruitDraft()
+        activeCreateGroupID = nil
+        if let pendingCreatedPost {
+            self.pendingCreatedPost = nil
+            viewModel.handleCreateSuccess(pendingCreatedPost)
+            Task {
+                await viewModel.load(force: true, trigger: .createSheetDismissed)
+            }
+        }
     }
 
     private func resetCreateRecruitDraft() {
-        createTitle = ""
-        createBody = ""
-        createPositions = "MID,SUP"
+        recruitEditorDraft = RecruitEditorDraft(postType: viewModel.selectedType)
         createPostErrorMessage = nil
+    }
+
+    @ViewBuilder
+    private func recruitBoardContent(snapshot: RecruitBoardSnapshot?, emptyMessage: String?) -> some View {
+        ScrollView(showsIndicators: false) {
+            VStack(spacing: 0) {
+                VStack(spacing: 16) {
+                    HStack(spacing: 4) {
+                        typeButton(.memberRecruit)
+                        typeButton(.opponentRecruit)
+                    }
+                    .padding(3)
+                    .background(AppPalette.bgSecondary)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            filterChip(.date, title: dateFilterChipTitle)
+                            filterChip(.positions, title: positionsFilterChipTitle)
+                            filterChip(.regions, title: regionsFilterChipTitle)
+                            filterChip(.tags, title: tagsFilterChipTitle)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if let snapshot {
+                        ForEach(snapshot.posts) { post in
+                            recruitPostCard(post, snapshot: snapshot)
+                        }
+                    } else if let emptyMessage {
+                        EmptyStateView(title: "모집", message: emptyMessage, actionTitle: "글 작성") {
+                            presentCreateRecruitEntry(source: "empty_state")
+                        }
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.top, 8)
+            }
+        }
+    }
+
+    private func recruitPostCard(_ post: RecruitPost, snapshot: RecruitBoardSnapshot) -> some View {
+        Button {
+            debugRecruitScreen("navigate detail postId=\(post.id)")
+            session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(post.title)
+                        .font(AppTypography.body(14, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                    Spacer()
+                    if post.tags.contains("급구") {
+                        Text("급구")
+                            .font(AppTypography.body(11, weight: .semibold))
+                            .foregroundStyle(AppPalette.bgPrimary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(AppPalette.accentGreen)
+                            .clipShape(Capsule())
+                    }
+                }
+
+                HStack(spacing: 8) {
+                    Text(snapshot.groupNamesByID[post.groupID] ?? "그룹 정보 없음")
+                    if let region = snapshot.groupRegionsByID[post.groupID] {
+                        Text(region)
+                    }
+                    if let scheduledAt = post.scheduledAt {
+                        Text(scheduledAt.shortDateText)
+                            .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
+                    }
+                }
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+
+                HStack(spacing: 6) {
+                    ForEach(post.requiredPositions, id: \.self) { value in
+                        Text(value)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.accentBlue)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(AppPalette.bgTertiary)
+                            .clipShape(Capsule())
+                    }
+                    ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
+                        Text(value)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.accentPurple)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(AppPalette.bgTertiary)
+                            .clipShape(Capsule())
+                    }
+                }
+                Text(post.status == .open ? "모집 중" : post.status.rawValue)
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(AppPalette.bgCard)
+            .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func filterChip(_ sheet: RecruitFilterSheet, title: String) -> some View {
+        Button {
+            filterDraft = viewModel.filterState
+            activeFilterSheet = sheet
+        } label: {
+            FilterChipView(title: title, tint: filterChipTint(for: sheet), isSelected: isFilterActive(sheet))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var dateFilterChipTitle: String {
+        let dateFilter = viewModel.filterState.selectedDateFilter
+        switch dateFilter.preset {
+        case .all:
+            return dateFilter.includesUnscheduledPosts ? "날짜" : "날짜 · 미정 제외"
+        case .today:
+            return "오늘"
+        case .thisWeek:
+            return "이번 주"
+        case .specificDate:
+            return dateFilter.selectedDate.shortDateText
+        }
+    }
+
+    private var positionsFilterChipTitle: String {
+        let count = viewModel.filterState.selectedPositions.count
+        return count == 0 ? "포지션" : "포지션 \(count)"
+    }
+
+    private var regionsFilterChipTitle: String {
+        let regions = viewModel.filterState.selectedRegions.sorted()
+        switch regions.count {
+        case 0:
+            return "지역"
+        case 1:
+            return regions[0]
+        default:
+            return "지역 \(regions.count)"
+        }
+    }
+
+    private var tagsFilterChipTitle: String {
+        let count = viewModel.filterState.selectedTags.count
+        return count == 0 ? "성향" : "성향 \(count)"
+    }
+
+    private func filterChipTint(for sheet: RecruitFilterSheet) -> Color {
+        switch sheet {
+        case .date, .positions:
+            return AppPalette.accentBlue
+        case .regions, .tags:
+            return AppPalette.accentPurple
+        }
+    }
+
+    private func isFilterActive(_ sheet: RecruitFilterSheet) -> Bool {
+        switch sheet {
+        case .date:
+            return !viewModel.filterState.selectedDateFilter.isDefault
+        case .positions:
+            return !viewModel.filterState.selectedPositions.isEmpty
+        case .regions:
+            return !viewModel.filterState.selectedRegions.isEmpty
+        case .tags:
+            return !viewModel.filterState.selectedTags.isEmpty
+        }
+    }
+
+    private func filterSheetTitle(for sheet: RecruitFilterSheet) -> String {
+        switch sheet {
+        case .date: return "날짜 필터"
+        case .positions: return "포지션 필터"
+        case .regions: return "지역 필터"
+        case .tags: return "성향 필터"
+        }
+    }
+
+    @ViewBuilder
+    private func filterSheetContent(_ sheet: RecruitFilterSheet) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            switch sheet {
+            case .date:
+                dateFilterContent
+            case .positions:
+                selectionFilterContent(
+                    options: RecruitOptionCatalog.positions,
+                    selectedValues: filterDraft.selectedPositions,
+                    tint: AppPalette.accentBlue
+                ) { toggleFilterSelection($0, sheet: .positions) }
+            case .regions:
+                selectionFilterContent(
+                    options: RecruitOptionCatalog.regions,
+                    selectedValues: filterDraft.selectedRegions,
+                    tint: AppPalette.accentPurple
+                ) { toggleFilterSelection($0, sheet: .regions) }
+            case .tags:
+                selectionFilterContent(
+                    options: RecruitOptionCatalog.moodTags,
+                    selectedValues: filterDraft.selectedTags,
+                    tint: AppPalette.accentPurple
+                ) { toggleFilterSelection($0, sheet: .tags) }
+            }
+
+            HStack(spacing: 10) {
+                Button("취소") {
+                    activeFilterSheet = nil
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
+                Button("초기화") {
+                    resetFilterDraft(sheet)
+                }
+                .buttonStyle(SecondaryButtonStyle())
+
+                Button("적용") {
+                    applyFilterDraft(sheet)
+                }
+                .buttonStyle(PrimaryButtonStyle())
+            }
+        }
+    }
+
+    private var dateFilterContent: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 92), spacing: 8)], alignment: .leading, spacing: 8) {
+                ForEach(RecruitDateFilterPreset.allCases, id: \.self) { preset in
+                    SelectableChipButton(
+                        title: dateFilterPresetTitle(preset),
+                        tint: AppPalette.accentBlue,
+                        isSelected: filterDraft.selectedDateFilter.preset == preset
+                    ) {
+                        filterDraft.selectedDateFilter.preset = preset
+                    }
+                }
+            }
+            Toggle("예정 시간 미정 글 포함", isOn: $filterDraft.selectedDateFilter.includesUnscheduledPosts)
+                .tint(AppPalette.accentBlue)
+            if filterDraft.selectedDateFilter.preset == .specificDate {
+                DatePicker(
+                    "날짜 선택",
+                    selection: $filterDraft.selectedDateFilter.selectedDate,
+                    displayedComponents: .date
+                )
+            }
+        }
+    }
+
+    private func selectionFilterContent(
+        options: [String],
+        selectedValues: Set<String>,
+        tint: Color,
+        onToggle: @escaping (String) -> Void
+    ) -> some View {
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 88), spacing: 8)], alignment: .leading, spacing: 8) {
+            ForEach(options, id: \.self) { value in
+                SelectableChipButton(title: value, tint: tint, isSelected: selectedValues.contains(value)) {
+                    onToggle(value)
+                }
+            }
+        }
+    }
+
+    private func dateFilterPresetTitle(_ preset: RecruitDateFilterPreset) -> String {
+        switch preset {
+        case .all: return "전체"
+        case .today: return "오늘"
+        case .thisWeek: return "이번 주"
+        case .specificDate: return "날짜 선택"
+        }
+    }
+
+    private func toggleFilterSelection(_ value: String, sheet: RecruitFilterSheet) {
+        switch sheet {
+        case .positions:
+            if filterDraft.selectedPositions.contains(value) {
+                filterDraft.selectedPositions.remove(value)
+            } else {
+                filterDraft.selectedPositions.insert(value)
+            }
+        case .regions:
+            if filterDraft.selectedRegions.contains(value) {
+                filterDraft.selectedRegions.remove(value)
+            } else {
+                filterDraft.selectedRegions.insert(value)
+            }
+        case .tags:
+            if filterDraft.selectedTags.contains(value) {
+                filterDraft.selectedTags.remove(value)
+            } else {
+                filterDraft.selectedTags.insert(value)
+            }
+        case .date:
+            break
+        }
+    }
+
+    private func resetFilterDraft(_ sheet: RecruitFilterSheet) {
+        switch sheet {
+        case .date:
+            filterDraft.selectedDateFilter = RecruitDateFilter()
+        case .positions:
+            filterDraft.selectedPositions.removeAll()
+        case .regions:
+            filterDraft.selectedRegions.removeAll()
+        case .tags:
+            filterDraft.selectedTags.removeAll()
+        }
+    }
+
+    private func applyFilterDraft(_ sheet: RecruitFilterSheet) {
+        let reason: RecruitBoardFilterChangeReason
+        switch sheet {
+        case .date: reason = .date
+        case .positions: reason = .positions
+        case .regions: reason = .regions
+        case .tags: reason = .tags
+        }
+        Task {
+            await viewModel.applyFilters(filterDraft, reason: reason)
+            activeFilterSheet = nil
+        }
     }
 
     private func debugCreateRecruitingPost(_ message: String) {
@@ -4725,22 +6963,42 @@ struct RecruitBoardScreen: View {
         print("[CreateRecruitingPost] \(message)")
         #endif
     }
+
+    private func debugRecruitScreen(_ message: String) {
+        #if DEBUG
+        print("[RecruitScreen] \(message)")
+        #endif
+    }
 }
 
 struct RecruitDetailScreen: View {
     @ObservedObject var viewModel: RecruitDetailViewModel
     @ObservedObject var router: AppRouter
+    let onUpdateSuccess: (RecruitPost) -> Void
+    let onDeleteSuccess: (RecruitPost) -> Void
+    @State private var isDeleteConfirmationPresented = false
+    @State private var isManagementDialogPresented = false
+    @State private var isEditorPresented = false
+    @State private var recruitEditorDraft = RecruitEditorDraft(postType: .memberRecruit)
+    @State private var recruitEditorErrorMessage: String?
 
     var body: some View {
-        screenScaffold(title: "모집 상세", onBack: router.pop) {
+        screenScaffold(
+            title: "모집 상세",
+            onBack: router.pop,
+            rightSystemImage: viewModel.isEditVisible || viewModel.isDeleteVisible ? "ellipsis.circle" : nil,
+            onRightTap: { isManagementDialogPresented = true }
+        ) {
             switch viewModel.state {
-            case .initial, .loading:
+            case .initial:
                 LoadingStateView(title: "모집 상세를 불러오는 중입니다")
-                    .task { await viewModel.load() }
+                    .task { await viewModel.load(trigger: .screenAppear) }
+            case .loading:
+                LoadingStateView(title: "모집 상세를 불러오는 중입니다")
             case let .error(error):
-                ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-            case .empty:
-                EmptyStateView(title: "모집 상세", message: "모집글을 찾을 수 없습니다.")
+                ErrorStateView(error: error) { Task { await viewModel.load(force: true, trigger: .retry) } }
+            case let .empty(message):
+                EmptyStateView(title: "모집 상세", message: message)
             case let .content(post), let .refreshing(post):
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 16) {
@@ -4748,11 +7006,11 @@ struct RecruitDetailScreen: View {
                             Text(post.title)
                                 .font(AppTypography.heading(18, weight: .bold))
                             HStack(spacing: 12) {
-                                Text(post.groupID)
-                                if let scheduledAt = post.scheduledAt {
-                                    Text(scheduledAt.shortDateText)
+                                Text(post.groupName)
+                                Text(post.scheduledAtText)
+                                if let authorName = post.authorName {
+                                    Text(authorName)
                                 }
-                                Text(post.createdBy ?? "작성자 미상")
                             }
                             .font(AppTypography.body(12))
                             .foregroundStyle(AppPalette.textSecondary)
@@ -4761,10 +7019,10 @@ struct RecruitDetailScreen: View {
                         VStack(alignment: .leading, spacing: 10) {
                             Text("모집 정보")
                                 .font(AppTypography.body(14, weight: .semibold))
-                            infoRow("필요 포지션", value: post.requiredPositions.joined(separator: ", "))
-                            infoRow("상태", value: post.status.rawValue)
-                            infoRow("분위기", value: post.tags.joined(separator: ", "))
-                            infoRow("예상 시간", value: post.scheduledAt?.shortDateText ?? "미정")
+                            infoRow("필요 포지션", value: post.requiredPositionsText)
+                            infoRow("상태", value: post.statusText)
+                            infoRow("분위기", value: post.moodTagsText)
+                            infoRow("예정 시간", value: post.scheduledAtText)
                         }
                         .padding(16)
                         .background(AppPalette.bgCard)
@@ -4773,7 +7031,7 @@ struct RecruitDetailScreen: View {
                         VStack(alignment: .leading, spacing: 10) {
                             Text("상세 설명")
                                 .font(AppTypography.heading(15, weight: .bold))
-                            Text(post.body ?? "상세 설명이 없습니다.")
+                            Text(post.bodyText)
                                 .font(AppTypography.body(13))
                                 .foregroundStyle(AppPalette.textSecondary)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -4781,28 +7039,70 @@ struct RecruitDetailScreen: View {
                     }
                     .padding(16)
                 }
-                HStack(spacing: 8) {
-                    Button("참가 신청") {
-                        viewModel.actionState = .failure("실제 서버에 참가 신청 endpoint가 없어 현재 단계에서는 지원하지 않습니다.")
-                    }
-                    .buttonStyle(PrimaryButtonStyle())
-
-                    Button("내전 생성") {
-                        Task {
-                            if let match = await viewModel.createMatch() {
-                                router.push(.matchLobby(groupID: post.groupID, matchID: match.id))
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Button("참가 신청") {
+                            Task {
+                                if let updatedPost = await viewModel.applyToRecruit() {
+                                    onUpdateSuccess(updatedPost)
+                                }
                             }
                         }
+                        .buttonStyle(PrimaryButtonStyle())
+                        .disabled(!viewModel.isApplyButtonEnabled)
+
+                        Button("내전 생성") {
+                            Task {
+                                if let match = await viewModel.createMatch() {
+                                    router.push(.matchLobby(groupID: post.groupID, matchID: match.id))
+                                }
+                            }
+                        }
+                        .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
+                        .disabled(!viewModel.isCreateMatchButtonEnabled)
+                        .frame(maxWidth: 120)
                     }
-                    .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
-                    .frame(maxWidth: 120)
+
+                    if let note = viewModel.applyCapabilityNote {
+                        Text(note)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
                 .background(AppPalette.bgSecondary)
             }
         }
+        .sheet(isPresented: $isEditorPresented, onDismiss: clearRecruitEditorError) {
+            RecruitEditorSheet(
+                mode: .edit,
+                draft: $recruitEditorDraft,
+                errorMessage: recruitEditorErrorMessage,
+                isSubmitting: viewModel.isMutationInFlight,
+                onClose: { isEditorPresented = false },
+                onSubmit: submitRecruitUpdate
+            )
+        }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .confirmationDialog("모집글 관리", isPresented: $isManagementDialogPresented, titleVisibility: .visible) {
+            if viewModel.isEditVisible {
+                Button("수정") { presentRecruitEditor() }
+            }
+            if viewModel.isDeleteVisible {
+                Button("삭제", role: .destructive) { promptDeleteConfirmation() }
+            }
+            Button("취소", role: .cancel) {}
+        }
+        .alert("이 모집글을 삭제할까요?", isPresented: $isDeleteConfirmationPresented) {
+            Button("취소", role: .cancel) {}
+            Button("삭제", role: .destructive) {
+                Task { await confirmDelete() }
+            }
+        } message: {
+            Text("삭제한 모집글은 복구할 수 없습니다.")
+        }
     }
 
     private func infoRow(_ title: String, value: String) -> some View {
@@ -4814,6 +7114,50 @@ struct RecruitDetailScreen: View {
                 .multilineTextAlignment(.trailing)
         }
         .font(AppTypography.body(13))
+    }
+
+    private func promptDeleteConfirmation() {
+        guard viewModel.beginDeleteConfirmation() else { return }
+        isDeleteConfirmationPresented = true
+    }
+
+    private func presentRecruitEditor() {
+        guard let draft = viewModel.makeEditorDraft() else { return }
+        recruitEditorDraft = draft
+        recruitEditorErrorMessage = nil
+        isEditorPresented = true
+    }
+
+    private func submitRecruitUpdate() {
+        recruitEditorErrorMessage = nil
+        Task {
+            let updatedPost = await viewModel.updatePost(
+                title: recruitEditorDraft.normalizedTitle,
+                body: recruitEditorDraft.normalizedBody,
+                tags: recruitEditorDraft.composedTags,
+                scheduledAt: recruitEditorDraft.effectiveScheduledAt,
+                requiredPositions: recruitEditorDraft.requiredPositions
+            )
+            if let updatedPost {
+                onUpdateSuccess(updatedPost)
+                isEditorPresented = false
+                return
+            }
+            if case let .failure(message) = viewModel.actionState {
+                recruitEditorErrorMessage = message
+            }
+        }
+    }
+
+    private func confirmDelete() async {
+        guard let deletedPost = await viewModel.deletePost() else { return }
+        onDeleteSuccess(deletedPost)
+        viewModel.didNavigateBackAfterDelete()
+        router.pop()
+    }
+
+    private func clearRecruitEditorError() {
+        recruitEditorErrorMessage = nil
     }
 }
 
@@ -4929,71 +7273,15 @@ struct MatchDetailScreen: View {
                 EmptyStateView(title: "경기 상세", message: "경기 데이터를 찾을 수 없습니다.")
             case let .content(snapshot), let .refreshing(snapshot):
                 ScrollView(showsIndicators: false) {
-                    VStack(spacing: 14) {
-                        VStack(spacing: 10) {
-                            Text(snapshot.match.scheduledAt?.dottedDateText ?? Date().dottedDateText)
-                                .font(AppTypography.body(12))
-                                .foregroundStyle(AppPalette.textMuted)
-                            HStack(spacing: 16) {
-                                Text("블루")
-                                    .foregroundStyle(AppPalette.teamBlue)
-                                Text("VS")
-                                    .foregroundStyle(AppPalette.textSecondary)
-                                Text("레드")
-                                    .foregroundStyle(AppPalette.teamRed)
-                            }
-                            .font(AppTypography.heading(18, weight: .bold))
-                            if let result = snapshot.result {
-                                Text(result.resultStatus.title)
-                                    .font(AppTypography.body(12))
-                                    .foregroundStyle(AppPalette.accentGreen)
-                            }
-                            if let cache = snapshot.cachedMetadata {
-                                HStack(spacing: 16) {
-                                    overviewStat("예상 밸런스", value: "\(cache.balanceRating)/5")
-                                    overviewStat("승리 팀", value: cache.winningTeam.title)
-                                    overviewStat("MVP", value: mvpName(cache.mvpUserID, match: snapshot.match))
-                                }
-                            } else {
-                                Text("서버 결과 상세 응답에는 MVP와 체감 밸런스가 포함되지 않아, 클라이언트에서 저장한 값이 있을 때만 표시합니다.")
-                                    .font(AppTypography.body(12))
-                                    .foregroundStyle(AppPalette.textSecondary)
-                                    .multilineTextAlignment(.center)
-                            }
-                        }
-                        .padding(16)
-                        .frame(maxWidth: .infinity)
-                        .background(
-                            LinearGradient(colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary], startPoint: .topLeading, endPoint: .bottomTrailing)
-                        )
-                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
+                    VStack(spacing: 16) {
+                        resultSummaryCard(snapshot)
 
-                        if let result = snapshot.result {
-                            HStack(spacing: 8) {
-                                statsColumn(title: "블루 팀", tint: AppPalette.teamBlue, players: teamPlayers(side: .blue, match: snapshot.match, result: result))
-                                statsColumn(title: "레드 팀", tint: AppPalette.teamRed, players: teamPlayers(side: .red, match: snapshot.match, result: result))
-                            }
+                        HStack(alignment: .top, spacing: 10) {
+                            teamCard(side: .blue, snapshot: snapshot)
+                            teamCard(side: .red, snapshot: snapshot)
                         }
 
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("파워 변화량")
-                                .font(AppTypography.heading(14, weight: .bold))
-                            VStack(spacing: 6) {
-                                ForEach(snapshot.match.players) { player in
-                                    HStack {
-                                        Text(player.nickname)
-                                        Spacer()
-                                        Text(deltaText(for: player, snapshot: snapshot))
-                                            .foregroundStyle(deltaColor(for: player, snapshot: snapshot))
-                                    }
-                                    .font(AppTypography.body(13, weight: .semibold))
-                                }
-                            }
-                            .padding(14)
-                            .background(AppPalette.bgCard)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                        }
+                        powerDeltaSection(snapshot)
                     }
                     .padding(16)
                 }
@@ -5001,11 +7289,12 @@ struct MatchDetailScreen: View {
                 Button("같은 인원으로 재매칭") {
                     Task {
                         if let match = await viewModel.rematch() {
-                            router.push(.matchLobby(groupID: snapshot.match.groupID, matchID: match.id))
+                            router.push(.teamBalance(groupID: snapshot.match.groupID, matchID: match.id))
                         }
                     }
                 }
                 .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentPurple))
+                .disabled(isActionInFlight)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 12)
                 .background(AppPalette.bgSecondary)
@@ -5014,639 +7303,329 @@ struct MatchDetailScreen: View {
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
     }
 
-    private func overviewStat(_ label: String, value: String) -> some View {
-        VStack(spacing: 4) {
-            Text(label)
-                .font(AppTypography.body(11))
-                .foregroundStyle(AppPalette.textSecondary)
-            Text(value)
-                .font(AppTypography.body(13, weight: .semibold))
-                .foregroundStyle(AppPalette.textPrimary)
-        }
-    }
-
-    private func statsColumn(title: String, tint: Color, players: [(MatchPlayer, MatchStat?)]) -> some View {
-        VStack(spacing: 0) {
-            Text(title)
-                .font(AppTypography.heading(12, weight: .bold))
-                .foregroundStyle(Color.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 28)
-                .background(tint)
-            VStack(spacing: 0) {
-                ForEach(players, id: \.0.id) { player, stat in
-                    HStack {
-                        Text(player.assignedRole?.shortLabel ?? "-")
-                            .font(AppTypography.body(9, weight: .bold))
-                            .foregroundStyle(tint)
-                            .frame(width: 26, alignment: .leading)
-                        Text(player.nickname)
-                            .font(AppTypography.body(11, weight: .semibold))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                        Text("\(stat?.kills ?? 0)/\(stat?.deaths ?? 0)/\(stat?.assists ?? 0)")
-                            .font(AppTypography.body(11, weight: .semibold))
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 7)
-                }
-            }
-            .background(title.contains("블루") ? Color(hex: 0x0D1B2A) : Color(hex: 0x2A0D0D))
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private func teamPlayers(side: TeamSide, match: Match, result: MatchResult) -> [(MatchPlayer, MatchStat?)] {
-        match.players
-            .filter { $0.teamSide == side }
-            .map { player in
-                (player, result.players.first(where: { $0.userID == player.userID }))
-            }
-    }
-
-    private func deltaText(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> String {
-        guard let result = snapshot.result, let teamSide = player.teamSide else { return "±0" }
-        let confidence: Double = result.resultStatus == .confirmed ? 1 : result.resultStatus == .partial ? 0.5 : 0
-        let didWin = result.winningTeam == teamSide
-        let value = Int((didWin ? 18 : -18) * confidence)
-        return value >= 0 ? "+\(value)" : "\(value)"
-    }
-
-    private func deltaColor(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> Color {
-        deltaText(for: player, snapshot: snapshot).hasPrefix("+") ? AppPalette.accentGreen : AppPalette.accentRed
-    }
-
-    private func mvpName(_ userID: String, match: Match) -> String {
-        match.players.first(where: { $0.userID == userID })?.nickname ?? "미상"
-    }
-}
-
-struct TeamBalancePreviewScreen: View {
-    @ObservedObject var session: AppSessionViewModel
-    @ObservedObject var router: AppRouter
-    @State private var draft: TeamBalancePreviewDraft
-    @State private var actionState: AsyncActionState = .idle
-    @State private var remotePreviewResult: TeamBalancePreviewResult?
-    @State private var previewStatusMessage: String?
-    @State private var previewSyncTask: Task<Void, Never>?
-
-    init(session: AppSessionViewModel, router: AppRouter) {
-        self.session = session
-        self.router = router
-        _draft = State(initialValue: session.container.localStore.teamBalancePreviewDraft)
-    }
-
-    private var previewResult: TeamBalancePreviewResult? {
-        remotePreviewResult ?? draft.makePreviewResult()
-    }
-
-    var body: some View {
-        screenScaffold(title: "팀 밸런스 프리뷰", onBack: router.pop) {
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 16) {
-                    previewIntroCard(
-                        badge: "PREVIEW",
-                        title: "게스트 팀 밸런스 프리뷰",
-                        message: "로그인 없이 임시 로스터를 구성해 팀 밸런스를 확인할 수 있어요. 이 화면의 입력값과 결과는 실제 매치에 저장되지 않고, 이 기기에만 임시 저장됩니다."
-                    )
-
-                    if let previewStatusMessage {
-                        previewStatusCard(message: previewStatusMessage)
-                    }
-
-                    sectionCard(title: "밸런스 모드", spacing: 8) {
-                        HStack(spacing: 8) {
-                            previewModeButton(.balanced)
-                            previewModeButton(.positionFirst)
-                            previewModeButton(.skillFirst)
-                        }
-                    }
-
-                    sectionCard(title: "임시 로스터", spacing: 10) {
-                        ForEach($draft.players) { $player in
-                            VStack(spacing: 10) {
-                                TextField("닉네임", text: $player.name)
-                                    .textFieldStyle(.roundedBorder)
-
-                                HStack(spacing: 10) {
-                                    Picker("포지션", selection: $player.preferredPosition) {
-                                        ForEach([Position.top, .jungle, .mid, .adc, .support], id: \.self) { position in
-                                            Text(position.shortLabel).tag(position)
-                                        }
-                                    }
-                                    .pickerStyle(.menu)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                                    Stepper(value: $player.score, in: 40 ... 100, step: 1) {
-                                        Text("점수 \(player.score)")
-                                            .font(AppTypography.body(12, weight: .semibold))
-                                    }
-                                }
-                            }
-                            .padding(12)
-                            .appPanel(background: AppPalette.bgCard, radius: 10)
-                        }
-                    }
-
-                    if let previewResult {
-                        sectionCard(title: "프리뷰 결과", spacing: 12) {
-                            HStack {
-                                VStack(alignment: .leading, spacing: 4) {
-                                    Text("블루 \(previewResult.blueTotal)")
-                                        .font(AppTypography.heading(22, weight: .heavy))
-                                        .foregroundStyle(AppPalette.teamBlue)
-                                    Text("레드 \(previewResult.redTotal)")
-                                        .font(AppTypography.body(13, weight: .semibold))
-                                        .foregroundStyle(AppPalette.teamRed)
-                                }
-                                Spacer()
-                                Text(previewResult.headline)
-                                    .font(AppTypography.body(13, weight: .semibold))
-                                    .foregroundStyle(AppPalette.accentGold)
-                            }
-
-                            HStack(spacing: 10) {
-                                previewTeamColumn(title: "블루", tint: AppPalette.teamBlue, players: previewResult.bluePlayers)
-                                previewTeamColumn(title: "레드", tint: AppPalette.teamRed, players: previewResult.redPlayers)
-                            }
-                        }
-                    }
-
-                    sectionCard(title: "다음 액션", spacing: 10) {
-                        Button("결과 프리뷰로 이어서 보기") {
-                            let nextDraft = previewResult.map(ResultPreviewDraft.defaultValue(from:)) ?? .defaultValue(from: draft)
-                            session.container.localStore.setResultPreviewDraft(nextDraft)
-                            router.push(.resultPreview)
-                        }
-                        .buttonStyle(PrimaryButtonStyle())
-
-                        HStack(spacing: 8) {
-                            Button("샘플로 초기화") {
-                                draft = .defaultValue
-                                actionState = .success("샘플 로스터로 초기화했습니다.")
-                            }
-                            .buttonStyle(SecondaryButtonStyle())
-
-                            Button("로그인 후 실제 매치로 저장") {
-                                session.requireAuthentication(for: .matchSave)
-                            }
-                            .buttonStyle(SecondaryButtonStyle())
-                        }
-
-                        Text("프리뷰 로스터와 최근 입력값은 이 기기에서만 유지됩니다. 로그인 후에도 자동 저장되지 않으며, 원할 때만 실제 매치 생성으로 이어집니다.")
-                            .font(AppTypography.body(11))
-                            .foregroundStyle(AppPalette.textMuted)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                }
-                .padding(16)
-            }
-        }
-        .overlay(alignment: .bottom) { actionBanner(actionState) }
-        .onAppear {
-            schedulePreviewRefresh(immediate: true)
-        }
-        .onDisappear {
-            previewSyncTask?.cancel()
-        }
-        .onChange(of: draft) { _, newValue in
-            session.container.localStore.setTeamBalancePreviewDraft(newValue)
-            schedulePreviewRefresh()
-        }
-    }
-
-    private func previewIntroCard(badge: String, title: String, message: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(badge)
-                .font(AppTypography.body(10, weight: .semibold))
-                .foregroundStyle(AppPalette.accentGold)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(AppPalette.bgTertiary)
-                .clipShape(Capsule())
-            Text(title)
-                .font(AppTypography.heading(18, weight: .bold))
-            Text(message)
-                .font(AppTypography.body(12))
-                .foregroundStyle(AppPalette.textSecondary)
-        }
-        .padding(16)
-        .appPanel(background: AppPalette.bgCard, radius: 12)
-    }
-
-    private func previewStatusCard(message: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "waveform.path.ecg")
-                .foregroundStyle(AppPalette.accentBlue)
-            Text(message)
-                .font(AppTypography.body(11))
-                .foregroundStyle(AppPalette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer()
-        }
-        .padding(12)
-        .appPanel(background: AppPalette.bgSecondary, radius: 10)
-    }
-
-    private func sectionCard<Content: View>(title: String, spacing: CGFloat, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: spacing) {
-            Text(title)
-                .font(AppTypography.heading(16, weight: .bold))
-            content()
-        }
-        .padding(14)
-        .appPanel(background: AppPalette.bgSecondary, radius: 12)
-    }
-
-    private func previewModeButton(_ mode: BalanceMode) -> some View {
-        Button {
-            draft.selectedMode = mode
-        } label: {
-            Text(mode.title)
-                .font(AppTypography.body(12, weight: draft.selectedMode == mode ? .semibold : .regular))
-                .foregroundStyle(draft.selectedMode == mode ? Color.white : AppPalette.textSecondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: 38)
-                .background(draft.selectedMode == mode ? AppPalette.accentBlue : AppPalette.bgCard)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func previewTeamColumn(title: String, tint: Color, players: [PreviewRosterPlayer]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(AppTypography.body(13, weight: .semibold))
-                .foregroundStyle(tint)
-            ForEach(players) { player in
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(player.sanitizedName)
-                            .font(AppTypography.body(12, weight: .semibold))
-                        Text(player.preferredPosition.shortLabel)
-                            .font(AppTypography.body(10))
-                            .foregroundStyle(AppPalette.textMuted)
-                    }
-                    Spacer()
-                    Text("\(player.clampedScore)")
-                        .font(AppTypography.body(12, weight: .semibold))
-                }
-                .padding(10)
-                .appPanel(background: AppPalette.bgCard, radius: 8)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private func schedulePreviewRefresh(immediate: Bool = false) {
-        previewSyncTask?.cancel()
-        let draftSnapshot = draft
-        if !draftSnapshot.isReady {
-            remotePreviewResult = nil
-            previewStatusMessage = "10명 로스터를 채우면 서버 프리뷰 기준으로 조합을 확인할 수 있어요."
-            return
-        }
-        previewSyncTask = Task {
-            if !immediate {
-                try? await Task.sleep(nanoseconds: 350_000_000)
-            }
-            await refreshPreview(for: draftSnapshot)
-        }
-    }
-
-    @MainActor
-    private func refreshPreview(for draftSnapshot: TeamBalancePreviewDraft) async {
-        do {
-            let result = try await session.container.matchRepository.previewBalance(draft: draftSnapshot)
-            guard !Task.isCancelled else { return }
-            remotePreviewResult = result
-            previewStatusMessage = "서버 프리뷰 기준으로 계산된 조합입니다."
-        } catch let error as UserFacingError {
-            guard !Task.isCancelled else { return }
-            remotePreviewResult = nil
-            previewStatusMessage = error.isRateLimited
-                ? "프리뷰 요청이 많아요. 잠시 후 다시 확인해 주세요."
-                : "서버 프리뷰를 확인하지 못해 이 기기 계산 결과를 보여주고 있어요."
-        } catch {
-            guard !Task.isCancelled else { return }
-            remotePreviewResult = nil
-            previewStatusMessage = "서버 프리뷰를 확인하지 못해 이 기기 계산 결과를 보여주고 있어요."
-        }
-    }
-}
-
-struct ResultPreviewScreen: View {
-    @ObservedObject var session: AppSessionViewModel
-    @ObservedObject var router: AppRouter
-    @State private var draft: ResultPreviewDraft
-    @State private var actionState: AsyncActionState = .idle
-    @State private var previewValidation: ResultPreviewValidation?
-    @State private var previewValidationMessage: String?
-    @State private var previewValidationTask: Task<Void, Never>?
-
-    init(session: AppSessionViewModel, router: AppRouter) {
-        self.session = session
-        self.router = router
-        _draft = State(initialValue: session.container.localStore.resultPreviewDraft)
-    }
-
-    private var isBusy: Bool {
-        if case .inProgress = actionState {
+    private var isActionInFlight: Bool {
+        if case .inProgress = viewModel.actionState {
             return true
         }
         return false
     }
 
-    var body: some View {
-        screenScaffold(title: "결과 프리뷰", onBack: router.pop) {
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 16) {
-                    previewIntroCard(
-                        badge: "LOCAL PREVIEW",
-                        title: "게스트 결과 입력 프리뷰",
-                        message: "지금 입력하는 결과는 실제 전적에 반영되지 않습니다. 게스트 상태에서는 이 기기에만 임시 저장되고, 로그인 후 명시적으로 계정 저장을 선택할 때만 실제 저장 흐름으로 이어집니다."
-                    )
-
-                    if let previewValidationMessage {
-                        previewValidationCard(
-                            message: previewValidationMessage,
-                            isValid: previewValidation?.isValid ?? false
-                        )
-                    }
-
-                    sectionCard(title: "승리 팀", spacing: 8) {
-                        HStack(spacing: 8) {
-                            resultTeamButton(.blue, title: "블루 승리", tint: AppPalette.teamBlue)
-                            resultTeamButton(.red, title: "레드 승리", tint: AppPalette.teamRed)
-                        }
-                    }
-
-                    sectionCard(title: "MVP", spacing: 8) {
-                        ForEach(draft.mvpCandidates) { player in
-                            Button {
-                                draft.selectedMVPPlayerID = player.id
-                            } label: {
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(player.name)
-                                            .font(AppTypography.body(13, weight: .semibold))
-                                        Text("\(player.teamSide == .blue ? "블루" : "레드") · \(player.role.shortLabel)")
-                                            .font(AppTypography.body(11))
-                                            .foregroundStyle(AppPalette.textSecondary)
-                                    }
-                                    Spacer()
-                                    Image(systemName: draft.selectedMVPPlayerID == player.id ? "checkmark.circle.fill" : "circle")
-                                        .foregroundStyle(draft.selectedMVPPlayerID == player.id ? AppPalette.accentGold : AppPalette.textMuted)
-                                }
-                                .padding(12)
-                                .appPanel(background: AppPalette.bgCard, radius: 10)
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    }
-
-                    sectionCard(title: "체감 밸런스", spacing: 8) {
-                        HStack(spacing: 8) {
-                            resultBalanceButton(title: "한쪽 우세", value: 1)
-                            resultBalanceButton(title: "살짝 우세", value: 3)
-                            resultBalanceButton(title: "접전", value: 5)
-                        }
-                    }
-
-                    HStack(spacing: 10) {
-                        resultPlayersColumn(title: "블루", tint: AppPalette.teamBlue, players: draft.players.filter { $0.teamSide == .blue })
-                        resultPlayersColumn(title: "레드", tint: AppPalette.teamRed, players: draft.players.filter { $0.teamSide == .red })
-                    }
-
-                    sectionCard(title: "다음 액션", spacing: 10) {
-                        Button("이 기기에 임시 저장") {
-                            Task { await saveLocally() }
-                        }
-                        .buttonStyle(PrimaryButtonStyle())
-                        .disabled(isBusy)
-
-                        HStack(spacing: 8) {
-                            Button("밸런스 프리뷰 다시 보기") {
-                                router.push(.teamBalancePreview)
-                            }
-                            .buttonStyle(SecondaryButtonStyle())
-
-                            Button("로그인 후 계정에 저장") {
-                                session.requireAuthentication(for: .resultSave)
-                            }
-                            .buttonStyle(SecondaryButtonStyle())
-                        }
-
-                        Text("게스트 프리뷰 기록은 프로필과 기록 탭의 로컬 영역에서만 보입니다. 로그인 직후 자동 업로드되지는 않습니다.")
-                            .font(AppTypography.body(11))
-                            .foregroundStyle(AppPalette.textMuted)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+    private func resultSummaryCard(_ snapshot: MatchDetailSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(snapshot.match.scheduledAt?.dottedDateText ?? Date().dottedDateText)
+                        .font(AppTypography.body(11, weight: .semibold))
+                        .foregroundStyle(AppPalette.textMuted)
+                    Text(viewModel.groupName(for: snapshot.match.groupID))
+                        .font(AppTypography.heading(18, weight: .bold))
+                        .foregroundStyle(AppPalette.textPrimary)
                 }
-                .padding(16)
+                Spacer()
+                resultBadge(snapshot)
+            }
+
+            HStack(alignment: .center, spacing: 12) {
+                teamHeadline(title: "블루팀", tint: AppPalette.teamBlue)
+                Text("VS")
+                    .font(AppTypography.heading(15, weight: .bold))
+                    .foregroundStyle(AppPalette.textMuted)
+                teamHeadline(title: "레드팀", tint: AppPalette.teamRed)
+            }
+            .frame(maxWidth: .infinity)
+
+            HStack(alignment: .top, spacing: 10) {
+                summaryTile(label: "MVP", value: mvpName(for: snapshot), tint: AppPalette.accentGold)
+                summaryTile(label: "예측 밸런스", value: predictedBalanceText(for: snapshot), tint: AppPalette.accentBlue)
+                summaryTile(label: "게임 밸런스", value: gameBalanceText(for: snapshot), tint: AppPalette.accentGreen)
+                summaryTile(label: "실제 결과", value: actualResultText(for: snapshot), tint: winnerColor(for: snapshot))
+            }
+
+            if snapshot.cachedMetadata == nil {
+                Text("MVP와 게임 밸런스는 이 기기에 저장된 기록이 있을 때만 표시됩니다.")
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
             }
         }
-        .overlay(alignment: .bottom) { actionBanner(actionState) }
-        .onAppear {
-            schedulePreviewValidation(immediate: true)
-        }
-        .onDisappear {
-            previewValidationTask?.cancel()
-        }
-        .onChange(of: draft) { _, newValue in
-            if !newValue.mvpCandidates.contains(where: { newValue.selectedMVPPlayerID == $0.id }) {
-                draft.selectedMVPPlayerID = newValue.mvpCandidates.first?.id
-            }
-            session.container.localStore.setResultPreviewDraft(draft)
-            schedulePreviewValidation()
-        }
-    }
-
-    private func saveLocally() async {
-        guard let selectedPlayer = draft.mvpCandidates.first(where: { draft.selectedMVPPlayerID == $0.id }) ?? draft.mvpCandidates.first else {
-            actionState = .failure("MVP를 선택해 주세요.")
-            return
-        }
-
-        actionState = .inProgress("서버 프리뷰를 확인하는 중입니다")
-        do {
-            let validation = try await session.container.matchRepository.previewResult(draft: draft)
-            previewValidation = validation
-            previewValidationMessage = validation.message
-            guard validation.isValid else {
-                actionState = .failure(validation.message)
-                return
-            }
-        } catch let error as UserFacingError {
-            let message = error.isRateLimited
-                ? "프리뷰 요청이 많아요. 잠시 후 다시 저장해 주세요."
-                : "서버 프리뷰를 확인한 뒤 저장할 수 있어요. 잠시 후 다시 시도해 주세요."
-            previewValidation = nil
-            previewValidationMessage = message
-            actionState = .failure(message)
-            return
-        } catch {
-            previewValidation = nil
-            previewValidationMessage = "서버 프리뷰를 확인한 뒤 저장할 수 있어요. 잠시 후 다시 시도해 주세요."
-            actionState = .failure("서버 프리뷰를 확인한 뒤 저장할 수 있어요. 잠시 후 다시 시도해 주세요.")
-            return
-        }
-
-        let matchID = "guest-preview-\(UUID().uuidString)"
-        session.container.localStore.trackMatch(
-            RecentMatchContext(
-                matchID: matchID,
-                groupID: "guest-preview",
-                groupName: "게스트 프리뷰",
-                createdAt: Date()
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
             )
         )
-        session.container.localStore.cacheResult(
-            matchID: matchID,
-            metadata: CachedResultMetadata(
-                winningTeam: draft.winningTeam,
-                mvpUserID: selectedPlayer.name,
-                balanceRating: draft.balanceRating,
-                updatedAt: Date()
-            )
-        )
-        session.container.localStore.appendNotification(
-            title: "게스트 결과 저장",
-            body: "프리뷰 결과가 이 기기에만 임시 저장되었습니다.",
-            symbol: "externaldrive.fill.badge.checkmark"
-        )
-        actionState = .success("프리뷰 결과를 이 기기에 임시 저장했습니다.")
+        .overlay(RoundedRectangle(cornerRadius: 18).stroke(AppPalette.border, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 18))
     }
 
-    private func previewIntroCard(badge: String, title: String, message: String) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(badge)
+    private func summaryTile(label: String, value: String, tint: Color) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(label)
                 .font(AppTypography.body(10, weight: .semibold))
-                .foregroundStyle(AppPalette.accentGreen)
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-                .background(AppPalette.bgTertiary)
-                .clipShape(Capsule())
-            Text(title)
-                .font(AppTypography.heading(18, weight: .bold))
-            Text(message)
-                .font(AppTypography.body(12))
-                .foregroundStyle(AppPalette.textSecondary)
+                .foregroundStyle(AppPalette.textMuted)
+            Text(value)
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(value == "기록 없음" || value == "계산 전" ? AppPalette.textSecondary : tint)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(12)
+        .appPanel(background: AppPalette.bgCard.opacity(0.92), radius: 12)
+    }
+
+    private func resultBadge(_ snapshot: MatchDetailSnapshot) -> some View {
+        Text(resultStatusText(for: snapshot))
+            .font(AppTypography.body(11, weight: .semibold))
+            .foregroundStyle(AppPalette.bgPrimary)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 5)
+            .background(resultStatusColor(for: snapshot))
+            .clipShape(Capsule())
+    }
+
+    private func teamHeadline(title: String, tint: Color) -> some View {
+        Text(title)
+            .font(AppTypography.heading(18, weight: .bold))
+            .foregroundStyle(tint)
+            .frame(maxWidth: .infinity)
+    }
+
+    private func teamCard(side: TeamSide, snapshot: MatchDetailSnapshot) -> some View {
+        let players = teamPlayers(side: side, snapshot: snapshot)
+        let tint = side == .blue ? AppPalette.teamBlue : AppPalette.teamRed
+        let background = side == .blue ? Color(hex: 0x0D1B2A) : Color(hex: 0x2A0D0D)
+
+        return VStack(spacing: 0) {
+            HStack {
+                Text(side == .blue ? "블루 팀" : "레드 팀")
+                    .font(AppTypography.heading(13, weight: .bold))
+                    .foregroundStyle(Color.white)
+                Spacer()
+                if winningTeam(for: snapshot) == side {
+                    Text("WIN")
+                        .font(AppTypography.body(10, weight: .bold))
+                        .foregroundStyle(AppPalette.bgPrimary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(AppPalette.accentGold)
+                        .clipShape(Capsule())
+                }
+            }
+            .padding(.horizontal, 12)
+            .frame(maxWidth: .infinity)
+            .frame(height: 34)
+            .background(tint)
+
+            VStack(spacing: 1) {
+                ForEach(players, id: \.0.id) { player, stat in
+                    HStack(spacing: 8) {
+                        Text(player.assignedRole?.shortLabel ?? "-")
+                            .font(AppTypography.body(10, weight: .bold))
+                            .foregroundStyle(tint)
+                            .frame(width: 30, alignment: .leading)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            HStack(spacing: 4) {
+                                Text(player.nickname)
+                                    .font(AppTypography.body(12, weight: .semibold))
+                                    .foregroundStyle(AppPalette.textPrimary)
+                                if isMVP(player: player, snapshot: snapshot) {
+                                    Image(systemName: "star.fill")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .foregroundStyle(AppPalette.accentGold)
+                                }
+                            }
+                            Text(statLine(for: stat))
+                                .font(AppTypography.body(10))
+                                .foregroundStyle(stat == nil ? AppPalette.textMuted : AppPalette.textSecondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 9)
+                    .background(isMVP(player: player, snapshot: snapshot) ? tint.opacity(0.16) : background.opacity(0.96))
+                }
+            }
+            .background(background)
+        }
+        .frame(maxWidth: .infinity, alignment: .top)
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func powerDeltaSection(_ snapshot: MatchDetailSnapshot) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("파워 변화량")
+                .font(AppTypography.heading(15, weight: .bold))
+            VStack(spacing: 8) {
+                ForEach(sortedPlayers(for: snapshot.match)) { player in
+                    let delta = deltaText(for: player, snapshot: snapshot)
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(player.nickname)
+                                .font(AppTypography.body(13, weight: .semibold))
+                            Text(player.assignedRole?.shortLabel ?? "포지션 미정")
+                                .font(AppTypography.body(10))
+                                .foregroundStyle(AppPalette.textMuted)
+                        }
+                        Spacer()
+                        Text(delta ?? "계산 전")
+                            .font(AppTypography.body(13, weight: .semibold))
+                            .foregroundStyle(deltaColor(for: player, snapshot: snapshot))
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 10)
+                    .appPanel(background: AppPalette.bgTertiary, radius: 10)
+                }
+            }
         }
         .padding(16)
-        .appPanel(background: AppPalette.bgCard, radius: 12)
+        .appPanel(background: AppPalette.bgCard, radius: 14)
     }
 
-    private func previewValidationCard(message: String, isValid: Bool) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: isValid ? "checkmark.shield.fill" : "exclamationmark.triangle.fill")
-                .foregroundStyle(isValid ? AppPalette.accentGreen : AppPalette.accentOrange)
-            Text(message)
-                .font(AppTypography.body(11))
-                .foregroundStyle(AppPalette.textSecondary)
-                .fixedSize(horizontal: false, vertical: true)
-            Spacer()
+    private func teamPlayers(side: TeamSide, snapshot: MatchDetailSnapshot) -> [(MatchPlayer, MatchStat?)] {
+        let players = snapshot.match.players
+            .filter { $0.teamSide == side }
+            .sorted { roleOrder($0.assignedRole) < roleOrder($1.assignedRole) }
+        return players.map { player in
+            (player, snapshot.result?.players.first(where: { $0.userID == player.userID }))
         }
-        .padding(12)
-        .appPanel(background: AppPalette.bgSecondary, radius: 10)
     }
 
-    private func sectionCard<Content: View>(title: String, spacing: CGFloat, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: spacing) {
-            Text(title)
-                .font(AppTypography.heading(16, weight: .bold))
-            content()
-        }
-        .padding(14)
-        .appPanel(background: AppPalette.bgSecondary, radius: 12)
-    }
-
-    private func resultTeamButton(_ side: TeamSide, title: String, tint: Color) -> some View {
-        Button {
-            draft.winningTeam = side
-            draft.selectedMVPPlayerID = draft.mvpCandidates.first?.id
-        } label: {
-            Text(title)
-                .font(AppTypography.body(12, weight: draft.winningTeam == side ? .semibold : .regular))
-                .foregroundStyle(draft.winningTeam == side ? Color.white : AppPalette.textSecondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: 38)
-                .background(draft.winningTeam == side ? tint : AppPalette.bgCard)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func resultBalanceButton(title: String, value: Int) -> some View {
-        Button {
-            draft.balanceRating = value
-        } label: {
-            Text(title)
-                .font(AppTypography.body(12, weight: draft.balanceRating == value ? .semibold : .regular))
-                .foregroundStyle(draft.balanceRating == value ? Color.white : AppPalette.textSecondary)
-                .frame(maxWidth: .infinity)
-                .frame(height: 38)
-                .background(draft.balanceRating == value ? AppPalette.accentGreen : AppPalette.bgCard)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func resultPlayersColumn(title: String, tint: Color, players: [ResultPreviewPlayer]) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(AppTypography.body(13, weight: .semibold))
-                .foregroundStyle(tint)
-            ForEach(players) { player in
-                HStack {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(player.name)
-                            .font(AppTypography.body(12, weight: .semibold))
-                        Text(player.role.shortLabel)
-                            .font(AppTypography.body(10))
-                            .foregroundStyle(AppPalette.textMuted)
-                    }
-                    Spacer()
-                    if draft.selectedMVPPlayerID == player.id {
-                        Image(systemName: "star.fill")
-                            .foregroundStyle(AppPalette.accentGold)
-                    }
-                }
-                .padding(10)
-                .appPanel(background: AppPalette.bgCard, radius: 8)
+    private func sortedPlayers(for match: Match) -> [MatchPlayer] {
+        match.players.sorted { left, right in
+            let leftSideOrder = left.teamSide == .blue ? 0 : 1
+            let rightSideOrder = right.teamSide == .blue ? 0 : 1
+            if leftSideOrder == rightSideOrder {
+                return roleOrder(left.assignedRole) < roleOrder(right.assignedRole)
             }
-        }
-        .frame(maxWidth: .infinity, alignment: .topLeading)
-    }
-
-    private func schedulePreviewValidation(immediate: Bool = false) {
-        previewValidationTask?.cancel()
-        let draftSnapshot = draft
-        previewValidationTask = Task {
-            if !immediate {
-                try? await Task.sleep(nanoseconds: 350_000_000)
-            }
-            await refreshPreviewValidation(for: draftSnapshot)
+            return leftSideOrder < rightSideOrder
         }
     }
 
-    @MainActor
-    private func refreshPreviewValidation(for draftSnapshot: ResultPreviewDraft) async {
-        do {
-            let validation = try await session.container.matchRepository.previewResult(draft: draftSnapshot)
-            guard !Task.isCancelled else { return }
-            previewValidation = validation
-            previewValidationMessage = validation.message
-        } catch let error as UserFacingError {
-            guard !Task.isCancelled else { return }
-            previewValidation = nil
-            previewValidationMessage = error.isRateLimited
-                ? "프리뷰 요청이 많아요. 잠시 후 다시 확인해 주세요."
-                : "서버 프리뷰 확인이 지연되고 있어요. 입력값은 이 기기에만 임시 보관됩니다."
-        } catch {
-            guard !Task.isCancelled else { return }
-            previewValidation = nil
-            previewValidationMessage = "서버 프리뷰 확인이 지연되고 있어요. 입력값은 이 기기에만 임시 보관됩니다."
+    private func roleOrder(_ role: Position?) -> Int {
+        switch role {
+        case .top: return 0
+        case .jungle: return 1
+        case .mid: return 2
+        case .adc: return 3
+        case .support: return 4
+        case .fill: return 5
+        case nil: return 6
         }
+    }
+
+    private func statLine(for stat: MatchStat?) -> String {
+        guard let stat else { return "기록 없음" }
+        return "KDA \(stat.kills)/\(stat.deaths)/\(stat.assists)"
+    }
+
+    private func resultStatusText(for snapshot: MatchDetailSnapshot) -> String {
+        if let winner = winningTeam(for: snapshot) {
+            return "\(winner.title) 승리"
+        }
+        return snapshot.result?.resultStatus.title ?? "결과 대기"
+    }
+
+    private func resultStatusColor(for snapshot: MatchDetailSnapshot) -> Color {
+        if let winner = winningTeam(for: snapshot) {
+            return winner == .blue ? AppPalette.teamBlue : AppPalette.teamRed
+        }
+        switch snapshot.result?.resultStatus {
+        case .confirmed:
+            return AppPalette.accentBlue
+        case .partial:
+            return AppPalette.accentGreen
+        case .disputed:
+            return AppPalette.accentOrange
+        case nil:
+            return AppPalette.textMuted
+        }
+    }
+
+    private func winnerColor(for snapshot: MatchDetailSnapshot) -> Color {
+        guard let winner = winningTeam(for: snapshot) else { return AppPalette.textSecondary }
+        return winner == .blue ? AppPalette.teamBlue : AppPalette.teamRed
+    }
+
+    private func winningTeam(for snapshot: MatchDetailSnapshot) -> TeamSide? {
+        snapshot.result?.winningTeam ?? snapshot.cachedMetadata?.winningTeam
+    }
+
+    private func mvpName(for snapshot: MatchDetailSnapshot) -> String {
+        guard let userID = snapshot.cachedMetadata?.mvpUserID else { return "기록 없음" }
+        return snapshot.match.players.first(where: { $0.userID == userID })?.nickname ?? "기록 없음"
+    }
+
+    private func isMVP(player: MatchPlayer, snapshot: MatchDetailSnapshot) -> Bool {
+        snapshot.cachedMetadata?.mvpUserID == player.userID
+    }
+
+    private func predictedBalanceText(for snapshot: MatchDetailSnapshot) -> String {
+        guard let candidate = selectedCandidate(in: snapshot.match) else { return "계산 전" }
+        let gap = abs(candidate.teamAPower - candidate.teamBPower)
+        if gap <= 4 {
+            return "접전 예상"
+        }
+        return candidate.teamAPower > candidate.teamBPower ? "블루 우세" : "레드 우세"
+    }
+
+    private func gameBalanceText(for snapshot: MatchDetailSnapshot) -> String {
+        guard let rating = snapshot.cachedMetadata?.balanceRating else { return "기록 없음" }
+        switch rating {
+        case ...2:
+            return "한쪽 우세"
+        case 3...4:
+            return "살짝 우세"
+        default:
+            return "접전"
+        }
+    }
+
+    private func actualResultText(for snapshot: MatchDetailSnapshot) -> String {
+        guard let winner = winningTeam(for: snapshot) else { return "기록 없음" }
+        return "\(winner.title) 승리"
+    }
+
+    private func selectedCandidate(in match: Match) -> MatchCandidate? {
+        if let candidateNo = match.selectedCandidateNo,
+           let candidate = match.candidates.first(where: { $0.candidateNo == candidateNo }) {
+            return candidate
+        }
+        return match.candidates.first(where: { $0.type == (match.balanceMode ?? .balanced) }) ?? match.candidates.first
+    }
+
+    private func deltaText(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> String? {
+        guard
+            let result = snapshot.result,
+            let teamSide = player.teamSide,
+            let winningTeam = result.winningTeam
+        else {
+            return nil
+        }
+
+        let confidence: Double
+        switch result.resultStatus {
+        case .confirmed:
+            confidence = 1
+        case .partial:
+            confidence = 0.5
+        case .disputed:
+            confidence = 0
+        }
+
+        guard confidence > 0 else { return nil }
+
+        let didWin = winningTeam == teamSide
+        let value = Int((didWin ? 18 : -18) * confidence)
+        return value >= 0 ? "+\(value)" : "\(value)"
+    }
+
+    private func deltaColor(for player: MatchPlayer, snapshot: MatchDetailSnapshot) -> Color {
+        guard let delta = deltaText(for: player, snapshot: snapshot) else { return AppPalette.textMuted }
+        return delta.hasPrefix("+") ? AppPalette.accentGreen : AppPalette.accentRed
     }
 }
 
@@ -5998,6 +7977,10 @@ struct SearchScreen: View {
             viewModel.recordRecentSearchKeyword(trimmedSearchText)
         }
         isSearchFieldFocused = false
+        guard item.destination.isAccessible else {
+            session.actionState = .failure("참여 중인 그룹만 확인할 수 있어요.")
+            return
+        }
         session.openProtectedRoute(
             item.destination.route,
             requirement: item.destination.authRequirement,

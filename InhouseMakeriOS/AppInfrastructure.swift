@@ -110,6 +110,7 @@ private enum LocalStoreKey {
     static let groupIDs = "local.group.ids"
     static let recentMatches = "local.recent.matches"
     static let cachedResults = "local.cached.results"
+    static let manualAdjustDrafts = "local.manual.adjust.drafts"
     static let notifications = "local.notifications"
     static let recentSearchKeywords = "local.recent.search.keywords"
     static let guestOnboardingCompleted = "local.guest.onboarding.completed"
@@ -401,6 +402,20 @@ private final class LocalPersistenceStore {
         }
     }
 
+    func groupName(for groupID: String) -> String? {
+        read { context in
+            recentGroupEntity(for: groupID, in: context)?
+                .groupName?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+
+    func containsGroup(id: String) -> Bool {
+        read { context in
+            recentGroupEntity(for: id, in: context) != nil
+        }
+    }
+
     func trackGroup(id: String, name: String? = nil) {
         write { context in
             let entity = recentGroupEntity(for: id, in: context)
@@ -413,6 +428,22 @@ private final class LocalPersistenceStore {
                 context.insert(entity)
             }
             pruneRecentGroups(in: context)
+        }
+    }
+
+    func deleteGroup(id: String) {
+        write { context in
+            if let entity = recentGroupEntity(for: id, in: context) {
+                context.delete(entity)
+            }
+
+            let descriptor = FetchDescriptor<LocalMatchRecordEntity>(
+                predicate: #Predicate { $0.groupID == id }
+            )
+            let relatedMatchRecords = (try? context.fetch(descriptor)) ?? []
+            for entity in relatedMatchRecords {
+                entity.groupID = nil
+            }
         }
     }
 
@@ -817,6 +848,10 @@ final class AppLocalStore {
         persistenceStore.migrateLegacyData(from: defaults)
     }
 
+    var userDefaults: UserDefaults {
+        defaults
+    }
+
     var storedGroupIDs: [String] {
         let groupIDs = persistenceStore.storedGroupIDs()
         return groupIDs.isEmpty ? (defaults.stringArray(forKey: LocalStoreKey.groupIDs) ?? []) : groupIDs
@@ -890,6 +925,10 @@ final class AppLocalStore {
         return records
     }
 
+    var manualAdjustDrafts: [String: ManualAdjustDraft] {
+        decode([String: ManualAdjustDraft].self, forKey: LocalStoreKey.manualAdjustDrafts) ?? [:]
+    }
+
     var recentSearchKeywords: [RecentSearchKeyword] {
         let keywords = persistenceStore.recentSearchKeywords()
         return keywords.isEmpty ? (decode([RecentSearchKeyword].self, forKey: LocalStoreKey.recentSearchKeywords) ?? []) : keywords
@@ -919,11 +958,27 @@ final class AppLocalStore {
         )
     }
 
-    func trackGroup(id: String) {
-        persistenceStore.trackGroup(id: id)
+    func groupName(for groupID: String) -> String? {
+        persistenceStore.groupName(for: groupID)
+    }
+
+    func containsGroup(id: String) -> Bool {
+        persistenceStore.containsGroup(id: id)
+            || storedGroupIDs.contains(id)
+    }
+
+    func trackGroup(id: String, name: String? = nil) {
+        persistenceStore.trackGroup(id: id, name: name)
         var current = storedGroupIDs.filter { $0 != id }
         current.insert(id, at: 0)
         defaults.set(Array(current.prefix(12)), forKey: LocalStoreKey.groupIDs)
+    }
+
+    func removeGroup(id: String) {
+        persistenceStore.deleteGroup(id: id)
+        defaults.set(storedGroupIDs.filter { $0 != id }, forKey: LocalStoreKey.groupIDs)
+        let filteredRecentMatches = recentMatches.filter { $0.groupID != id }
+        save(filteredRecentMatches, forKey: LocalStoreKey.recentMatches)
     }
 
     func trackMatch(_ context: RecentMatchContext) {
@@ -938,6 +993,22 @@ final class AppLocalStore {
         var current = cachedResults
         current[matchID] = metadata
         save(current, forKey: LocalStoreKey.cachedResults)
+    }
+
+    func manualAdjustDraft(matchID: String) -> ManualAdjustDraft? {
+        manualAdjustDrafts[matchID]
+    }
+
+    func saveManualAdjustDraft(matchID: String, draft: ManualAdjustDraft) {
+        var current = manualAdjustDrafts
+        current[matchID] = draft
+        save(current, forKey: LocalStoreKey.manualAdjustDrafts)
+    }
+
+    func clearManualAdjustDraft(matchID: String) {
+        var current = manualAdjustDrafts
+        current.removeValue(forKey: matchID)
+        save(current, forKey: LocalStoreKey.manualAdjustDrafts)
     }
 
     func appendNotification(title: String, body: String, symbol: String, unread: Bool = true) {
@@ -1105,6 +1176,7 @@ final class AppLocalStore {
             LocalStoreKey.groupIDs,
             LocalStoreKey.recentMatches,
             LocalStoreKey.cachedResults,
+            LocalStoreKey.manualAdjustDrafts,
             LocalStoreKey.notifications,
             LocalStoreKey.recentSearchKeywords,
             LocalStoreKey.recruitFilterType,
@@ -1382,7 +1454,12 @@ final class APIClient {
                 retryOnUnauthorized: false
             )
         default:
-            throw mapError(data: data, statusCode: httpResponse.statusCode, path: originalRequest.path)
+            throw mapError(
+                data: data,
+                statusCode: httpResponse.statusCode,
+                path: originalRequest.path,
+                method: originalRequest.method
+            )
         }
     }
 
@@ -1414,7 +1491,7 @@ final class APIClient {
         }
     }
 
-    private func mapError(data: Data, statusCode: Int, path: String) -> UserFacingError {
+    private func mapError(data: Data, statusCode: Int, path: String, method: HTTPMethod) -> UserFacingError {
         if let serverError = try? JSONDecoder.app.decode(ServerErrorResponse.self, from: data) {
             let mappedError = UserFacingError(
                 title: statusCode == 401 ? "인증 오류" : "서버 오류",
@@ -1422,18 +1499,28 @@ final class APIClient {
                 code: serverError.code,
                 provider: serverError.provider,
                 statusCode: serverError.statusCode,
-                details: serverError.details
+                details: serverError.details,
+                endpoint: path,
+                requestMethod: method.rawValue
             ).serverContractMapped
-            debugLogMappedError(path: path, error: mappedError)
+            debugLogMappedError(
+                path: path,
+                method: method,
+                rawCode: serverError.code,
+                rawMessage: serverError.message.value,
+                error: mappedError
+            )
             return mappedError
         }
         let mappedError = UserFacingError(
             title: statusCode == 401 ? "인증 오류" : "네트워크 오류",
             message: "요청 처리 중 문제가 발생했습니다. 잠시 후 다시 시도해주세요.",
             code: statusCode == 429 ? "RATE_LIMITED" : nil,
-            statusCode: statusCode
+            statusCode: statusCode,
+            endpoint: path,
+            requestMethod: method.rawValue
         ).serverContractMapped
-        debugLogMappedError(path: path, error: mappedError)
+        debugLogMappedError(path: path, method: method, error: mappedError)
         return mappedError
     }
 
@@ -1480,10 +1567,21 @@ final class APIClient {
 #endif
     }
 
-    private func debugLogMappedError(path: String, error: UserFacingError) {
+    private func debugLogMappedError(
+        path: String,
+        method: HTTPMethod,
+        rawCode: String? = nil,
+        rawMessage: String? = nil,
+        error: UserFacingError
+    ) {
 #if DEBUG
         guard shouldDebugLog(path: path) else { return }
-        print("[APIClient] mappedError \(path) title=\(error.title) code=\(error.code ?? "nil") status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+        print(
+            "[ErrorMapper] endpoint=\(path) method=\(method.rawValue) rawCode=\(rawCode ?? error.code ?? "nil") rawMessage=\(rawMessage ?? "nil") mappedMessage=\(error.message)"
+        )
+        print(
+            "[APIClient] mappedError \(path) title=\(error.title) code=\(error.code ?? "nil") status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)"
+        )
 #endif
     }
 
@@ -1492,7 +1590,9 @@ final class APIClient {
             || path == "/auth/login/email"
             || path == "/me"
             || path == "/groups"
+            || path.hasPrefix("/groups/")
             || path == "/recruiting-posts"
+            || path.hasPrefix("/recruiting-posts/")
             || path.hasSuffix("/power-profile")
             || path.hasSuffix("/inhouse-history")
             || path.hasPrefix("/riot-accounts")
@@ -1882,11 +1982,36 @@ struct GroupSummaryDTO: Codable {
     let name: String
     let description: String?
     let visibility: GroupVisibility
+    let isMember: Bool?
     let joinPolicy: JoinPolicy
     let tags: [String]
     let ownerUserId: String
     let memberCount: Int
     let recentMatches: Int
+
+    init(
+        id: String,
+        name: String,
+        description: String?,
+        visibility: GroupVisibility,
+        isMember: Bool? = nil,
+        joinPolicy: JoinPolicy,
+        tags: [String],
+        ownerUserId: String,
+        memberCount: Int,
+        recentMatches: Int
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.visibility = visibility
+        self.isMember = isMember
+        self.joinPolicy = joinPolicy
+        self.tags = tags
+        self.ownerUserId = ownerUserId
+        self.memberCount = memberCount
+        self.recentMatches = recentMatches
+    }
 
     func toDomain() -> GroupSummary {
         GroupSummary(
@@ -1894,6 +2019,7 @@ struct GroupSummaryDTO: Codable {
             name: name,
             description: description,
             visibility: visibility,
+            isMember: isMember,
             joinPolicy: joinPolicy,
             tags: tags,
             ownerUserID: ownerUserId,
@@ -1908,6 +2034,14 @@ struct GroupSummaryListDTO: Codable {
 }
 
 struct CreateGroupRequestDTO: Encodable {
+    let name: String
+    let description: String?
+    let visibility: GroupVisibility
+    let joinPolicy: JoinPolicy
+    let tags: [String]
+}
+
+struct UpdateGroupRequestDTO: Encodable {
     let name: String
     let description: String?
     let visibility: GroupVisibility
@@ -2298,6 +2432,15 @@ struct CreateRecruitPostRequestDTO: Encodable {
     let requiredPositions: [String]
 }
 
+struct UpdateRecruitPostRequestDTO: Encodable {
+    let postType: RecruitingPostType
+    let title: String
+    let body: String?
+    let tags: [String]
+    let scheduledAt: String?
+    let requiredPositions: [String]
+}
+
 // MARK: - Repositories
 
 final class AuthRepository {
@@ -2580,7 +2723,9 @@ final class GroupRepository {
             path: "/groups/public",
             requiresAuth: false
         )
-        return response.items.map { $0.toDomain() }
+        return response.items
+            .map { $0.toDomain() }
+            .filterPubliclyVisible()
     }
 
     func create(name: String, description: String?, visibility: GroupVisibility, joinPolicy: JoinPolicy, tags: [String]) async throws -> GroupSummary {
@@ -2589,6 +2734,23 @@ final class GroupRepository {
             method: .post,
             body: try apiClient.encodedBody(
                 CreateGroupRequestDTO(
+                    name: name,
+                    description: description,
+                    visibility: visibility,
+                    joinPolicy: joinPolicy,
+                    tags: tags
+                )
+            )
+        )
+        return response.toDomain()
+    }
+
+    func update(groupID: String, name: String, description: String?, visibility: GroupVisibility, joinPolicy: JoinPolicy, tags: [String]) async throws -> GroupSummary {
+        let response: GroupSummaryDTO = try await apiClient.send(
+            path: "/groups/\(groupID)",
+            method: .patch,
+            body: try apiClient.encodedBody(
+                UpdateGroupRequestDTO(
                     name: name,
                     description: description,
                     visibility: visibility,
@@ -2630,6 +2792,13 @@ final class GroupRepository {
             body: try apiClient.encodedBody(AddGroupMemberRequestDTO(userId: userID, role: role))
         )
         return response.items.map { $0.toDomain() }
+    }
+
+    func delete(groupID: String) async throws {
+        let _: EmptyResponse = try await apiClient.send(
+            path: "/groups/\(groupID)",
+            method: .delete
+        )
     }
 }
 
@@ -2778,22 +2947,29 @@ final class MatchRepository {
 
 final class RecruitingRepository {
     private let apiClient: APIClient
+    private let applyEndpointPatterns = [
+        "/recruiting-posts/%@/apply",
+        "/recruiting-posts/%@/participants",
+        "/recruiting-posts/%@/join",
+    ]
 
     init(apiClient: APIClient) {
         self.apiClient = apiClient
     }
 
     func list(type: RecruitingPostType? = nil, groupID: String? = nil, status: RecruitingPostStatus? = .open) async throws -> [RecruitPost] {
-        var queryItems: [URLQueryItem] = []
-        if let type {
-            queryItems.append(URLQueryItem(name: "postType", value: type.rawValue))
-        }
-        if let groupID {
-            queryItems.append(URLQueryItem(name: "groupId", value: groupID))
-        }
-        if let status {
-            queryItems.append(URLQueryItem(name: "status", value: status.rawValue))
-        }
+        try await list(
+            query: RecruitPostListQuery(
+                postType: type,
+                groupID: groupID,
+                status: status
+            )
+        )
+    }
+
+    func list(query: RecruitPostListQuery) async throws -> [RecruitPost] {
+        let queryItems = buildListQueryItems(from: query)
+        debugRecruitListRequest(path: "/recruiting-posts", queryItems: queryItems, includeUnscheduledSent: false)
         let response: RecruitPostListDTO = try await apiClient.sendWithoutBody(
             path: "/recruiting-posts",
             queryItems: queryItems
@@ -2802,13 +2978,17 @@ final class RecruitingRepository {
     }
 
     func listPublic(type: RecruitingPostType? = nil, status: RecruitingPostStatus? = .open) async throws -> [RecruitPost] {
-        var queryItems: [URLQueryItem] = []
-        if let type {
-            queryItems.append(URLQueryItem(name: "postType", value: type.rawValue))
-        }
-        if let status {
-            queryItems.append(URLQueryItem(name: "status", value: status.rawValue))
-        }
+        try await listPublic(
+            query: RecruitPostListQuery(
+                postType: type,
+                status: status
+            )
+        )
+    }
+
+    func listPublic(query: RecruitPostListQuery) async throws -> [RecruitPost] {
+        let queryItems = buildListQueryItems(from: query, allowsGroupID: false)
+        debugRecruitListRequest(path: "/recruiting-posts/public", queryItems: queryItems, includeUnscheduledSent: false)
         let response: RecruitPostListDTO = try await apiClient.sendWithoutBody(
             path: "/recruiting-posts/public",
             queryItems: queryItems,
@@ -2817,8 +2997,122 @@ final class RecruitingRepository {
         return response.items.map { $0.toDomain() }
     }
 
+    private func buildListQueryItems(from query: RecruitPostListQuery, allowsGroupID: Bool = true) -> [URLQueryItem] {
+        var queryItems: [URLQueryItem] = []
+        if let type = query.postType {
+            queryItems.append(URLQueryItem(name: "postType", value: type.rawValue))
+        }
+        if allowsGroupID,
+           let groupID = query.groupID?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !groupID.isEmpty
+        {
+            queryItems.append(URLQueryItem(name: "groupId", value: groupID))
+        }
+        if let status = query.status {
+            queryItems.append(URLQueryItem(name: "status", value: status.rawValue))
+        }
+        if let scheduledFrom = query.scheduledFrom {
+            queryItems.append(URLQueryItem(name: "scheduledFrom", value: ISO8601DateFormatter.simple.string(from: scheduledFrom)))
+        }
+        if let scheduledTo = query.scheduledTo {
+            queryItems.append(URLQueryItem(name: "scheduledTo", value: ISO8601DateFormatter.simple.string(from: scheduledTo)))
+        }
+        let requiredPositions = sanitizedQueryValues(query.requiredPositions)
+        if !requiredPositions.isEmpty {
+            queryItems.append(contentsOf: requiredPositions.map { URLQueryItem(name: "requiredPositions", value: $0) })
+        }
+        let regions = sanitizedQueryValues(query.regions)
+        if !regions.isEmpty {
+            queryItems.append(contentsOf: regions.map { URLQueryItem(name: "region", value: $0) })
+        }
+        let tags = sanitizedQueryValues(query.tags)
+        if !tags.isEmpty {
+            queryItems.append(contentsOf: tags.map { URLQueryItem(name: "tags", value: $0) })
+        }
+        return queryItems
+    }
+
+    private func sanitizedQueryValues(_ values: [String]) -> [String] {
+        values
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
+    private func debugRecruitListRequest(path: String, queryItems: [URLQueryItem], includeUnscheduledSent: Bool) {
+#if DEBUG
+        let queryDescription = queryItems.isEmpty
+            ? "<none>"
+            : queryItems.map { "\($0.name)=\($0.value ?? "")" }.joined(separator: "&")
+        print("[RecruitListRequest] endpoint=\(path) query=\(queryDescription)")
+        print("[RecruitListRequest] includeUnscheduled sent=\(includeUnscheduledSent)")
+#endif
+    }
+
     func detail(postID: String) async throws -> RecruitPost {
         let response: RecruitPostDTO = try await apiClient.sendWithoutBody(path: "/recruiting-posts/\(postID)")
+        return response.toDomain()
+    }
+
+    func apply(postID: String) async throws -> RecruitPost {
+        var lastCapabilityError: UserFacingError?
+
+        for pathPattern in applyEndpointPatterns {
+            let path = String(format: pathPattern, postID)
+            do {
+                let _: EmptyResponse = try await apiClient.send(path: path, method: .post)
+                return try await detail(postID: postID)
+            } catch let error as UserFacingError {
+                if error.requiresAuthentication {
+                    throw error
+                }
+                if isCapabilityUnavailable(error) {
+                    lastCapabilityError = error
+                    continue
+                }
+                throw error
+            }
+        }
+
+        throw lastCapabilityError
+            ?? UserFacingError(
+                title: "참가 신청 실패",
+                message: "참가 신청 기능을 확인하지 못했습니다.",
+                endpoint: "/recruiting-posts/\(postID)",
+                requestMethod: HTTPMethod.post.rawValue
+            )
+    }
+
+    func isCapabilityUnavailable(_ error: UserFacingError) -> Bool {
+        switch error.statusCode {
+        case 404, 405, 501:
+            return true
+        default:
+            return false
+        }
+    }
+
+    func delete(postID: String) async throws {
+        let _: EmptyResponse = try await apiClient.send(
+            path: "/recruiting-posts/\(postID)",
+            method: .delete
+        )
+    }
+
+    func update(postID: String, type: RecruitingPostType, title: String, body: String?, tags: [String], scheduledAt: Date?, requiredPositions: [String]) async throws -> RecruitPost {
+        let response: RecruitPostDTO = try await apiClient.send(
+            path: "/recruiting-posts/\(postID)",
+            method: .patch,
+            body: try apiClient.encodedBody(
+                UpdateRecruitPostRequestDTO(
+                    postType: type,
+                    title: title,
+                    body: body,
+                    tags: tags,
+                    scheduledAt: scheduledAt.map { ISO8601DateFormatter.simple.string(from: $0) },
+                    requiredPositions: requiredPositions
+                )
+            )
+        )
         return response.toDomain()
     }
 
@@ -2934,6 +3228,7 @@ final class SearchUseCase {
             }
 
         let groupItems = payload.groups
+            .filterPubliclyVisible()
             .filter { group in
                 searchMatches(tokens: tokens, fields: [
                     group.name,
@@ -2955,7 +3250,7 @@ final class SearchUseCase {
                     subtitle: "멤버 \(group.memberCount)명 · 최근 내전 \(group.recentMatches)회",
                     tags: Array(group.tags.prefix(3)),
                     supportingText: group.description,
-                    destination: .groupDetail(groupID: group.id)
+                    destination: .groupDetail(groupID: group.id, isAccessible: group.isAccessible())
                 )
             }
 
@@ -3030,6 +3325,7 @@ private extension String {
 
 // MARK: - Container
 
+@MainActor
 final class AppContainer {
     let configuration: AppConfiguration
     let modelContainer: ModelContainer

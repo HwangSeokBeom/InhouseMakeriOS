@@ -333,6 +333,10 @@ enum AuthErrorMapper {
         }
 
         switch userFacingError.serverContractCode {
+        case .riotAccountAlreadyAddedByThisUser,
+             .riotAccountAddUnavailable,
+             .invalidPayload:
+            break
         case .accountExistsWithApple:
             return .accountExistsWithApple(email: email)
         case .accountExistsWithGoogle:

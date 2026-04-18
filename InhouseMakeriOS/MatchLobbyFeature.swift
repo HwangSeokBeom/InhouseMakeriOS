@@ -61,12 +61,25 @@ struct MatchLobbyFeature {
                 let matchID = state.matchID
                 let container = appContainer
                 return .run { send in
+#if DEBUG
+                    print("[RouteFetch] fetch started screen=match_lobby groupID=\(groupID) matchID=\(matchID)")
+#endif
                     do {
-                        let snapshot = try await Self.makeSnapshot(container: container, groupID: groupID, matchID: matchID)
+                        let resolvedContainer = await container()
+                        let snapshot = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
+#if DEBUG
+                        print("[RouteFetch] fetch success screen=match_lobby groupID=\(groupID) matchID=\(matchID) source=live players=\(snapshot.match.players.count)")
+#endif
                         await send(.loadResponse(.success(snapshot)))
                     } catch let error as UserFacingError {
+#if DEBUG
+                        print("[RouteFetch] fetch failure screen=match_lobby groupID=\(groupID) matchID=\(matchID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
+#endif
                         await send(.loadResponse(.failure(error)))
                     } catch {
+#if DEBUG
+                        print("[RouteFetch] fetch failure screen=match_lobby groupID=\(groupID) matchID=\(matchID) source=live status=nil message=\(error.localizedDescription)")
+#endif
                         await send(.loadResponse(.failure(.unexpected("로비 로딩 실패", message: "내전 로비를 불러오지 못했습니다."))))
                     }
                 }
@@ -110,7 +123,11 @@ struct MatchLobbyFeature {
                 let container = appContainer
                 return .run { send in
                     do {
-                        _ = try await container.matchRepository.addPlayers(
+                        let resolvedContainer = await container()
+                        await MainActor.run {
+                            resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
+                        }
+                        _ = try await resolvedContainer.matchRepository.addPlayers(
                             matchID: matchID,
                             players: userIDs.map {
                                 MatchPlayerInputDTO(
@@ -123,7 +140,7 @@ struct MatchLobbyFeature {
                                 )
                             }
                         )
-                        let snapshot = try await Self.makeSnapshot(container: container, groupID: groupID, matchID: matchID)
+                        let snapshot = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
                         await send(.addPlayersResponse(.success(snapshot)))
                     } catch let error as UserFacingError {
                         await send(.addPlayersResponse(.failure(error)))
@@ -156,12 +173,22 @@ struct MatchLobbyFeature {
                 let container = appContainer
                 return .run { send in
                     do {
-                        if snapshot.match.status != .locked && snapshot.match.status != .balanced {
-                            _ = try await container.matchRepository.lock(matchID: matchID)
+                        let resolvedContainer = await container()
+                        await MainActor.run {
+                            resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
                         }
-                        _ = try await container.matchRepository.autoBalance(matchID: matchID)
-                        let refreshed = try await Self.makeSnapshot(container: container, groupID: groupID, matchID: matchID)
-                        container.localStore.appendNotification(title: "자동 밸런스 생성", body: "추천 조합이 생성되었습니다.", symbol: "arrow.trianglehead.2.clockwise")
+                        if snapshot.match.status != .locked && snapshot.match.status != .balanced {
+                            _ = try await resolvedContainer.matchRepository.lock(matchID: matchID)
+                        }
+                        _ = try await resolvedContainer.matchRepository.autoBalance(matchID: matchID)
+                        let refreshed = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
+                        await MainActor.run {
+                            resolvedContainer.localStore.appendNotification(
+                                title: "자동 밸런스 생성",
+                                body: "추천 조합이 생성되었습니다.",
+                                symbol: "arrow.trianglehead.2.clockwise"
+                            )
+                        }
                         await send(.autoBalanceResponse(.success(refreshed)))
                     } catch let error as UserFacingError {
                         await send(.autoBalanceResponse(.failure(error)))
@@ -201,10 +228,12 @@ struct MatchLobbyFeature {
         let members = try await container.groupRepository.members(groupID: groupID)
         let match = try await container.matchRepository.detail(matchID: matchID)
         let powerProfiles = await loadPowerProfiles(container: container, userIDs: match.players.map(\.userID))
-        container.localStore.trackGroup(id: groupID)
-        container.localStore.trackMatch(
-            RecentMatchContext(matchID: match.id, groupID: groupID, groupName: group.name, createdAt: Date())
-        )
+        await MainActor.run {
+            container.localStore.trackGroup(id: groupID)
+            container.localStore.trackMatch(
+                RecentMatchContext(matchID: match.id, groupID: groupID, groupName: group.name, createdAt: Date())
+            )
+        }
         return MatchLobbySnapshot(match: match, group: group, members: members, powerProfiles: powerProfiles)
     }
 
@@ -267,11 +296,16 @@ struct MatchLobbyFeatureView: View {
                             Text("참가자 목록")
                                 .font(AppTypography.heading(15, weight: .bold))
                             ForEach(snapshot.match.players) { player in
-                                lobbyPlayerCard(
-                                    name: player.nickname,
-                                    subtitle: playerSubtitle(player),
-                                    powerScore: Int(snapshot.powerProfiles[player.userID]?.overallPower.rounded() ?? 0)
-                                )
+                                Button {
+                                    router.push(.memberProfile(userID: player.userID, nickname: player.nickname))
+                                } label: {
+                                    lobbyPlayerCard(
+                                        name: player.nickname,
+                                        subtitle: playerSubtitle(player),
+                                        powerScore: Int(snapshot.powerProfiles[player.userID]?.overallPower.rounded() ?? 0)
+                                    )
+                                }
+                                .buttonStyle(.plain)
                             }
 
                             if snapshot.match.players.count < 10 {

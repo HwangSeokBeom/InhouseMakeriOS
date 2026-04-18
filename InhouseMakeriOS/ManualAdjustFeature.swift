@@ -6,12 +6,14 @@ struct ManualAdjustFeature {
     @ObservableState
     struct State: Equatable {
         let matchID: String
+        let mode: BalanceMode
         var blueRows: [ManualAdjustRow]
         var redRows: [ManualAdjustRow]
         var actionState: AsyncActionState = .idle
 
         init(matchID: String, draft: ManualAdjustDraft) {
             self.matchID = matchID
+            self.mode = draft.mode
             self.blueRows = draft.blueRows
             self.redRows = draft.redRows
         }
@@ -57,7 +59,10 @@ struct ManualAdjustFeature {
     enum Action: Equatable {
         case swapTapped(ManualAdjustRow)
         case saveTapped
+        case saveCompleted
     }
+
+    @Dependency(\.appContainer) var appContainer
 
     var body: some ReducerOf<Self> {
         Reduce { state, action in
@@ -77,9 +82,19 @@ struct ManualAdjustFeature {
                 return .none
 
             case .saveTapped:
-                // TODO: InhouseMakerCoreServer에 수동 팀 조정 저장 endpoint가 생기면
-                // 여기서 local-only 성공 메시지를 서버 저장 effect로 교체.
-                state.actionState = .success("서버 저장 API가 없어 현재 단계에서는 로컬 상태로만 반영됩니다.")
+                let matchID = state.matchID
+                let draft = ManualAdjustDraft(
+                    mode: state.mode,
+                    blueRows: state.blueRows,
+                    redRows: state.redRows
+                )
+                return .run { send in
+                    await appContainer().localStore.saveManualAdjustDraft(matchID: matchID, draft: draft)
+                    await send(.saveCompleted)
+                }
+
+            case .saveCompleted:
+                state.actionState = .success("수동 조정안을 로컬에 저장했습니다.")
                 return .none
             }
         }
@@ -89,6 +104,7 @@ struct ManualAdjustFeature {
 struct ManualAdjustFeatureView: View {
     @Bindable var store: StoreOf<ManualAdjustFeature>
     let onBack: () -> Void
+    let onSaved: () -> Void
 
     var body: some View {
         screenScaffold(title: "수동 팀 조정", onBack: onBack) {
@@ -169,6 +185,10 @@ struct ManualAdjustFeatureView: View {
             .background(AppPalette.bgSecondary)
         }
         .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
+        .onChange(of: store.actionState) { _, actionState in
+            guard case .success = actionState else { return }
+            onSaved()
+        }
     }
 
     private func manualColumn(title: String, tint: Color, rows: [ManualAdjustRow]) -> some View {

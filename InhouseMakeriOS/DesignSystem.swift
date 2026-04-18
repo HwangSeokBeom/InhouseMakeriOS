@@ -443,7 +443,10 @@ struct AppTabBar: View {
     var body: some View {
         HStack(spacing: 6) {
             ForEach(AppTab.allCases, id: \.self) { tab in
-                Button(action: { onSelect(tab) }) {
+                Button(action: {
+                    guard selectedTab != tab else { return }
+                    onSelect(tab)
+                }) {
                     VStack(spacing: 2) {
                         Image(systemName: tab.iconName)
                             .font(.system(size: 17, weight: selectedTab == tab ? .semibold : .medium))
@@ -701,6 +704,7 @@ struct LoadingStateView: View {
 struct ErrorStateView: View {
     let error: UserFacingError
     let retry: () -> Void
+    var secondaryAction: ErrorStateAction? = nil
 
     var body: some View {
         VStack(spacing: 12) {
@@ -712,10 +716,19 @@ struct ErrorStateView: View {
                 .multilineTextAlignment(.center)
             Button("다시 시도") { retry() }
                 .buttonStyle(PrimaryButtonStyle())
+            if let secondaryAction {
+                Button(secondaryAction.title) { secondaryAction.action() }
+                    .buttonStyle(SecondaryButtonStyle())
+            }
         }
         .padding(24)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
+}
+
+struct ErrorStateAction {
+    let title: String
+    let action: () -> Void
 }
 
 struct ToastBanner: View {

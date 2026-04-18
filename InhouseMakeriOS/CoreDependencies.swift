@@ -2,13 +2,21 @@ import ComposableArchitecture
 import Foundation
 
 private enum AppContainerKey: DependencyKey {
-    static let liveValue = AppContainer()
-    static let previewValue = AppContainer()
-    static let testValue = AppContainer()
+    static let liveValue: @Sendable @MainActor () -> AppContainer = {
+        AppContainer()
+    }
+
+    static let previewValue: @Sendable @MainActor () -> AppContainer = {
+        AppContainer()
+    }
+
+    static let testValue: @Sendable @MainActor () -> AppContainer = {
+        AppContainer()
+    }
 }
 
 extension DependencyValues {
-    var appContainer: AppContainer {
+    var appContainer: @Sendable @MainActor () -> AppContainer {
         get { self[AppContainerKey.self] }
         set { self[AppContainerKey.self] = newValue }
     }

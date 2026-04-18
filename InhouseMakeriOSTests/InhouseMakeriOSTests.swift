@@ -410,6 +410,48 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(error.message, "요청을 처리하지 못했습니다. 잠시 후 다시 시도해 주세요.")
     }
 
+    func testRecruitingListInvalidPayloadServerContractMapsToFilterCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Payload is invalid.",
+            code: "INVALID_PAYLOAD",
+            statusCode: 400,
+            endpoint: "/recruiting-posts",
+            requestMethod: "GET"
+        ).serverContractMapped
+
+        XCTAssertEqual(error.title, "필터 조건을 다시 확인해 주세요")
+        XCTAssertEqual(error.message, "목록을 불러오는 조건이 올바르지 않습니다.")
+    }
+
+    func testLoginInvalidPayloadServerContractMapsToLoginCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Payload is invalid.",
+            code: "INVALID_PAYLOAD",
+            statusCode: 400,
+            endpoint: "/auth/login/email",
+            requestMethod: "POST"
+        ).serverContractMapped
+
+        XCTAssertEqual(error.title, "로그인 정보를 다시 확인해 주세요")
+        XCTAssertEqual(error.message, "입력한 로그인 정보를 다시 확인한 뒤 다시 시도해 주세요.")
+    }
+
+    func testGenericInvalidPayloadServerContractMapsToGenericFormCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Payload is invalid.",
+            code: "INVALID_PAYLOAD",
+            statusCode: 400,
+            endpoint: "/groups",
+            requestMethod: "POST"
+        ).serverContractMapped
+
+        XCTAssertEqual(error.title, "입력값을 다시 확인해 주세요")
+        XCTAssertEqual(error.message, "입력한 내용을 다시 확인한 뒤 시도해 주세요.")
+    }
+
     func testAuthRateLimitedMapsToRateLimitedError() {
         let error = UserFacingError(
             title: "서버 오류",
@@ -443,6 +485,20 @@ final class InhouseMakeriOSTests: XCTestCase {
 
         XCTAssertTrue(error.isForbiddenFeature)
         XCTAssertEqual(error.message, "이 기능에 대한 권한이 없습니다.")
+    }
+
+    func testGroupNotFoundServerContractMapsToDomainSpecificCopy() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "Group not found.",
+            code: "RESOURCE_NOT_FOUND",
+            statusCode: 404,
+            endpoint: "/groups/group-1",
+            requestMethod: "GET"
+        ).serverContractMapped
+
+        XCTAssertEqual(error.title, "접근할 수 없는 그룹이에요")
+        XCTAssertEqual(error.message, "더 이상 접근할 수 없는 그룹입니다.")
     }
 
     func testTeamBalancePreviewDraftBuildsBalancedTeams() {
@@ -944,6 +1000,32 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(restored.resultPreviewDraft, resultDraft)
     }
 
+    func testLocalStoreRemoveGroupClearsTrackedGroupAndRecentMatchContext() {
+        let suiteName = "InhouseMakeriOSTests.localstore.remove-group.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let store = AppLocalStore(defaults: defaults)
+        store.trackGroup(id: "group-1", name: "삭제될 그룹")
+        store.trackGroup(id: "group-2", name: "남을 그룹")
+        store.trackMatch(
+            RecentMatchContext(
+                matchID: "match-1",
+                groupID: "group-1",
+                groupName: "삭제될 그룹",
+                createdAt: Date(timeIntervalSince1970: 1_713_484_800)
+            )
+        )
+
+        store.removeGroup(id: "group-1")
+
+        XCTAssertEqual(store.storedGroupIDs, ["group-2"])
+        XCTAssertNil(store.groupName(for: "group-1"))
+        XCTAssertTrue(store.recentMatches.isEmpty)
+    }
+
     func testGroupPublicRequestOmitsAuthorizationHeader() async throws {
         let tokenStore = makeTokenStore()
         await tokenStore.save(tokens: makeTokens())
@@ -1333,7 +1415,24 @@ final class InhouseMakeriOSTests: XCTestCase {
             urlSession: makeURLSession { request in
                 switch request.url?.path {
                 case "/groups/public":
-                    let payload = try JSONEncoder.app.encode(GroupSummaryListDTO(items: [self.makeGroupSummaryDTO(id: "public-group", name: "공개 그룹")]))
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryListDTO(
+                            items: [
+                                self.makeGroupSummaryDTO(id: "public-group", name: "공개 그룹"),
+                                GroupSummaryDTO(
+                                    id: "leaked-private-group",
+                                    name: "섞여 내려온 비공개 그룹",
+                                    description: "비공개 설명",
+                                    visibility: .private,
+                                    joinPolicy: .inviteOnly,
+                                    tags: ["서울"],
+                                    ownerUserId: "owner",
+                                    memberCount: 12,
+                                    recentMatches: 5
+                                ),
+                            ]
+                        )
+                    )
                     return (200, payload)
                 case "/groups/private-group":
                     let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "private-group", name: "비공개 그룹"))
@@ -1349,7 +1448,7 @@ final class InhouseMakeriOSTests: XCTestCase {
 
         session.restoreGuestSession()
         await viewModel.load(force: true)
-        XCTAssertEqual(viewModel.state.value?.first?.name, "공개 그룹")
+        XCTAssertEqual(viewModel.state.value?.map(\.id), ["public-group"])
 
         session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
         await viewModel.load(force: true)
@@ -1357,7 +1456,80 @@ final class InhouseMakeriOSTests: XCTestCase {
 
         session.restoreGuestSession()
         await viewModel.load(force: true)
-        XCTAssertEqual(viewModel.state.value?.first?.name, "공개 그룹")
+        XCTAssertEqual(viewModel.state.value?.map(\.id), ["public-group"])
+    }
+
+    func testSearchUseCaseFiltersPrivateGroupsFromSearchResults() async {
+        struct MockSearchRepository: SearchRepository {
+            let payload: SearchRepositoryPayload
+
+            func loadSearchableResources(forceRefresh: Bool) async -> SearchRepositoryPayload {
+                payload
+            }
+        }
+
+        let useCase = SearchUseCase(
+            repository: MockSearchRepository(
+                payload: SearchRepositoryPayload(
+                    groups: [
+                        GroupSummary(
+                            id: "public-group",
+                            name: "공개 그룹",
+                            description: "검색 가능한 그룹",
+                            visibility: .public,
+                            isMember: nil,
+                            joinPolicy: .open,
+                            tags: ["서울"],
+                            ownerUserID: "owner",
+                            memberCount: 10,
+                            recentMatches: 4
+                        ),
+                        GroupSummary(
+                            id: "private-group",
+                            name: "비공개 그룹",
+                            description: "노출되면 안 되는 그룹",
+                            visibility: .private,
+                            isMember: false,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserID: "owner",
+                            memberCount: 8,
+                            recentMatches: 3
+                        ),
+                    ],
+                    recruitingPosts: []
+                )
+            )
+        )
+
+        let response = await useCase.execute(query: "그룹", linkedRiotAccounts: [])
+        let groupItems = response.sections.first(where: { $0.kind == .group })?.items ?? []
+
+        XCTAssertEqual(groupItems.map(\.title), ["공개 그룹"])
+    }
+
+    @MainActor
+    func testAppSessionBlocksInaccessiblePrivateGroupRouteBeforePush() {
+        let session = AppSessionViewModel(container: AppContainer(configuration: makeConfiguration(), tokenStore: makeTokenStore()))
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let router = AppRouter()
+        let inaccessibleGroup = GroupSummary(
+            id: "private-group",
+            name: "비공개 그룹",
+            description: nil,
+            visibility: .private,
+            isMember: false,
+            joinPolicy: .inviteOnly,
+            tags: ["서울"],
+            ownerUserID: "owner",
+            memberCount: 5,
+            recentMatches: 0
+        )
+
+        session.openGroupDetailIfAccessible(inaccessibleGroup, router: router)
+
+        XCTAssertTrue(router.path.isEmpty)
+        XCTAssertEqual(session.actionState, .failure("참여 중인 그룹만 확인할 수 있어요."))
     }
 
     @MainActor
@@ -1391,16 +1563,445 @@ final class InhouseMakeriOSTests: XCTestCase {
         let viewModel = RecruitBoardViewModel(session: session)
 
         session.restoreGuestSession()
-        await viewModel.load(force: true)
+        await viewModel.load(force: true, trigger: .sessionScopeChange)
         XCTAssertEqual(viewModel.state.value?.posts.first?.title, "공개 모집")
 
         session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
-        await viewModel.load(force: true)
+        await viewModel.load(force: true, trigger: .sessionScopeChange)
         XCTAssertEqual(viewModel.state.value?.posts.first?.title, "계정 모집")
 
         session.restoreGuestSession()
-        await viewModel.load(force: true)
+        await viewModel.load(force: true, trigger: .sessionScopeChange)
         XCTAssertEqual(viewModel.state.value?.posts.first?.title, "공개 모집")
+    }
+
+    @MainActor
+    func testGroupMainViewModelRemovesDeletedGroupContextWhenTrackedGroupReturnsNotFound() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.group.deleted-reload.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "deleted-group", name: "삭제된 그룹")
+        localStore.trackGroup(id: "active-group", name: "남은 그룹")
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/groups/deleted-group":
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RESOURCE_NOT_FOUND",
+                            message: "Group not found."
+                        )
+                    )
+                case "/groups/active-group":
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "active-group",
+                            name: "남은 그룹",
+                            description: nil,
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "u1",
+                            memberCount: 5,
+                            recentMatches: 3
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupMainViewModel(session: session)
+
+        await viewModel.load(force: true)
+
+        XCTAssertEqual(viewModel.state.value?.map(\.id), ["active-group"])
+        XCTAssertEqual(localStore.storedGroupIDs, ["active-group"])
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelHandleCreateSuccessPreservesCreatedPostType() {
+        let suiteName = "InhouseMakeriOSTests.recruit.create-success.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
+
+        let session = AppSessionViewModel(
+            container: AppContainer(
+                configuration: makeConfiguration(),
+                tokenStore: makeTokenStore(),
+                localStore: localStore
+            )
+        )
+        let viewModel = RecruitBoardViewModel(session: session)
+        let createdPost = makeRecruitPostDTO(
+            id: "created-post",
+            title: "새 상대 모집",
+            postType: .opponentRecruit
+        ).toDomain()
+
+        viewModel.handleCreateSuccess(createdPost)
+
+        XCTAssertEqual(viewModel.selectedType, .opponentRecruit)
+        XCTAssertEqual(localStore.recruitFilterType, .opponentRecruit)
+        XCTAssertEqual(viewModel.state.value?.selectedType, .opponentRecruit)
+        XCTAssertEqual(viewModel.state.value?.posts.map(\.id), ["created-post"])
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelSwitchTypeIgnoresDuplicateSelection() async {
+        let requestLock = NSLock()
+        var requestCount = 0
+        let suiteName = "InhouseMakeriOSTests.recruit.duplicate-switch.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: makeTokenStore(),
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                requestLock.lock()
+                requestCount += 1
+                requestLock.unlock()
+                let payload = try JSONEncoder.app.encode(RecruitPostListDTO(items: [self.makeRecruitPostDTO(id: "post-1", title: "모집글")]))
+                return (200, payload)
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        await viewModel.switchType(.memberRecruit)
+
+        requestLock.lock()
+        let capturedRequestCount = requestCount
+        requestLock.unlock()
+        XCTAssertEqual(capturedRequestCount, 0)
+        XCTAssertEqual(viewModel.selectedType, .memberRecruit)
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelQueuesLatestSelectionWhilePreviousLoadIsInFlight() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let firstRequestStarted = expectation(description: "first recruit request started")
+        let secondRequestStarted = expectation(description: "second recruit request started")
+        let releaseFirstRequest = DispatchSemaphore(value: 0)
+        let requestLock = NSLock()
+        var requestedPostTypes: [String] = []
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                let postType = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                    .queryItems?
+                    .first(where: { $0.name == "postType" })?
+                    .value ?? ""
+                requestLock.lock()
+                requestedPostTypes.append(postType)
+                requestLock.unlock()
+
+                switch postType {
+                case RecruitingPostType.memberRecruit.rawValue:
+                    firstRequestStarted.fulfill()
+                    _ = releaseFirstRequest.wait(timeout: .now() + 1)
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostListDTO(items: [self.makeRecruitPostDTO(id: "member-post", title: "팀원 모집", postType: .memberRecruit)])
+                    )
+                    return (200, payload)
+                case RecruitingPostType.opponentRecruit.rawValue:
+                    secondRequestStarted.fulfill()
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostListDTO(items: [self.makeRecruitPostDTO(id: "opponent-post", title: "상대팀 모집", postType: .opponentRecruit)])
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected postType \(postType)")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        let initialLoadTask = Task { await viewModel.load(force: true, trigger: .screenAppear) }
+        await fulfillment(of: [firstRequestStarted], timeout: 1)
+
+        let switchTask = Task { await viewModel.switchType(.opponentRecruit) }
+        releaseFirstRequest.signal()
+
+        await initialLoadTask.value
+        await switchTask.value
+        await fulfillment(of: [secondRequestStarted], timeout: 1)
+        await Task.yield()
+
+        XCTAssertEqual(viewModel.selectedType, .opponentRecruit)
+        XCTAssertEqual(viewModel.state.value?.selectedType, .opponentRecruit)
+        XCTAssertEqual(viewModel.state.value?.posts.map(\.id), ["opponent-post"])
+
+        requestLock.lock()
+        let capturedRequestedPostTypes = requestedPostTypes
+        requestLock.unlock()
+        XCTAssertEqual(
+            capturedRequestedPostTypes,
+            [RecruitingPostType.memberRecruit.rawValue, RecruitingPostType.opponentRecruit.rawValue]
+        )
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelApplyFiltersBuildsQueryAndDedupesDuplicateSelection() async throws {
+        let suiteName = "InhouseMakeriOSTests.recruit.filters.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
+
+        let requestLock = NSLock()
+        var requestedURL: URL?
+        var requestCount = 0
+        let filterDate = Date(timeIntervalSince1970: 1_776_643_200) // 2026-04-20T00:00:00Z
+        let filterState = RecruitBoardFilterState(
+            selectedDateFilter: RecruitDateFilter(
+                preset: .specificDate,
+                selectedDate: filterDate,
+                includesUnscheduledPosts: false
+            ),
+            selectedPositions: ["MID", "SUPPORT"],
+            selectedRegions: ["서울"],
+            selectedTags: ["빡겜"]
+        )
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: makeTokenStore(),
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                requestLock.lock()
+                requestCount += 1
+                requestedURL = request.url
+                requestLock.unlock()
+                let payload = try JSONEncoder.app.encode(RecruitPostListDTO(items: []))
+                return (200, payload)
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        await viewModel.applyFilters(filterState, reason: .date)
+        await viewModel.applyFilters(filterState, reason: .date)
+
+        requestLock.lock()
+        let capturedRequestCount = requestCount
+        let capturedRequestedURL = requestedURL
+        requestLock.unlock()
+
+        XCTAssertEqual(capturedRequestCount, 1)
+        XCTAssertEqual(viewModel.filterState, filterState)
+        XCTAssertEqual(capturedRequestedURL?.path, "/recruiting-posts/public")
+        XCTAssertEqual(queryItemValues(from: capturedRequestedURL, named: "postType"), [RecruitingPostType.memberRecruit.rawValue])
+        XCTAssertEqual(queryItemValues(from: capturedRequestedURL, named: "status"), [RecruitingPostStatus.open.rawValue])
+        XCTAssertEqual(Set(queryItemValues(from: capturedRequestedURL, named: "requiredPositions")), ["MID", "SUPPORT"])
+        XCTAssertEqual(queryItemValues(from: capturedRequestedURL, named: "region"), ["서울"])
+        XCTAssertEqual(queryItemValues(from: capturedRequestedURL, named: "tags"), ["빡겜"])
+        XCTAssertTrue(queryItemValues(from: capturedRequestedURL, named: "includeUnscheduled").isEmpty)
+        XCTAssertFalse(queryItemValues(from: capturedRequestedURL, named: "scheduledFrom").isEmpty)
+        XCTAssertFalse(queryItemValues(from: capturedRequestedURL, named: "scheduledTo").isEmpty)
+    }
+
+    @MainActor
+    func testHomeViewModelRecruitingFailureKeepsContentAndOmitsUnsupportedQuery() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var capturedRecruitingURL: URL?
+        let historyDate = Date(timeIntervalSince1970: 1_776_643_200)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/recruiting-posts"):
+                    requestLock.lock()
+                    capturedRecruitingURL = request.url
+                    requestLock.unlock()
+                    return (
+                        400,
+                        self.makeServerErrorData(
+                            statusCode: 400,
+                            code: "INVALID_PAYLOAD",
+                            message: "Payload is invalid.",
+                            details: [
+                                "validationErrors": .array([
+                                    .object([
+                                        "field": .string("includeUnscheduled"),
+                                        "message": .string("property includeUnscheduled should not exist"),
+                                    ]),
+                                ]),
+                            ]
+                        )
+                    )
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(RiotAccountListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(
+                        HistoryResponseDTO(
+                            items: [
+                                HistoryItemDTO(
+                                    matchId: "match-1",
+                                    scheduledAt: historyDate,
+                                    role: .mid,
+                                    teamSide: .blue,
+                                    result: "WIN",
+                                    kda: "3/1/5",
+                                    deltaMmr: 12
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test")
+
+        requestLock.lock()
+        let requestedRecruitingURL = capturedRecruitingURL
+        requestLock.unlock()
+
+        XCTAssertEqual(requestedRecruitingURL?.path, "/recruiting-posts")
+        XCTAssertTrue(queryItemValues(from: requestedRecruitingURL, named: "includeUnscheduled").isEmpty)
+
+        switch viewModel.state {
+        case let .content(.authenticated(snapshot)):
+            XCTAssertTrue(snapshot.recruitingPosts.isEmpty)
+            XCTAssertEqual(snapshot.latestHistory?.matchID, "match-1")
+        case let .error(error):
+            XCTFail("Expected home content, got error: \(error.title) / \(error.message)")
+        default:
+            XCTFail("Expected authenticated home content")
+        }
+    }
+
+    @MainActor
+    func testHomeViewModelDoesNotRestoreRemovedDeletedGroupOnInitialLoad() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.deleted-group-restore.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "deleted-group", name: "삭제된 그룹")
+        localStore.trackGroup(id: "active-group", name: "남은 그룹")
+        localStore.removeGroup(id: "deleted-group")
+
+        let requestLock = NSLock()
+        var requestedPaths: [String] = []
+        let historyDate = Date(timeIntervalSince1970: 1_776_643_200)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                requestLock.lock()
+                requestedPaths.append(request.url?.path ?? "nil")
+                requestLock.unlock()
+
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/active-group"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "active-group",
+                            name: "남은 그룹",
+                            description: nil,
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "u1",
+                            memberCount: 5,
+                            recentMatches: 0
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/recruiting-posts"):
+                    let payload = try JSONEncoder.app.encode(RecruitPostListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(RiotAccountListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(
+                        HistoryResponseDTO(
+                            items: [
+                                HistoryItemDTO(
+                                    matchId: "match-1",
+                                    scheduledAt: historyDate,
+                                    role: .mid,
+                                    teamSide: .blue,
+                                    result: "WIN",
+                                    kda: "3/1/5",
+                                    deltaMmr: 12
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "scene_reenter")
+
+        requestLock.lock()
+        let capturedPaths = requestedPaths
+        requestLock.unlock()
+
+        XCTAssertFalse(capturedPaths.contains("/groups/deleted-group"))
+        XCTAssertTrue(capturedPaths.contains("/groups/active-group"))
+        XCTAssertEqual(localStore.storedGroupIDs, ["active-group"])
     }
 
     @MainActor
@@ -1476,6 +2077,7 @@ final class InhouseMakeriOSTests: XCTestCase {
             title: "테스트 모집",
             body: "본문",
             tags: ["빡겜"],
+            scheduledAt: nil,
             positions: ["MID"]
         )
 
@@ -1484,6 +2086,8 @@ final class InhouseMakeriOSTests: XCTestCase {
             XCTAssertTrue(true)
         case let .failure(message):
             XCTFail("Expected authentication recovery, got failure: \(message)")
+        case let .invalidGroupContext(message):
+            XCTFail("Expected authentication recovery, got invalid group context: \(message)")
         case .success:
             XCTFail("Expected authentication recovery result")
         }
@@ -1495,6 +2099,805 @@ final class InhouseMakeriOSTests: XCTestCase {
         session.handleModalDismissed(.recruitCreate)
 
         XCTAssertEqual(session.authPrompt?.requirement, .recruitingWrite)
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelCreatePostBlocksWhenGroupContextIsInvalid() async {
+        let suiteName = "InhouseMakeriOSTests.recruit.invalid-context.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        let session = AppSessionViewModel(
+            container: AppContainer(
+                configuration: makeConfiguration(),
+                tokenStore: makeTokenStore(),
+                localStore: localStore
+            )
+        )
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        let result = await viewModel.createPost(
+            groupID: "deleted-group",
+            title: "테스트 모집",
+            body: "본문",
+            tags: ["빡겜"],
+            scheduledAt: nil,
+            positions: ["MID"]
+        )
+
+        switch result {
+        case let .invalidGroupContext(message):
+            XCTAssertEqual(message, "모집글을 연결할 그룹이 없습니다. 먼저 그룹을 생성해주세요.")
+        case .failure, .requiresAuthentication, .success:
+            XCTFail("Expected invalid group context result")
+        }
+
+        XCTAssertEqual(viewModel.actionState, .failure("모집글을 연결할 그룹이 없습니다. 먼저 그룹을 생성해주세요."))
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelCreatePostMapsGroupNotFoundToInvalidContextAndClearsStoredGroup() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.recruit.group-not-found.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "group-1", name: "삭제될 그룹")
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/recruiting-posts":
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RESOURCE_NOT_FOUND",
+                            message: "Group not found."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        let result = await viewModel.createPost(
+            groupID: "group-1",
+            title: "테스트 모집",
+            body: "본문",
+            tags: ["빡겜"],
+            scheduledAt: nil,
+            positions: ["MID"]
+        )
+
+        switch result {
+        case let .invalidGroupContext(message):
+            XCTAssertEqual(message, "삭제되었거나 존재하지 않는 그룹입니다.")
+        case .failure, .requiresAuthentication, .success:
+            XCTFail("Expected invalid group context result")
+        }
+
+        XCTAssertTrue(localStore.storedGroupIDs.isEmpty)
+        XCTAssertEqual(viewModel.actionState, .failure("삭제되었거나 존재하지 않는 그룹입니다."))
+    }
+
+    @MainActor
+    func testRecruitDetailViewModelMapsNotFoundToEmptyState() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/recruiting-posts/post-404":
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RECRUITING_POST_NOT_FOUND",
+                            message: "Not found"
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitDetailViewModel(session: session, postID: "post-404")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        switch viewModel.state {
+        case let .empty(message):
+            XCTAssertEqual(message, "이 모집글을 찾을 수 없습니다.")
+        default:
+            XCTFail("Expected empty state, got \(viewModel.state)")
+        }
+    }
+
+    @MainActor
+    func testRecruitDetailViewModelMapsForbiddenToPermissionError() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/recruiting-posts/post-403":
+                    return (
+                        403,
+                        self.makeServerErrorData(
+                            statusCode: 403,
+                            code: "FORBIDDEN_FEATURE",
+                            message: "Forbidden"
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitDetailViewModel(session: session, postID: "post-403")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        switch viewModel.state {
+        case let .error(error):
+            XCTAssertEqual(error.title, "권한이 없어요")
+            XCTAssertEqual(error.statusCode, 403)
+        default:
+            XCTFail("Expected forbidden error state, got \(viewModel.state)")
+        }
+    }
+
+    @MainActor
+    func testRecruitDetailViewModelBuildsDisplayStateWithoutRawIdentifiers() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/recruiting-posts/post-1":
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostDTO(
+                            id: "post-1",
+                            groupId: "group-1",
+                            postType: .memberRecruit,
+                            title: "테스트 모집",
+                            status: .open,
+                            scheduledAt: nil,
+                            body: "본문",
+                            tags: ["빡겜"],
+                            requiredPositions: ["MID"],
+                            createdBy: "u1"
+                        )
+                    )
+                    return (200, payload)
+                case "/groups/group-1":
+                    let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "우리 모임"))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitDetailViewModel(session: session, postID: "post-1")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        guard case let .content(viewState) = viewModel.state else {
+            return XCTFail("Expected content state, got \(viewModel.state)")
+        }
+
+        XCTAssertEqual(viewState.title, "테스트 모집")
+        XCTAssertEqual(viewState.groupName, "우리 모임")
+        XCTAssertNotEqual(viewState.groupName, "group-1")
+        XCTAssertEqual(viewState.authorName, "tester")
+        XCTAssertEqual(viewState.requiredPositionsText, "MID")
+        XCTAssertEqual(viewState.statusText, "모집 중")
+        XCTAssertEqual(viewState.moodTagsText, "빡겜")
+        XCTAssertEqual(viewState.bodyText, "본문")
+        XCTAssertTrue(viewState.isOwner)
+        XCTAssertTrue(viewModel.isDeleteVisible)
+    }
+
+    @MainActor
+    func testRecruitDetailViewModelDeletePostCallsDeleteEndpoint() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let deleteRequestReceived = expectation(description: "delete recruit request received")
+        let requestLock = NSLock()
+        var deleteRequestMethod: String?
+        var deleteRequestPath: String?
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/recruiting-posts/post-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostDTO(
+                            id: "post-1",
+                            groupId: "group-1",
+                            postType: .memberRecruit,
+                            title: "테스트 모집",
+                            status: .open,
+                            scheduledAt: nil,
+                            body: "본문",
+                            tags: ["빡겜"],
+                            requiredPositions: ["MID"],
+                            createdBy: "u1"
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "우리 모임"))
+                    return (200, payload)
+                case ("DELETE", "/recruiting-posts/post-1"):
+                    requestLock.lock()
+                    deleteRequestMethod = request.httpMethod
+                    deleteRequestPath = request.url?.path
+                    requestLock.unlock()
+                    deleteRequestReceived.fulfill()
+                    return (204, Data())
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitDetailViewModel(session: session, postID: "post-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let deletedPost = await viewModel.deletePost()
+        await fulfillment(of: [deleteRequestReceived], timeout: 1)
+
+        requestLock.lock()
+        let capturedDeleteRequestMethod = deleteRequestMethod
+        let capturedDeleteRequestPath = deleteRequestPath
+        requestLock.unlock()
+
+        XCTAssertEqual(deletedPost?.id, "post-1")
+        XCTAssertEqual(capturedDeleteRequestMethod, "DELETE")
+        XCTAssertEqual(capturedDeleteRequestPath, "/recruiting-posts/post-1")
+        XCTAssertEqual(viewModel.actionState, .success("모집글이 삭제되었습니다"))
+    }
+
+    @MainActor
+    func testRecruitDetailViewModelUpdatePostCallsPatchEndpoint() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var patchRequestMethod: String?
+        var patchRequestPath: String?
+        var patchRequestBody: [String: Any]?
+        let scheduledAt = Date(timeIntervalSince1970: 1_776_686_400) // 2026-04-20T12:00:00Z
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/recruiting-posts/post-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostDTO(
+                            id: "post-1",
+                            groupId: "group-1",
+                            postType: .memberRecruit,
+                            title: "기존 모집",
+                            status: .open,
+                            scheduledAt: nil,
+                            body: "기존 본문",
+                            tags: ["빡겜"],
+                            requiredPositions: ["MID"],
+                            createdBy: "u1"
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "우리 모임"))
+                    return (200, payload)
+                case ("PATCH", "/recruiting-posts/post-1"):
+                    requestLock.lock()
+                    patchRequestMethod = request.httpMethod
+                    patchRequestPath = request.url?.path
+                    patchRequestBody = self.requestBodyJSONObject(from: request)
+                    requestLock.unlock()
+
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostDTO(
+                            id: "post-1",
+                            groupId: "group-1",
+                            postType: .memberRecruit,
+                            title: "수정된 모집",
+                            status: .open,
+                            scheduledAt: scheduledAt,
+                            body: "수정 본문",
+                            tags: ["즐겜", "주말"],
+                            requiredPositions: ["ADC", "SUPPORT"],
+                            createdBy: "u1"
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitDetailViewModel(session: session, postID: "post-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let updatedPost = await viewModel.updatePost(
+            title: "수정된 모집",
+            body: "수정 본문",
+            tags: ["즐겜", "주말"],
+            scheduledAt: scheduledAt,
+            requiredPositions: ["ADC", "SUPPORT"]
+        )
+
+        requestLock.lock()
+        let capturedPatchRequestMethod = patchRequestMethod
+        let capturedPatchRequestPath = patchRequestPath
+        let capturedPatchRequestBody = patchRequestBody
+        requestLock.unlock()
+
+        XCTAssertEqual(capturedPatchRequestMethod, "PATCH")
+        XCTAssertEqual(capturedPatchRequestPath, "/recruiting-posts/post-1")
+        XCTAssertEqual(capturedPatchRequestBody?["postType"] as? String, RecruitingPostType.memberRecruit.rawValue)
+        XCTAssertEqual(capturedPatchRequestBody?["title"] as? String, "수정된 모집")
+        XCTAssertEqual(capturedPatchRequestBody?["body"] as? String, "수정 본문")
+        XCTAssertEqual(Set(capturedPatchRequestBody?["tags"] as? [String] ?? []), ["즐겜", "주말"])
+        XCTAssertEqual(Set(capturedPatchRequestBody?["requiredPositions"] as? [String] ?? []), ["ADC", "SUPPORT"])
+        XCTAssertNotNil(capturedPatchRequestBody?["scheduledAt"] as? String)
+        XCTAssertEqual(updatedPost?.title, "수정된 모집")
+        XCTAssertEqual(viewModel.actionState, .success("모집글이 수정되었습니다"))
+
+        guard case let .content(viewState) = viewModel.state else {
+            return XCTFail("Expected content state, got \(viewModel.state)")
+        }
+        XCTAssertEqual(viewState.title, "수정된 모집")
+        XCTAssertEqual(viewState.requiredPositionsText, "ADC, SUPPORT")
+        XCTAssertEqual(viewState.moodTagsText, "즐겜, 주말")
+    }
+
+    @MainActor
+    func testGroupDetailViewModelDoesNotTrackPublicGroupForNonMember() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.group.public-nonmember.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/public-group"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "public-group",
+                            name: "공개 그룹",
+                            description: "설명",
+                            visibility: .public,
+                            joinPolicy: .open,
+                            tags: ["서울"],
+                            ownerUserId: "owner",
+                            memberCount: 12,
+                            recentMatches: 4
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/public-group/members"):
+                    let payload = try JSONEncoder.app.encode(GroupMemberListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(HistoryResponseDTO(items: []))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "public-group")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        XCTAssertFalse(localStore.containsGroup(id: "public-group"))
+        XCTAssertEqual(viewModel.state.value?.group.id, "public-group")
+    }
+
+    @MainActor
+    func testGroupDetailViewModelTracksPrivateGroupForMember() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.group.private-member.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/private-group"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "private-group",
+                            name: "우리 비공개 그룹",
+                            description: "설명",
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "owner",
+                            memberCount: 5,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/private-group/members"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupMemberListDTO(
+                            items: [
+                                GroupMemberDTO(id: "gm-1", userId: "u1", nickname: "tester", role: .member),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case (_, let path?) where path.hasSuffix("/power-profile"):
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RESOURCE_NOT_FOUND",
+                            message: "Power profile not found."
+                        )
+                    )
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(HistoryResponseDTO(items: []))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "private-group")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        XCTAssertTrue(localStore.containsGroup(id: "private-group"))
+        XCTAssertEqual(localStore.groupName(for: "private-group"), "우리 비공개 그룹")
+    }
+
+    @MainActor
+    func testGroupDetailViewModelKeepsForbiddenFallbackMessage() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/private-group"):
+                    return (
+                        403,
+                        self.makeServerErrorData(
+                            statusCode: 403,
+                            code: "GROUP_ACCESS_FORBIDDEN",
+                            message: "Group access forbidden."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "private-group")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        guard case let .error(error) = viewModel.state else {
+            return XCTFail("Expected forbidden error state, got \(viewModel.state)")
+        }
+        XCTAssertEqual(error.title, "그룹에 접근할 수 없어요")
+        XCTAssertEqual(error.message, "참여 중인 그룹만 확인할 수 있어요.")
+        XCTAssertEqual(error.statusCode, 403)
+    }
+
+    @MainActor
+    func testGroupDetailViewModelUpdateGroupCallsPatchEndpoint() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var patchRequestMethod: String?
+        var patchRequestPath: String?
+        var patchRequestBody: [String: Any]?
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "기존 방",
+                            description: "기존 설명",
+                            visibility: .public,
+                            joinPolicy: .open,
+                            tags: ["서울", "빡겜"],
+                            ownerUserId: "u1",
+                            memberCount: 5,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    let payload = try JSONEncoder.app.encode(GroupMemberListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(HistoryResponseDTO(items: []))
+                    return (200, payload)
+                case ("PATCH", "/groups/group-1"):
+                    requestLock.lock()
+                    patchRequestMethod = request.httpMethod
+                    patchRequestPath = request.url?.path
+                    patchRequestBody = self.requestBodyJSONObject(from: request)
+                    requestLock.unlock()
+
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "수정된 방",
+                            description: "수정 설명",
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["경기", "즐겜"],
+                            ownerUserId: "u1",
+                            memberCount: 5,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let updatedGroup = await viewModel.updateGroup(
+            name: "수정된 방",
+            description: "수정 설명",
+            visibility: .private,
+            joinPolicy: .inviteOnly,
+            tags: ["경기", "즐겜"]
+        )
+
+        requestLock.lock()
+        let capturedPatchRequestMethod = patchRequestMethod
+        let capturedPatchRequestPath = patchRequestPath
+        let capturedPatchRequestBody = patchRequestBody
+        requestLock.unlock()
+
+        XCTAssertEqual(capturedPatchRequestMethod, "PATCH")
+        XCTAssertEqual(capturedPatchRequestPath, "/groups/group-1")
+        XCTAssertEqual(capturedPatchRequestBody?["name"] as? String, "수정된 방")
+        XCTAssertEqual(capturedPatchRequestBody?["description"] as? String, "수정 설명")
+        XCTAssertEqual(capturedPatchRequestBody?["visibility"] as? String, GroupVisibility.private.rawValue)
+        XCTAssertEqual(capturedPatchRequestBody?["joinPolicy"] as? String, JoinPolicy.inviteOnly.rawValue)
+        XCTAssertEqual(Set(capturedPatchRequestBody?["tags"] as? [String] ?? []), ["경기", "즐겜"])
+        XCTAssertEqual(updatedGroup?.name, "수정된 방")
+        XCTAssertEqual(viewModel.actionState, .success("내전 방 정보가 수정되었습니다"))
+        XCTAssertEqual(viewModel.state.value?.group.name, "수정된 방")
+    }
+
+    @MainActor
+    func testGroupDetailViewModelDeleteGroupMapsNotFoundToExplicitMessage() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let requestLock = NSLock()
+        var deleteRequestMethod: String?
+        var deleteRequestPath: String?
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "기존 방",
+                            description: "기존 설명",
+                            visibility: .public,
+                            joinPolicy: .open,
+                            tags: ["서울", "빡겜"],
+                            ownerUserId: "u1",
+                            memberCount: 5,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    let payload = try JSONEncoder.app.encode(GroupMemberListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(HistoryResponseDTO(items: []))
+                    return (200, payload)
+                case ("DELETE", "/groups/group-1"):
+                    requestLock.lock()
+                    deleteRequestMethod = request.httpMethod
+                    deleteRequestPath = request.url?.path
+                    requestLock.unlock()
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "GROUP_DELETE_ENDPOINT_NOT_READY",
+                            message: "Not found"
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let deletedGroupID = await viewModel.deleteGroup()
+
+        requestLock.lock()
+        let capturedDeleteRequestMethod = deleteRequestMethod
+        let capturedDeleteRequestPath = deleteRequestPath
+        requestLock.unlock()
+
+        XCTAssertNil(deletedGroupID)
+        XCTAssertEqual(capturedDeleteRequestMethod, "DELETE")
+        XCTAssertEqual(capturedDeleteRequestPath, "/groups/group-1")
+        XCTAssertEqual(viewModel.actionState, .failure("이미 삭제되었거나 서버에서 삭제 기능을 아직 지원하지 않습니다."))
+    }
+
+    @MainActor
+    func testGroupDetailViewModelDeleteGroupClearsContextAndSkipsFurtherReloads() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.group-detail.delete-success.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "group-1", name: "삭제될 방")
+
+        let requestLock = NSLock()
+        var groupDetailGetCount = 0
+        var membersGetCount = 0
+        var deleteCount = 0
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    requestLock.lock()
+                    groupDetailGetCount += 1
+                    requestLock.unlock()
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryDTO(
+                            id: "group-1",
+                            name: "삭제될 방",
+                            description: "설명",
+                            visibility: .private,
+                            joinPolicy: .inviteOnly,
+                            tags: ["서울"],
+                            ownerUserId: "u1",
+                            memberCount: 5,
+                            recentMatches: 2
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    requestLock.lock()
+                    membersGetCount += 1
+                    requestLock.unlock()
+                    let payload = try JSONEncoder.app.encode(GroupMemberListDTO(items: []))
+                    return (200, payload)
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(HistoryResponseDTO(items: []))
+                    return (200, payload)
+                case ("DELETE", "/groups/group-1"):
+                    requestLock.lock()
+                    deleteCount += 1
+                    requestLock.unlock()
+                    return (200, Data("{}".utf8))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let deletedGroupID = await viewModel.deleteGroup()
+        await viewModel.load(force: true, trigger: .retry)
+
+        requestLock.lock()
+        let capturedDetailGetCount = groupDetailGetCount
+        let capturedMembersGetCount = membersGetCount
+        let capturedDeleteCount = deleteCount
+        requestLock.unlock()
+
+        XCTAssertEqual(deletedGroupID, "group-1")
+        XCTAssertEqual(capturedDetailGetCount, 1)
+        XCTAssertEqual(capturedMembersGetCount, 1)
+        XCTAssertEqual(capturedDeleteCount, 1)
+        XCTAssertTrue(localStore.storedGroupIDs.isEmpty)
+        XCTAssertEqual(viewModel.actionState, .success("내전 방이 삭제되었습니다"))
     }
 
     @MainActor
@@ -1845,11 +3248,15 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
     }
 
-    private func makeRecruitPostDTO(id: String, title: String) -> RecruitPostDTO {
+    private func makeRecruitPostDTO(
+        id: String,
+        title: String,
+        postType: RecruitingPostType = .memberRecruit
+    ) -> RecruitPostDTO {
         RecruitPostDTO(
             id: id,
             groupId: "group-1",
-            postType: .memberRecruit,
+            postType: postType,
             title: title,
             status: .open,
             scheduledAt: nil,
@@ -1884,6 +3291,23 @@ final class InhouseMakeriOSTests: XCTestCase {
         }
 
         return data.isEmpty ? nil : data
+    }
+
+    private func requestBodyJSONObject(from request: URLRequest) -> [String: Any]? {
+        guard
+            let data = requestBodyData(from: request),
+            let jsonObject = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            return nil
+        }
+        return jsonObject
+    }
+
+    private func queryItemValues(from url: URL?, named name: String) -> [String] {
+        URLComponents(url: url ?? URL(string: "http://localhost")!, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .filter { $0.name == name }
+            .compactMap(\.value) ?? []
     }
 }
 
