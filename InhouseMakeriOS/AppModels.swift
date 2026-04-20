@@ -23,6 +23,10 @@ enum AppRoute: Hashable {
     case notifications
     case riotAccounts
     case settings
+    case editProfileImage
+    case blockedUsers
+    case report(target: ReportTarget)
+    case reportGuide
     case homeUpcomingMatches
     case homeGroups
     case powerDetail
@@ -1538,6 +1542,9 @@ struct UserProfile: Codable, Hashable {
     let id: String
     let email: String
     var nickname: String
+    var profileImageURL: URL?
+    var profileImageUpdatedAt: Date?
+    var profileImageCacheKey: String?
     var primaryPosition: Position?
     var secondaryPosition: Position?
     var isFillAvailable: Bool
@@ -1551,6 +1558,9 @@ struct UserProfile: Codable, Hashable {
         id: String,
         email: String,
         nickname: String,
+        profileImageURL: URL? = nil,
+        profileImageUpdatedAt: Date? = nil,
+        profileImageCacheKey: String? = nil,
         primaryPosition: Position?,
         secondaryPosition: Position?,
         isFillAvailable: Bool,
@@ -1564,6 +1574,9 @@ struct UserProfile: Codable, Hashable {
         self.id = id
         self.email = email
         self.nickname = nickname
+        self.profileImageURL = profileImageURL
+        self.profileImageUpdatedAt = profileImageUpdatedAt
+        self.profileImageCacheKey = profileImageCacheKey
         self.primaryPosition = primaryPosition
         self.secondaryPosition = secondaryPosition
         self.isFillAvailable = isFillAvailable
@@ -1577,6 +1590,89 @@ struct UserProfile: Codable, Hashable {
     var championAggregationStatus: ChampionAggregationStatus? {
         topChampionAggregation?.status
     }
+
+    func cacheBustedProfileImageURL(fallbackCacheKey: String? = nil) -> URL? {
+        guard let profileImageURL else { return nil }
+        let resolvedCacheKey = profileImageCacheKey
+            ?? profileImageUpdatedAt.map { String(Int($0.timeIntervalSince1970)) }
+            ?? fallbackCacheKey
+        guard let resolvedCacheKey, !resolvedCacheKey.isEmpty else { return profileImageURL }
+
+        var components = URLComponents(url: profileImageURL, resolvingAgainstBaseURL: false)
+        var queryItems = components?.queryItems ?? []
+        queryItems.removeAll { $0.name == "v" }
+        queryItems.append(URLQueryItem(name: "v", value: resolvedCacheKey))
+        components?.queryItems = queryItems
+        return components?.url ?? profileImageURL
+    }
+}
+
+enum ReportTargetType: String, Codable, Hashable {
+    case user = "USER"
+    case recruitPost = "RECRUIT_POST"
+    case match = "MATCH"
+    case group = "GROUP"
+
+    var title: String {
+        switch self {
+        case .user:
+            return "사용자"
+        case .recruitPost:
+            return "모집글"
+        case .match:
+            return "내전 기록"
+        case .group:
+            return "그룹"
+        }
+    }
+}
+
+struct ReportTarget: Codable, Hashable, Identifiable {
+    let type: ReportTargetType
+    let targetID: String
+    let displayName: String
+
+    var id: String {
+        "\(type.rawValue):\(targetID)"
+    }
+}
+
+enum ReportReason: String, Codable, CaseIterable, Hashable, Identifiable {
+    case abuseHarassment = "ABUSE_HARASSMENT"
+    case spamAds = "SPAM_ADS"
+    case inappropriateContent = "INAPPROPRIATE_CONTENT"
+    case impersonation = "IMPERSONATION"
+    case other = "OTHER"
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .abuseHarassment:
+            return "욕설/괴롭힘"
+        case .spamAds:
+            return "스팸/광고"
+        case .inappropriateContent:
+            return "부적절한 프로필/콘텐츠"
+        case .impersonation:
+            return "사칭"
+        case .other:
+            return "기타"
+        }
+    }
+}
+
+struct BlockUserTarget: Codable, Hashable {
+    let userID: String
+    let nickname: String
+}
+
+struct BlockedUser: Codable, Hashable, Identifiable {
+    let userID: String
+    let nickname: String
+    let blockedAt: Date
+
+    var id: String { userID }
 }
 
 enum ProfilePositionAssignmentSource: String, Codable, Equatable {

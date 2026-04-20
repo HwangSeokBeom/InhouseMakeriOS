@@ -48,6 +48,7 @@ enum AppExternalLink: String, CaseIterable, Identifiable {
     case support
     case terms
     case privacy
+    case openSource
 
     var id: String { rawValue }
 
@@ -61,6 +62,8 @@ enum AppExternalLink: String, CaseIterable, Identifiable {
             return "이용약관"
         case .privacy:
             return "개인정보처리방침"
+        case .openSource:
+            return "오픈소스 라이선스"
         }
     }
 
@@ -74,6 +77,9 @@ enum AppExternalLink: String, CaseIterable, Identifiable {
             return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/community.html")!
         case .privacy:
             return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/privacy.html")!
+        case .openSource:
+            // TODO: 실제 오픈소스 고지 문서 URL로 교체한다.
+            return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/open-source.html")!
         }
     }
 }
@@ -122,6 +128,8 @@ private enum LocalStoreKey {
     static let notificationsEnabled = "local.notifications.enabled"
     static let profilePublic = "local.profile.public"
     static let historyPublic = "local.history.public"
+    static let profileImages = "local.profile.images"
+    static let blockedUsers = "local.blocked.users"
 }
 
 private enum LocalPreferenceKey: String {
@@ -694,6 +702,23 @@ private final class LocalPersistenceStore {
         }
     }
 
+    func clearAccountScopedData() {
+        write { context in
+            for entity in (try? context.fetch(FetchDescriptor<LocalRecentGroupEntity>())) ?? [] {
+                context.delete(entity)
+            }
+            for entity in (try? context.fetch(FetchDescriptor<LocalMatchRecordEntity>())) ?? [] {
+                context.delete(entity)
+            }
+            for entity in (try? context.fetch(FetchDescriptor<LocalNotificationEntity>())) ?? [] {
+                context.delete(entity)
+            }
+            for entity in (try? context.fetch(FetchDescriptor<LocalSearchKeywordEntity>())) ?? [] {
+                context.delete(entity)
+            }
+        }
+    }
+
     private func read<T>(_ body: (ModelContext) -> T) -> T {
         lock.withLock {
             body(ModelContext(modelContainer))
@@ -849,6 +874,11 @@ struct OnboardingStatusNormalizationResult: Equatable {
     var didMigrate: Bool {
         source != .normalized
     }
+}
+
+private struct LocalProfileImageCacheEntry: Codable {
+    let data: Data
+    let updatedAt: Date
 }
 
 final class AppLocalStore {
@@ -1009,6 +1039,74 @@ final class AppLocalStore {
             defaultsKey: LocalStoreKey.historyPublic,
             defaultValue: true
         )
+    }
+
+    var blockedUsers: [BlockedUser] {
+        (decode([BlockedUser].self, forKey: LocalStoreKey.blockedUsers) ?? [])
+            .sorted { $0.blockedAt > $1.blockedAt }
+    }
+
+    func setBlockedUsers(_ users: [BlockedUser]) {
+        let sanitizedUsers = users.reduce(into: [String: BlockedUser]()) { partialResult, user in
+            let normalizedUserID = user.userID.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalizedUserID.isEmpty else { return }
+            partialResult[normalizedUserID] = BlockedUser(
+                userID: normalizedUserID,
+                nickname: user.nickname.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "사용자" : user.nickname,
+                blockedAt: user.blockedAt
+            )
+        }
+        save(
+            sanitizedUsers.values.sorted { $0.blockedAt > $1.blockedAt },
+            forKey: LocalStoreKey.blockedUsers
+        )
+    }
+
+    @discardableResult
+    func blockUser(_ target: BlockUserTarget) -> BlockedUser {
+        let normalizedUserID = target.userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedUserID.isEmpty else {
+            return BlockedUser(userID: "", nickname: "사용자", blockedAt: Date())
+        }
+        let normalizedNickname = target.nickname.trimmingCharacters(in: .whitespacesAndNewlines)
+        let blockedUser = BlockedUser(
+            userID: normalizedUserID,
+            nickname: normalizedNickname.isEmpty ? "사용자" : normalizedNickname,
+            blockedAt: Date()
+        )
+        var current = blockedUsers.filter { $0.userID != normalizedUserID }
+        current.insert(blockedUser, at: 0)
+        setBlockedUsers(current)
+        return blockedUser
+    }
+
+    func unblockUser(userID: String) {
+        guard let normalizedUserID = normalizedUserID(userID) else { return }
+        setBlockedUsers(blockedUsers.filter { $0.userID != normalizedUserID })
+    }
+
+    func isUserBlocked(_ userID: String?) -> Bool {
+        guard let normalizedUserID = normalizedUserID(userID) else { return false }
+        return blockedUsers.contains { $0.userID == normalizedUserID }
+    }
+
+    func localProfileImageData(for userID: String) -> Data? {
+        guard let normalizedUserID = normalizedUserID(userID) else { return nil }
+        return localProfileImages[normalizedUserID]?.data
+    }
+
+    func saveLocalProfileImage(data: Data, for userID: String) {
+        guard let normalizedUserID = normalizedUserID(userID) else { return }
+        var current = localProfileImages
+        current[normalizedUserID] = LocalProfileImageCacheEntry(data: data, updatedAt: Date())
+        save(current, forKey: LocalStoreKey.profileImages)
+    }
+
+    func clearLocalProfileImage(for userID: String) {
+        guard let normalizedUserID = normalizedUserID(userID) else { return }
+        var current = localProfileImages
+        current.removeValue(forKey: normalizedUserID)
+        save(current, forKey: LocalStoreKey.profileImages)
     }
 
     func groupName(for groupID: String) -> String? {
@@ -1225,6 +1323,24 @@ final class AppLocalStore {
         defaults.set(isEnabled, forKey: LocalStoreKey.historyPublic)
     }
 
+    func clearAccountScopedData() {
+        persistenceStore.clearAccountScopedData()
+        [
+            LocalStoreKey.groupIDs,
+            LocalStoreKey.recentMatches,
+            LocalStoreKey.cachedResults,
+            LocalStoreKey.savedHistoryMatchIDs,
+            LocalStoreKey.manualAdjustDrafts,
+            LocalStoreKey.notifications,
+            LocalStoreKey.recentSearchKeywords,
+            LocalStoreKey.recruitFilterType,
+            LocalStoreKey.teamBalancePreviewDraft,
+            LocalStoreKey.resultPreviewDraft,
+            LocalStoreKey.profileImages,
+            LocalStoreKey.blockedUsers,
+        ].forEach { defaults.removeObject(forKey: $0) }
+    }
+
     private func save<T: Encodable>(_ value: T, forKey key: String) {
         guard let data = try? JSONEncoder.app.encode(value) else { return }
         defaults.set(data, forKey: key)
@@ -1235,9 +1351,21 @@ final class AppLocalStore {
         return try? JSONDecoder.app.decode(type, from: data)
     }
 
+    private var localProfileImages: [String: LocalProfileImageCacheEntry] {
+        decode([String: LocalProfileImageCacheEntry].self, forKey: LocalStoreKey.profileImages) ?? [:]
+    }
+
     private var legacyOnboardingStatus: OnboardingStatus? {
         guard let rawValue = defaults.string(forKey: LocalStoreKey.onboardingStatus) else { return nil }
         return OnboardingStatus(rawValue: rawValue)
+    }
+
+    private func normalizedUserID(_ value: String?) -> String? {
+        guard let normalizedValue = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !normalizedValue.isEmpty else {
+            return nil
+        }
+        return normalizedValue
     }
 
     private func boolPreference(
@@ -1687,13 +1815,18 @@ final class APIClient {
         path == "/auth/signup/email"
             || path == "/auth/login/email"
             || path == "/me"
+            || path == "/me/profile-image"
             || path == "/users"
             || path == "/users/search"
+            || path.hasPrefix("/users/")
             || path == "/groups"
             || path.hasPrefix("/groups/")
             || path.hasPrefix("/matches/")
             || path == "/recruiting-posts"
             || path.hasPrefix("/recruiting-posts/")
+            || path == "/reports"
+            || path == "/blocks"
+            || path.hasPrefix("/blocks/")
             || path.hasSuffix("/power-profile")
             || path.hasSuffix("/inhouse-history")
             || path.hasPrefix("/riot-accounts")
@@ -2240,6 +2373,8 @@ struct UserProfileDTO: Codable {
     let id: String
     let email: String
     let nickname: String
+    let profileImageURL: URL?
+    let profileImageUpdatedAt: Date?
     let primaryPosition: Position?
     let secondaryPosition: Position?
     let isFillAvailable: Bool
@@ -2253,6 +2388,13 @@ struct UserProfileDTO: Codable {
         case id
         case email
         case nickname
+        case profileImageUrl
+        case profileImageURL
+        case avatarUrl
+        case imageUrl
+        case updatedAt
+        case profileUpdatedAt
+        case profileImageUpdatedAt
         case primaryPosition
         case mainPosition
         case secondaryPosition
@@ -2275,6 +2417,8 @@ struct UserProfileDTO: Codable {
         id: String,
         email: String,
         nickname: String,
+        profileImageURL: URL? = nil,
+        profileImageUpdatedAt: Date? = nil,
         primaryPosition: Position?,
         secondaryPosition: Position?,
         isFillAvailable: Bool,
@@ -2288,6 +2432,8 @@ struct UserProfileDTO: Codable {
         self.id = id
         self.email = email
         self.nickname = nickname
+        self.profileImageURL = profileImageURL
+        self.profileImageUpdatedAt = profileImageUpdatedAt
         self.primaryPosition = primaryPosition
         self.secondaryPosition = secondaryPosition
         self.isFillAvailable = isFillAvailable
@@ -2303,6 +2449,11 @@ struct UserProfileDTO: Codable {
         id = try container.decode(String.self, forKey: .id)
         email = try container.decode(String.self, forKey: .email)
         nickname = try container.decode(String.self, forKey: .nickname)
+        profileImageURL = Self.decodeLossyURL(from: container, forKeys: [.profileImageUrl, .profileImageURL, .avatarUrl, .imageUrl])
+        profileImageUpdatedAt = Self.decodeLossyDate(
+            from: container,
+            forKeys: [.profileImageUpdatedAt, .updatedAt, .profileUpdatedAt]
+        )
         primaryPosition = Self.decodeLossyPosition(from: container, forKeys: [.primaryPosition, .mainPosition])
         secondaryPosition = Self.decodeLossyPosition(from: container, forKeys: [.secondaryPosition])
         isFillAvailable = (try? container.decode(Bool.self, forKey: .isFillAvailable)) ?? false
@@ -2322,6 +2473,8 @@ struct UserProfileDTO: Codable {
         try container.encode(id, forKey: .id)
         try container.encode(email, forKey: .email)
         try container.encode(nickname, forKey: .nickname)
+        try container.encodeIfPresent(profileImageURL?.absoluteString, forKey: .profileImageUrl)
+        try container.encodeIfPresent(profileImageUpdatedAt, forKey: .profileImageUpdatedAt)
         try container.encodeIfPresent(primaryPosition, forKey: .primaryPosition)
         try container.encodeIfPresent(secondaryPosition, forKey: .secondaryPosition)
         try container.encode(isFillAvailable, forKey: .isFillAvailable)
@@ -2342,6 +2495,9 @@ struct UserProfileDTO: Codable {
             id: id,
             email: email,
             nickname: nickname,
+            profileImageURL: profileImageURL,
+            profileImageUpdatedAt: profileImageUpdatedAt,
+            profileImageCacheKey: profileImageUpdatedAt.map { String(Int($0.timeIntervalSince1970)) },
             primaryPosition: primaryPosition,
             secondaryPosition: secondaryPosition,
             isFillAvailable: isFillAvailable,
@@ -2370,6 +2526,36 @@ struct UserProfileDTO: Codable {
                 if let position = Position(rawValue: normalized) {
                     return position
                 }
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyURL(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> URL? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(URL.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let url = URL(string: normalized), !normalized.isEmpty {
+                    return url
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyDate(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Date? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Date.self, forKey: key) {
+                return value
             }
         }
         return nil
@@ -2494,6 +2680,91 @@ struct UpdateProfileRequestDTO: Encodable {
     let isFillAvailable: Bool
     let styleTags: [String]
     let nickname: String
+}
+
+struct ReportRequestDTO: Encodable {
+    let targetType: ReportTargetType
+    let targetId: String
+    let reason: ReportReason
+    let detail: String?
+
+    init(target: ReportTarget, reason: ReportReason, detail: String?) {
+        targetType = target.type
+        targetId = target.targetID
+        self.reason = reason
+        self.detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+}
+
+struct BlockUserRequestDTO: Encodable {
+    let userId: String
+}
+
+struct BlockedUserDTO: Decodable {
+    let userID: String
+    let nickname: String
+    let blockedAt: Date
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case userId
+        case userID
+        case blockedUserId
+        case nickname
+        case displayName
+        case name
+        case blockedAt
+        case createdAt
+        case updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        userID = try container.decodeIfPresent(String.self, forKey: .userId)
+            ?? container.decodeIfPresent(String.self, forKey: .userID)
+            ?? container.decodeIfPresent(String.self, forKey: .blockedUserId)
+            ?? container.decode(String.self, forKey: .id)
+        let decodedNickname = try container.decodeIfPresent(String.self, forKey: .nickname)
+            ?? container.decodeIfPresent(String.self, forKey: .displayName)
+            ?? container.decodeIfPresent(String.self, forKey: .name)
+        nickname = decodedNickname?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "사용자"
+        blockedAt = (try? container.decodeIfPresent(Date.self, forKey: .blockedAt))
+            ?? (try? container.decodeIfPresent(Date.self, forKey: .createdAt))
+            ?? (try? container.decodeIfPresent(Date.self, forKey: .updatedAt))
+            ?? Date()
+    }
+
+    func toDomain() -> BlockedUser {
+        BlockedUser(
+            userID: userID.trimmingCharacters(in: .whitespacesAndNewlines),
+            nickname: nickname,
+            blockedAt: blockedAt
+        )
+    }
+}
+
+struct BlockedUserListDTO: Decodable {
+    let items: [BlockedUserDTO]
+
+    private enum CodingKeys: String, CodingKey {
+        case items
+        case users
+        case blockedUsers
+        case data
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            for key in [CodingKeys.items, .users, .blockedUsers, .data] {
+                if let items = try? container.decodeIfPresent([BlockedUserDTO].self, forKey: key) {
+                    self.items = items
+                    return
+                }
+            }
+        }
+        let singleValueContainer = try decoder.singleValueContainer()
+        items = try singleValueContainer.decode([BlockedUserDTO].self)
+    }
 }
 
 struct PowerProfileDTO: Codable {
@@ -3619,6 +3890,37 @@ final class AuthRepository {
         await tokenStore.clear()
     }
 
+    func deleteAccount() async throws {
+        var lastCapabilityError: UserFacingError?
+
+        // TODO: 서버 확정 스펙에 맞춰 계정 탈퇴 endpoint를 단일화한다.
+        for path in ["/me", "/auth/account"] {
+            do {
+                let response: EmptyResponse = try await apiClient.sendWithoutBody(
+                    path: path,
+                    method: .delete
+                )
+                _ = response
+                await tokenStore.clear()
+                return
+            } catch let error as UserFacingError {
+                if [404, 405, 501].contains(error.statusCode ?? -1) {
+                    lastCapabilityError = error
+                    continue
+                }
+                throw error
+            }
+        }
+
+        throw lastCapabilityError
+            ?? UserFacingError(
+                title: "회원 탈퇴 실패",
+                message: "회원 탈퇴 기능이 아직 서버와 연결되지 않았어요. 잠시 후 다시 시도해주세요.",
+                endpoint: "/me",
+                requestMethod: HTTPMethod.delete.rawValue
+            ).serverContractMapped
+    }
+
     private func debugLogEmailSignUpSuccess(_ tokens: AuthTokens) {
 #if DEBUG
         print(
@@ -3693,6 +3995,37 @@ final class ProfileRepository {
         let updatedProfile = response.toDomain()
         clearCachedPowerProfile(for: updatedProfile.id)
         return updatedProfile
+    }
+
+    func updateProfileImage(imageData: Data, mimeType: String, fileName: String) async throws -> UserProfile {
+        let boundary = "Boundary-\(UUID().uuidString)"
+        let body = multipartFormBody(
+            data: imageData,
+            fieldName: "image",
+            fileName: fileName,
+            mimeType: mimeType,
+            boundary: boundary
+        )
+        // TODO: 서버 업로드 스펙 확정 시 endpoint 및 multipart field name을 맞춘다.
+        let response: UserProfileDTO = try await apiClient.send(
+            path: "/me/profile-image",
+            method: .post,
+            body: body,
+            headers: ["Content-Type": "multipart/form-data; boundary=\(boundary)"]
+        )
+        var updatedProfile = response.toDomain()
+        updatedProfile.profileImageCacheKey = UUID().uuidString
+        clearCachedPowerProfile(for: updatedProfile.id)
+        return updatedProfile
+    }
+
+    func isProfileImageUploadCapabilityUnavailable(_ error: UserFacingError) -> Bool {
+        switch error.statusCode {
+        case 404, 405, 501:
+            return true
+        default:
+            return false
+        }
     }
 
     func powerProfile(userID: String) async throws -> PowerProfile {
@@ -3798,6 +4131,22 @@ final class ProfileRepository {
         }
     }
 
+    private func multipartFormBody(
+        data: Data,
+        fieldName: String,
+        fileName: String,
+        mimeType: String,
+        boundary: String
+    ) -> Data {
+        var body = Data()
+        body.append("--\(boundary)\r\n".data(using: .utf8)!)
+        body.append("Content-Disposition: form-data; name=\"\(fieldName)\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
+        body.append("Content-Type: \(mimeType)\r\n\r\n".data(using: .utf8)!)
+        body.append(data)
+        body.append("\r\n--\(boundary)--\r\n".data(using: .utf8)!)
+        return body
+    }
+
     private func fetchPowerProfile(userID: String) async throws -> PowerProfile {
         do {
             let response: PowerProfileDTO = try await apiClient.sendWithoutBody(path: "/users/\(userID)/power-profile")
@@ -3871,6 +4220,97 @@ final class ProfileRepository {
 #if DEBUG
         print("[ProfileDebug] \(message)")
 #endif
+    }
+}
+
+final class SafetyRepository {
+    private let apiClient: APIClient
+    private let blockedUsersEndpointCandidates = ["/blocks", "/me/blocks"]
+
+    init(apiClient: APIClient) {
+        self.apiClient = apiClient
+    }
+
+    func submitReport(target: ReportTarget, reason: ReportReason, detail: String?) async throws {
+        // TODO: 서버 신고 스펙 확정 시 endpoint 및 targetType 값을 검증한다.
+        let response: EmptyResponse = try await apiClient.send(
+            path: "/reports",
+            method: .post,
+            body: try apiClient.encodedBody(
+                ReportRequestDTO(target: target, reason: reason, detail: detail)
+            )
+        )
+        _ = response
+    }
+
+    func blockedUsers() async throws -> [BlockedUser] {
+        var lastCapabilityError: UserFacingError?
+        for path in blockedUsersEndpointCandidates {
+            do {
+                let response: BlockedUserListDTO = try await apiClient.sendWithoutBody(path: path)
+                return response.items
+                    .map { $0.toDomain() }
+                    .filter { !$0.userID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            } catch let error as UserFacingError {
+                if isCapabilityUnavailable(error) {
+                    lastCapabilityError = error
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastCapabilityError
+            ?? UserFacingError(
+                title: "차단 목록 조회 실패",
+                message: "차단 목록을 불러올 수 없어요.",
+                endpoint: blockedUsersEndpointCandidates.first,
+                requestMethod: HTTPMethod.get.rawValue
+            ).serverContractMapped
+    }
+
+    func blockUser(_ target: BlockUserTarget) async throws {
+        let response: EmptyResponse = try await apiClient.send(
+            path: "/blocks",
+            method: .post,
+            body: try apiClient.encodedBody(BlockUserRequestDTO(userId: target.userID))
+        )
+        _ = response
+    }
+
+    func unblockUser(userID: String) async throws {
+        var lastCapabilityError: UserFacingError?
+        for path in ["/blocks/\(userID)", "/users/\(userID)/block"] {
+            do {
+                let response: EmptyResponse = try await apiClient.sendWithoutBody(
+                    path: path,
+                    method: .delete
+                )
+                _ = response
+                return
+            } catch let error as UserFacingError {
+                if isCapabilityUnavailable(error) {
+                    lastCapabilityError = error
+                    continue
+                }
+                throw error
+            }
+        }
+        throw lastCapabilityError
+            ?? UserFacingError(
+                title: "차단 해제 실패",
+                message: "차단 해제를 완료할 수 없어요.",
+                endpoint: "/blocks/\(userID)",
+                requestMethod: HTTPMethod.delete.rawValue
+            ).serverContractMapped
+    }
+
+    func isCapabilityUnavailable(_ error: UserFacingError) -> Bool {
+        switch error.statusCode {
+        case 404, 405, 501:
+            return true
+        default:
+            return false
+        }
     }
 }
 
@@ -4540,6 +4980,10 @@ private extension String {
             .filter { !$0.isEmpty }
             .map(\.searchableText)
     }
+
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
 }
 
 // MARK: - Container
@@ -4553,6 +4997,7 @@ final class AppContainer {
     let apiClient: APIClient
     let authRepository: AuthRepository
     let profileRepository: ProfileRepository
+    let safetyRepository: SafetyRepository
     let riotRepository: RiotRepository
     let groupRepository: GroupRepository
     let matchRepository: MatchRepository
@@ -4574,6 +5019,7 @@ final class AppContainer {
         self.apiClient = APIClient(configuration: configuration, tokenStore: tokenStore, session: urlSession)
         self.authRepository = AuthRepository(apiClient: apiClient, tokenStore: tokenStore)
         self.profileRepository = ProfileRepository(apiClient: apiClient)
+        self.safetyRepository = SafetyRepository(apiClient: apiClient)
         self.riotRepository = RiotRepository(apiClient: apiClient)
         self.groupRepository = GroupRepository(apiClient: apiClient)
         self.matchRepository = MatchRepository(apiClient: apiClient)

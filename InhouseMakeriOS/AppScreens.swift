@@ -3,6 +3,7 @@ import ComposableArchitecture
 import Foundation
 import GoogleSignIn
 import MessageUI
+import PhotosUI
 import SafariServices
 import SwiftUI
 import UIKit
@@ -190,6 +191,14 @@ private extension AppRoute {
             return "riot_accounts"
         case .settings:
             return "settings"
+        case .editProfileImage:
+            return "edit_profile_image"
+        case .blockedUsers:
+            return "blocked_users"
+        case let .report(target):
+            return "report target=\(target.id)"
+        case .reportGuide:
+            return "report_guide"
         case .homeUpcomingMatches:
             return "home_upcoming_matches"
         case .homeGroups:
@@ -227,6 +236,14 @@ private extension AppRoute {
             return "RiotAccountsScreen"
         case .settings:
             return "SettingsScreen"
+        case .editProfileImage:
+            return "ProfileImageEditScreen"
+        case .blockedUsers:
+            return "BlockedUsersScreen"
+        case .report:
+            return "ReportScreen"
+        case .reportGuide:
+            return "ReportGuideScreen"
         case .homeUpcomingMatches:
             return "HomeUpcomingMatchesScreen"
         case .homeGroups:
@@ -510,6 +527,8 @@ final class AppSessionViewModel: ObservableObject {
     @Published private(set) var riotAccountsViewState: RiotLinkedAccountsViewState = .loading
     @Published private(set) var riotLinkedDataRevision = 0
     @Published private(set) var historyDataRevision = 0
+    @Published private(set) var profileImageRevision = 0
+    @Published private(set) var safetyDataRevision = 0
 
     let container: AppContainer
     private(set) var userSession: UserSession?
@@ -829,6 +848,14 @@ final class AppSessionViewModel: ObservableObject {
         state = .authenticated(session)
     }
 
+    func markProfileImageUpdated() {
+        profileImageRevision &+= 1
+    }
+
+    func markSafetyDataUpdated() {
+        safetyDataRevision &+= 1
+    }
+
     func recordResultSavedForHistory(matchID: String, userID: String?) {
         let writeUserID = userID ?? currentUserID ?? "nil"
         historyDataRevision &+= 1
@@ -948,6 +975,87 @@ final class AppSessionViewModel: ObservableObject {
         updateRiotAccountsViewState(.noLinkedAccounts)
         debugLog("signOut completed; route reset to main home and session changed to guest")
         state = .guest
+    }
+
+    func deleteAccount(router: AppRouter) async {
+        guard isAuthenticated else {
+            requireAuthentication(for: .settings)
+            return
+        }
+        if case .inProgress = actionState { return }
+
+        actionState = .inProgress("계정을 삭제하는 중입니다...")
+        do {
+            try await container.authRepository.deleteAccount()
+            container.localStore.clearAccountScopedData()
+            router.reset()
+            userSession = nil
+            selectedTab = .home
+            pendingAuthAction = nil
+            deferredAuthPrompt = nil
+            clearAuthPrompt(userInitiated: false)
+            container.localStore.setOnboardingStatus(.pending)
+            syncOnboardingPresentation(hasAuthenticatedSession: false)
+            updateRiotAccountsViewState(.noLinkedAccounts)
+            safetyDataRevision &+= 1
+            profileImageRevision &+= 1
+            actionState = .success("계정이 삭제되었습니다.")
+            state = .guest
+        } catch let error as UserFacingError {
+            if error.requiresAuthentication {
+                requireReauthentication(for: .settings)
+                actionState = .failure("다시 로그인한 뒤 계정 삭제를 진행해주세요.")
+            } else {
+                actionState = .failure(error.message)
+            }
+        } catch {
+            actionState = .failure("회원 탈퇴를 완료하지 못했습니다. 잠시 후 다시 시도해주세요.")
+        }
+    }
+
+    @discardableResult
+    func blockUser(_ target: BlockUserTarget) async -> Bool {
+        guard isAuthenticated else {
+            requireAuthentication(for: .profileSync)
+            return false
+        }
+        if case .inProgress = actionState { return false }
+
+        let normalizedUserID = target.userID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedUserID.isEmpty, normalizedUserID != currentUserID else {
+            actionState = .failure("차단할 수 없는 사용자입니다.")
+            return false
+        }
+
+        let previousBlockedUsers = container.localStore.blockedUsers
+        container.localStore.blockUser(target)
+        safetyDataRevision &+= 1
+        actionState = .inProgress("사용자를 차단하는 중입니다...")
+
+        do {
+            try await container.safetyRepository.blockUser(target)
+            actionState = .success("사용자를 차단했습니다.")
+            return true
+        } catch let error as UserFacingError {
+            if container.safetyRepository.isCapabilityUnavailable(error) {
+                actionState = .success("서버 차단 API 연결 전이라 이 기기에서 우선 숨겼습니다.")
+                return true
+            }
+            container.localStore.setBlockedUsers(previousBlockedUsers)
+            safetyDataRevision &+= 1
+            if error.requiresAuthentication {
+                requireReauthentication(for: .profileSync)
+                actionState = .failure("다시 로그인한 뒤 차단을 진행해주세요.")
+            } else {
+                actionState = .failure(error.message)
+            }
+            return false
+        } catch {
+            container.localStore.setBlockedUsers(previousBlockedUsers)
+            safetyDataRevision &+= 1
+            actionState = .failure("차단을 완료하지 못했습니다. 잠시 후 다시 시도해주세요.")
+            return false
+        }
     }
 
     func applyAuthenticatedSession(_ session: UserSession) {
@@ -1407,12 +1515,15 @@ final class HomeViewModel: ObservableObject {
 
     private func loadRecruitingPostsForHome(isAuthenticated: Bool, trigger: String) async throws -> [RecruitPost] {
         do {
+            let posts: [RecruitPost]
             if isAuthenticated {
                 debugHomeLoad("requestSource trigger=\(trigger) endpoint=/recruiting-posts source=HomeViewModel.loadRecruitingPostsForHome authenticated=true")
-                return try await session.container.recruitingRepository.list(status: .open)
+                posts = try await session.container.recruitingRepository.list(status: .open)
+            } else {
+                debugHomeLoad("requestSource trigger=\(trigger) endpoint=/recruiting-posts source=HomeViewModel.loadRecruitingPostsForHome authenticated=false")
+                posts = try await session.container.recruitingRepository.listPublic(status: .open)
             }
-            debugHomeLoad("requestSource trigger=\(trigger) endpoint=/recruiting-posts source=HomeViewModel.loadRecruitingPostsForHome authenticated=false")
-            return try await session.container.recruitingRepository.listPublic(status: .open)
+            return posts.filter { !session.container.localStore.isUserBlocked($0.createdBy) }
         } catch let error as UserFacingError {
             if isAuthenticated, error.requiresAuthentication {
                 throw error
@@ -1980,6 +2091,9 @@ final class RecruitBoardViewModel: ObservableObject {
         groupRegionsByID: [String: String]
     ) -> [RecruitPost] {
         posts.filter { post in
+            if session.container.localStore.isUserBlocked(post.createdBy) {
+                return false
+            }
             if !query.requiredPositions.isEmpty && Set(post.requiredPositions).intersection(query.requiredPositions).isEmpty {
                 return false
             }
@@ -2610,6 +2724,7 @@ fileprivate enum GroupMemberPowerSource: Hashable {
 
 fileprivate struct GroupMemberPowerRowViewState: Hashable, Identifiable {
     let id: String
+    let userID: String
     let name: String
     let subtitle: String
     let powerText: String
@@ -2700,6 +2815,7 @@ fileprivate enum PowerViewStateBuilder {
 
         return GroupMemberPowerRowViewState(
             id: member.id,
+            userID: member.userID,
             name: member.nickname,
             subtitle: subtitle,
             powerText: powerText,
@@ -3515,6 +3631,10 @@ final class GroupDetailViewModel: ObservableObject {
             return true
         }
         return false
+    }
+
+    func isUserBlocked(_ userID: String) -> Bool {
+        session.container.localStore.isUserBlocked(userID)
     }
 
     init(session: AppSessionViewModel, groupID: String) {
@@ -5165,6 +5285,25 @@ final class RecruitDetailViewModel: ObservableObject {
         state.value?.isOwner ?? false
     }
 
+    var isMoreMenuVisible: Bool {
+        state.value != nil
+    }
+
+    var reportTarget: ReportTarget? {
+        guard let viewState = state.value else { return nil }
+        return ReportTarget(type: .recruitPost, targetID: viewState.postID, displayName: viewState.title)
+    }
+
+    var authorBlockTarget: BlockUserTarget? {
+        guard let post = loadedPost,
+              let createdBy = normalizedDisplayValue(post.createdBy),
+              createdBy != session.currentUserID,
+              looksLikeInternalIdentifier(createdBy) else {
+            return nil
+        }
+        return BlockUserTarget(userID: createdBy, nickname: state.value?.authorName ?? "작성자")
+    }
+
     var isMutationInFlight: Bool {
         if case .inProgress = actionState {
             return true
@@ -5477,6 +5616,49 @@ final class RecruitDetailViewModel: ObservableObject {
         debugRecruitDetail("navigate back after delete")
     }
 
+    @discardableResult
+    func blockAuthor() async -> Bool {
+        guard let target = authorBlockTarget else {
+            actionState = .failure("차단할 수 없는 작성자입니다.")
+            return false
+        }
+        guard session.isAuthenticated else {
+            session.requireAuthentication(for: .profileSync)
+            return false
+        }
+        if case .inProgress = actionState { return false }
+
+        let previousBlockedUsers = session.container.localStore.blockedUsers
+        session.container.localStore.blockUser(target)
+        session.markSafetyDataUpdated()
+        actionState = .inProgress("작성자를 차단하는 중입니다...")
+
+        do {
+            try await session.container.safetyRepository.blockUser(target)
+            actionState = .success("작성자를 차단했습니다.")
+            return true
+        } catch let error as UserFacingError {
+            if session.container.safetyRepository.isCapabilityUnavailable(error) {
+                actionState = .success("서버 차단 API 연결 전이라 이 기기에서 우선 숨겼습니다.")
+                return true
+            }
+            session.container.localStore.setBlockedUsers(previousBlockedUsers)
+            session.markSafetyDataUpdated()
+            if error.requiresAuthentication {
+                session.requireReauthentication(for: .profileSync)
+                actionState = .failure("다시 로그인한 뒤 차단을 진행해주세요.")
+            } else {
+                actionState = .failure(error.message)
+            }
+            return false
+        } catch {
+            session.container.localStore.setBlockedUsers(previousBlockedUsers)
+            session.markSafetyDataUpdated()
+            actionState = .failure("차단을 완료하지 못했습니다. 잠시 후 다시 시도해주세요.")
+            return false
+        }
+    }
+
     private func recruitDetailErrorType(for error: UserFacingError) -> RecruitDetailErrorType {
         if error.requiresAuthentication {
             return .authRequired
@@ -5711,6 +5893,22 @@ struct AppShellView: View {
                     debugAppShell("source=AppShell action=loadSelectedTab trigger=\(AppShellLoadTrigger.historyDataRevision.rawValue) selectedTab=\(session.selectedTab.rawValue) force=true")
                     await historyViewModel.load(force: true, trigger: AppShellLoadTrigger.historyDataRevision.rawValue)
                 }
+                .task(id: session.profileImageRevision) {
+                    guard session.profileImageRevision > 0 else { return }
+                    profileViewModel.reset()
+                    if session.selectedTab == .profile {
+                        await profileViewModel.load(force: true, trigger: "profile_image_updated")
+                    }
+                }
+                .task(id: session.safetyDataRevision) {
+                    guard session.safetyDataRevision > 0 else { return }
+                    homeViewModel.reset()
+                    groupViewModel.reset()
+                    recruitViewModel.reset()
+                    if session.selectedTab == .home || session.selectedTab == .match || session.selectedTab == .recruit {
+                        await loadSelectedTab(force: true, trigger: .safetyDataRevision)
+                    }
+                }
         }
     }
 
@@ -5749,6 +5947,25 @@ struct AppShellView: View {
             RiotAccountsScreen(viewModel: RiotAccountsViewModel(session: session), session: session, onBack: router.pop)
         case .settings:
             SettingsScreen(session: session, router: router, onBack: router.pop)
+        case .editProfileImage:
+            ProfileImageEditScreen(
+                viewModel: ProfileImageEditViewModel(session: session),
+                router: router,
+                onBack: router.pop
+            )
+        case .blockedUsers:
+            BlockedUsersScreen(
+                viewModel: BlockedUsersViewModel(session: session),
+                onBack: router.pop
+            )
+        case let .report(target):
+            ReportScreen(
+                viewModel: ReportViewModel(session: session, target: target),
+                router: router,
+                onBack: router.pop
+            )
+        case .reportGuide:
+            ReportGuideScreen(onBack: router.pop)
         case .homeUpcomingMatches:
             HomeUpcomingMatchesScreen(
                 viewModel: HomeUpcomingMatchesViewModel(session: session),
@@ -5767,9 +5984,14 @@ struct AppShellView: View {
                 viewModel: PowerDetailViewModel(session: session),
                 title: "파워 상세",
                 emptyTitle: "파워 상세",
+                session: session,
+                router: router,
                 onBack: router.pop
             )
         case let .memberProfile(userID, nickname):
+            let safetyTarget = userID == session.currentUserID
+                ? nil
+                : BlockUserTarget(userID: userID, nickname: nickname.isEmpty ? "사용자" : nickname)
             PowerDetailScreen(
                 viewModel: PowerDetailViewModel(
                     session: session,
@@ -5778,6 +6000,9 @@ struct AppShellView: View {
                 ),
                 title: nickname.isEmpty ? "멤버 프로필" : nickname,
                 emptyTitle: "멤버 프로필",
+                session: session,
+                router: router,
+                safetyTarget: safetyTarget,
                 onBack: router.pop
             )
         case .homeRecentMatches:
@@ -5910,12 +6135,13 @@ private enum AppShellLoadTrigger: String {
     case riotLinkedDataRevision = "riot_linked_data_revision"
     case tabSelected = "tab_selected"
     case historyDataRevision = "history_data_revision"
+    case safetyDataRevision = "safety_data_revision"
 
     var recruitBoardTrigger: RecruitBoardLoadTrigger {
         switch self {
         case .sessionScopeChange:
             return .sessionScopeChange
-        case .riotLinkedDataRevision, .tabSelected, .historyDataRevision:
+        case .riotLinkedDataRevision, .tabSelected, .historyDataRevision, .safetyDataRevision:
             return .screenAppear
         }
     }
@@ -6820,25 +7046,41 @@ fileprivate struct HomeGroupsScreen: View {
 
 fileprivate struct PowerDetailScreen: View {
     @StateObject private var viewModel: PowerDetailViewModel
+    @ObservedObject var session: AppSessionViewModel
+    @ObservedObject var router: AppRouter
     let title: String
     let emptyTitle: String
+    let safetyTarget: BlockUserTarget?
     let onBack: () -> Void
     @State private var showsCalculationSheet = false
+    @State private var isSafetyDialogPresented = false
+    @State private var isBlockConfirmationPresented = false
 
     init(
         viewModel: PowerDetailViewModel,
         title: String = "파워 상세",
         emptyTitle: String = "파워 상세",
+        session: AppSessionViewModel,
+        router: AppRouter,
+        safetyTarget: BlockUserTarget? = nil,
         onBack: @escaping () -> Void
     ) {
         _viewModel = StateObject(wrappedValue: viewModel)
+        self.session = session
+        self.router = router
         self.title = title
         self.emptyTitle = emptyTitle
+        self.safetyTarget = safetyTarget
         self.onBack = onBack
     }
 
     var body: some View {
-        screenScaffold(title: title, onBack: onBack, rightSystemImage: nil) {
+        screenScaffold(
+            title: title,
+            onBack: onBack,
+            rightSystemImage: safetyTarget == nil ? nil : "ellipsis.circle",
+            onRightTap: { isSafetyDialogPresented = true }
+        ) {
             Group {
                 switch viewModel.state {
                 case .initial, .loading:
@@ -6928,7 +7170,38 @@ fileprivate struct PowerDetailScreen: View {
                 }
             }
         }
+        .overlay(alignment: .bottom) { actionBanner(session.actionState) }
+        .confirmationDialog("사용자 관리", isPresented: $isSafetyDialogPresented, titleVisibility: .visible) {
+            if let reportTarget {
+                Button("신고하기") {
+                    router.push(.report(target: reportTarget))
+                }
+            }
+            if safetyTarget != nil {
+                Button("차단하기", role: .destructive) {
+                    isBlockConfirmationPresented = true
+                }
+            }
+            Button("취소", role: .cancel) {}
+        }
+        .alert("사용자를 차단할까요?", isPresented: $isBlockConfirmationPresented) {
+            Button("취소", role: .cancel) {}
+            Button("차단", role: .destructive) {
+                Task {
+                    if let safetyTarget, await session.blockUser(safetyTarget) {
+                        router.pop()
+                    }
+                }
+            }
+        } message: {
+            Text("차단한 사용자의 프로필과 모집글 노출이 줄어듭니다.")
+        }
         .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsCalculationSheet)
+    }
+
+    private var reportTarget: ReportTarget? {
+        guard let safetyTarget else { return nil }
+        return ReportTarget(type: .user, targetID: safetyTarget.userID, displayName: safetyTarget.nickname)
     }
 
     private func overviewCard(_ overview: PowerOverviewViewState) -> some View {
@@ -7859,7 +8132,8 @@ struct GroupDetailScreen: View {
                 EmptyStateView(title: "그룹", message: "표시할 그룹이 없습니다.")
             case let .content(snapshot), let .refreshing(snapshot):
                 let guide = PowerViewStateBuilder.groupGuide()
-                let memberRows = snapshot.members.map { member in
+                let visibleMembers = snapshot.members.filter { !viewModel.isUserBlocked($0.userID) }
+                let memberRows = visibleMembers.map { member in
                     PowerViewStateBuilder.groupMember(
                         member: member,
                         powerProfile: snapshot.powerProfiles[member.userID]
@@ -7916,7 +8190,7 @@ struct GroupDetailScreen: View {
 
                         VStack(alignment: .leading, spacing: 10) {
                             HStack {
-                                Text("멤버 (\(snapshot.members.count))")
+                                Text("멤버 (\(visibleMembers.count))")
                                     .font(AppTypography.heading(16, weight: .bold))
                                     .foregroundStyle(AppPalette.textPrimary)
                                 Spacer()
@@ -7936,7 +8210,7 @@ struct GroupDetailScreen: View {
                                 .buttonStyle(.plain)
                             }
 
-                            if snapshot.members.count <= 1 {
+                            if visibleMembers.count <= 1 {
                                 GroupPowerGuideCard(guide: guide)
 
                                 VStack(alignment: .leading, spacing: 6) {
@@ -7955,7 +8229,12 @@ struct GroupDetailScreen: View {
 
                             LazyVStack(spacing: 8) {
                                 ForEach(memberRows) { row in
-                                    GroupPowerMemberRow(row: row)
+                                    Button {
+                                        router.push(.memberProfile(userID: row.userID, nickname: row.name))
+                                    } label: {
+                                        GroupPowerMemberRow(row: row)
+                                    }
+                                    .buttonStyle(.plain)
                                 }
                             }
                         }
@@ -9231,6 +9510,7 @@ struct RecruitDetailScreen: View {
     let onUpdateSuccess: (RecruitPost) -> Void
     let onDeleteSuccess: (RecruitPost) -> Void
     @State private var isDeleteConfirmationPresented = false
+    @State private var isBlockConfirmationPresented = false
     @State private var isManagementDialogPresented = false
     @State private var isEditorPresented = false
     @State private var recruitEditorDraft = RecruitEditorDraft(postType: .memberRecruit)
@@ -9240,7 +9520,7 @@ struct RecruitDetailScreen: View {
         screenScaffold(
             title: "모집 상세",
             onBack: router.pop,
-            rightSystemImage: viewModel.isEditVisible || viewModel.isDeleteVisible ? "ellipsis.circle" : nil,
+            rightSystemImage: viewModel.isMoreMenuVisible ? "ellipsis.circle" : nil,
             onRightTap: { isManagementDialogPresented = true }
         ) {
             switch viewModel.state {
@@ -9341,6 +9621,16 @@ struct RecruitDetailScreen: View {
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
         .confirmationDialog("모집글 관리", isPresented: $isManagementDialogPresented, titleVisibility: .visible) {
+            if let reportTarget = viewModel.reportTarget {
+                Button("신고하기") {
+                    router.push(.report(target: reportTarget))
+                }
+            }
+            if viewModel.authorBlockTarget != nil {
+                Button("작성자 차단하기", role: .destructive) {
+                    isBlockConfirmationPresented = true
+                }
+            }
             if viewModel.isEditVisible {
                 Button("수정") { presentRecruitEditor() }
             }
@@ -9356,6 +9646,18 @@ struct RecruitDetailScreen: View {
             }
         } message: {
             Text("삭제한 모집글은 복구할 수 없습니다.")
+        }
+        .alert("작성자를 차단할까요?", isPresented: $isBlockConfirmationPresented) {
+            Button("취소", role: .cancel) {}
+            Button("차단", role: .destructive) {
+                Task {
+                    if await viewModel.blockAuthor() {
+                        router.pop()
+                    }
+                }
+            }
+        } message: {
+            Text("차단한 사용자의 모집글과 프로필 노출이 줄어듭니다.")
         }
     }
 
@@ -10375,9 +10677,12 @@ struct ProfileScreen: View {
     @ViewBuilder
     private func authenticatedProfileContent(_ snapshot: ProfileSnapshot) -> some View {
         HStack(spacing: 16) {
-            Circle()
-                .fill(AppPalette.bgElevated)
-                .frame(width: 64, height: 64)
+            Button {
+                session.openProtectedRoute(.editProfileImage, requirement: .profileSync, router: router)
+            } label: {
+                profileAvatar(for: snapshot.profile, size: 64)
+            }
+            .buttonStyle(.plain)
             VStack(alignment: .leading, spacing: 4) {
                 Text(snapshot.profile.nickname)
                     .font(AppTypography.heading(24, weight: .bold))
@@ -10480,6 +10785,71 @@ struct ProfileScreen: View {
             )
             profileTopChampionsSection(snapshot.topChampionsSection)
         }
+    }
+
+    private func profileAvatar(for profile: UserProfile, size: CGFloat) -> some View {
+        ZStack(alignment: .bottomTrailing) {
+            profileAvatarImage(for: profile, size: size)
+
+            Image(systemName: "camera.fill")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(AppPalette.bgPrimary)
+                .frame(width: 22, height: 22)
+                .background(AppPalette.accentBlue)
+                .clipShape(Circle())
+                .overlay(Circle().stroke(AppPalette.bgPrimary, lineWidth: 2))
+        }
+        .accessibilityLabel("프로필 이미지 변경")
+    }
+
+    @ViewBuilder
+    private func profileAvatarImage(for profile: UserProfile, size: CGFloat) -> some View {
+        if let url = profile.cacheBustedProfileImageURL(fallbackCacheKey: String(session.profileImageRevision)) {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case let .success(image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                default:
+                    localProfileAvatarImage(for: profile, size: size)
+                }
+            }
+            .frame(width: size, height: size)
+            .clipShape(Circle())
+        } else if let data = session.container.localStore.localProfileImageData(for: profile.id),
+                  let image = UIImage(data: data) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+        } else {
+            profileAvatarPlaceholder(size: size)
+        }
+    }
+
+    @ViewBuilder
+    private func localProfileAvatarImage(for profile: UserProfile, size: CGFloat) -> some View {
+        if let data = session.container.localStore.localProfileImageData(for: profile.id),
+           let image = UIImage(data: data) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+        } else {
+            profileAvatarPlaceholder(size: size)
+        }
+    }
+
+    private func profileAvatarPlaceholder(size: CGFloat) -> some View {
+        ZStack {
+            Circle()
+                .fill(AppPalette.bgElevated)
+            Image(systemName: "person.fill")
+                .font(.system(size: size * 0.42, weight: .semibold))
+                .foregroundStyle(AppPalette.textMuted)
+        }
+        .frame(width: size, height: size)
     }
 
     @ViewBuilder
@@ -11597,6 +11967,608 @@ struct NotificationsScreen: View {
     }
 }
 
+private enum ProfileImageProcessor {
+    static func processedJPEGData(from image: UIImage, targetPixelSize: CGFloat = 512, compressionQuality: CGFloat = 0.82) -> (image: UIImage, data: Data)? {
+        let targetSize = CGSize(width: targetPixelSize, height: targetPixelSize)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        let renderedImage = renderer.image { context in
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: targetSize))
+
+            let scale = max(targetSize.width / image.size.width, targetSize.height / image.size.height)
+            let drawSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+            let drawOrigin = CGPoint(
+                x: (targetSize.width - drawSize.width) / 2,
+                y: (targetSize.height - drawSize.height) / 2
+            )
+            image.draw(in: CGRect(origin: drawOrigin, size: drawSize))
+        }
+
+        guard let data = renderedImage.jpegData(compressionQuality: compressionQuality) else { return nil }
+        return (renderedImage, data)
+    }
+}
+
+@MainActor
+final class ProfileImageEditViewModel: ObservableObject {
+    @Published private(set) var previewImage: UIImage?
+    @Published private(set) var actionState: AsyncActionState = .idle
+    private let session: AppSessionViewModel
+    private var processedImageData: Data?
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+    }
+
+    var canUpload: Bool {
+        processedImageData != nil
+    }
+
+    var currentProfile: UserProfile? {
+        session.profile
+    }
+
+    var currentLocalImageData: Data? {
+        guard let currentProfile else { return nil }
+        return session.container.localStore.localProfileImageData(for: currentProfile.id)
+    }
+
+    var currentProfileImageURL: URL? {
+        currentProfile?.cacheBustedProfileImageURL(fallbackCacheKey: String(session.profileImageRevision))
+    }
+
+    func loadSelectedItem(_ item: PhotosPickerItem?) async {
+        guard let item else { return }
+        do {
+            guard let data = try await item.loadTransferable(type: Data.self),
+                  let image = UIImage(data: data),
+                  let processed = ProfileImageProcessor.processedJPEGData(from: image) else {
+                actionState = .failure("선택한 이미지를 처리하지 못했습니다.")
+                return
+            }
+            previewImage = processed.image
+            processedImageData = processed.data
+            actionState = .idle
+        } catch {
+            actionState = .failure("사진을 불러오지 못했습니다.")
+        }
+    }
+
+    func upload(router: AppRouter) async {
+        guard let data = processedImageData else {
+            actionState = .failure("먼저 변경할 이미지를 선택해주세요.")
+            return
+        }
+        guard let currentProfile else {
+            session.requireAuthentication(for: .profileSync)
+            return
+        }
+        if case .inProgress = actionState { return }
+
+        actionState = .inProgress("프로필 이미지를 업로드하는 중입니다...")
+        do {
+            let updatedProfile = try await session.container.profileRepository.updateProfileImage(
+                imageData: data,
+                mimeType: "image/jpeg",
+                fileName: "profile-\(currentProfile.id).jpg"
+            )
+            session.container.localStore.saveLocalProfileImage(data: data, for: updatedProfile.id)
+            session.updateAuthenticatedProfile(updatedProfile)
+            session.markProfileImageUpdated()
+            actionState = .success("프로필 이미지가 변경되었습니다.")
+            await closeAfterSuccess(router: router)
+        } catch let error as UserFacingError {
+            if session.container.profileRepository.isProfileImageUploadCapabilityUnavailable(error) {
+                var localProfile = currentProfile
+                localProfile.profileImageUpdatedAt = Date()
+                localProfile.profileImageCacheKey = UUID().uuidString
+                session.container.localStore.saveLocalProfileImage(data: data, for: localProfile.id)
+                session.updateAuthenticatedProfile(localProfile)
+                session.markProfileImageUpdated()
+                actionState = .success("서버 업로드 연결 전이라 이 기기에 먼저 반영했습니다.")
+                await closeAfterSuccess(router: router)
+                return
+            }
+            if error.requiresAuthentication {
+                session.requireReauthentication(for: .profileSync)
+                actionState = .failure("다시 로그인한 뒤 프로필 이미지를 변경해주세요.")
+            } else {
+                actionState = .failure(error.message)
+            }
+        } catch {
+            actionState = .failure("프로필 이미지 변경에 실패했습니다. 잠시 후 다시 시도해주세요.")
+        }
+    }
+
+    private func closeAfterSuccess(router: AppRouter) async {
+        try? await Task.sleep(nanoseconds: 550_000_000)
+        router.pop()
+    }
+}
+
+struct ProfileImageEditScreen: View {
+    @ObservedObject var viewModel: ProfileImageEditViewModel
+    @ObservedObject var router: AppRouter
+    let onBack: () -> Void
+    @State private var selectedPhotoItem: PhotosPickerItem?
+
+    var body: some View {
+        screenScaffold(title: "프로필 이미지 변경", onBack: onBack) {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text("선택한 사진은 정사각형으로 맞춘 뒤 업로드됩니다.")
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    previewCard
+
+                    PhotosPicker(selection: $selectedPhotoItem, matching: .images, photoLibrary: .shared()) {
+                        Label("사진 선택", systemImage: "photo.on.rectangle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+
+                    Button {
+                        Task { await viewModel.upload(router: router) }
+                    } label: {
+                        Text("변경사항 저장")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(!viewModel.canUpload || isUploading)
+                    .opacity((!viewModel.canUpload || isUploading) ? 0.55 : 1)
+                }
+                .padding(24)
+            }
+        }
+        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .onChange(of: selectedPhotoItem) { _, newValue in
+            Task { await viewModel.loadSelectedItem(newValue) }
+        }
+    }
+
+    private var isUploading: Bool {
+        if case .inProgress = viewModel.actionState { return true }
+        return false
+    }
+
+    private var previewCard: some View {
+        VStack(spacing: 16) {
+            avatarPreview
+            Text(viewModel.previewImage == nil ? "현재 이미지" : "새 프로필 이미지")
+                .font(AppTypography.body(13, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(24)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+
+    @ViewBuilder
+    private var avatarPreview: some View {
+        if let image = viewModel.previewImage {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 148, height: 148)
+                .clipShape(Circle())
+        } else if let url = viewModel.currentProfileImageURL {
+            AsyncImage(url: url) { phase in
+                switch phase {
+                case let .success(image):
+                    image
+                        .resizable()
+                        .scaledToFill()
+                default:
+                    localAvatarPreview
+                }
+            }
+            .frame(width: 148, height: 148)
+            .clipShape(Circle())
+        } else {
+            localAvatarPreview
+        }
+    }
+
+    @ViewBuilder
+    private var localAvatarPreview: some View {
+        if let data = viewModel.currentLocalImageData,
+           let image = UIImage(data: data) {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFill()
+                .frame(width: 148, height: 148)
+                .clipShape(Circle())
+        } else {
+            ZStack {
+                Circle()
+                    .fill(AppPalette.bgElevated)
+                Image(systemName: "person.fill")
+                    .font(.system(size: 54, weight: .semibold))
+                    .foregroundStyle(AppPalette.textMuted)
+            }
+            .frame(width: 148, height: 148)
+        }
+    }
+}
+
+@MainActor
+final class ReportViewModel: ObservableObject {
+    @Published var selectedReason: ReportReason = .abuseHarassment
+    @Published var detailText: String = ""
+    @Published private(set) var actionState: AsyncActionState = .idle
+
+    let target: ReportTarget
+    private let session: AppSessionViewModel
+
+    init(session: AppSessionViewModel, target: ReportTarget) {
+        self.session = session
+        self.target = target
+    }
+
+    var isSubmitDisabled: Bool {
+        if case .inProgress = actionState { return true }
+        return selectedReason == .other && detailText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func submit(router: AppRouter) async {
+        guard session.isAuthenticated else {
+            session.requireAuthentication(for: .generic)
+            return
+        }
+        guard !isSubmitDisabled else {
+            actionState = .failure("기타 사유는 상세 내용을 입력해주세요.")
+            return
+        }
+        if case .inProgress = actionState { return }
+
+        actionState = .inProgress("신고를 접수하는 중입니다...")
+        do {
+            try await session.container.safetyRepository.submitReport(
+                target: target,
+                reason: selectedReason,
+                detail: detailText
+            )
+            actionState = .success("신고가 접수되었습니다.")
+            await closeAfterSuccess(router: router)
+        } catch let error as UserFacingError {
+            if session.container.safetyRepository.isCapabilityUnavailable(error) {
+                session.container.localStore.appendNotification(
+                    title: "신고 접수",
+                    body: "\(target.displayName) 신고 UI 흐름을 확인했습니다.",
+                    symbol: "exclamationmark.bubble.fill"
+                )
+                actionState = .success("서버 신고 API 연결 전이라 앱 내 접수 안내로 처리했습니다.")
+                await closeAfterSuccess(router: router)
+                return
+            }
+            if error.requiresAuthentication {
+                session.requireReauthentication(for: .generic)
+                actionState = .failure("다시 로그인한 뒤 신고를 진행해주세요.")
+            } else {
+                actionState = .failure(error.message)
+            }
+        } catch {
+            actionState = .failure("신고를 접수하지 못했습니다. 잠시 후 다시 시도해주세요.")
+        }
+    }
+
+    private func closeAfterSuccess(router: AppRouter) async {
+        try? await Task.sleep(nanoseconds: 650_000_000)
+        router.pop()
+    }
+}
+
+struct ReportScreen: View {
+    @ObservedObject var viewModel: ReportViewModel
+    @ObservedObject var router: AppRouter
+    let onBack: () -> Void
+    @State private var isConfirmationPresented = false
+
+    var body: some View {
+        screenScaffold(title: "신고하기", onBack: onBack) {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 18) {
+                    targetCard
+                    reasonSection
+                    detailSection
+
+                    Button {
+                        isConfirmationPresented = true
+                    } label: {
+                        Text("신고 제출")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(PrimaryButtonStyle(fill: AppPalette.accentRed))
+                    .disabled(viewModel.isSubmitDisabled)
+                    .opacity(viewModel.isSubmitDisabled ? 0.55 : 1)
+                }
+                .padding(24)
+            }
+        }
+        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .alert("신고를 제출할까요?", isPresented: $isConfirmationPresented) {
+            Button("취소", role: .cancel) {}
+            Button("제출", role: .destructive) {
+                Task { await viewModel.submit(router: router) }
+            }
+        } message: {
+            Text("신고 내용은 운영 검토 목적으로 사용됩니다.")
+        }
+    }
+
+    private var targetCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(viewModel.target.type.title)
+                .font(AppTypography.body(11, weight: .semibold))
+                .foregroundStyle(AppPalette.accentGold)
+            Text(viewModel.target.displayName)
+                .font(AppTypography.heading(18, weight: .bold))
+                .foregroundStyle(AppPalette.textPrimary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+
+    private var reasonSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("신고 사유")
+                .font(AppTypography.heading(16, weight: .bold))
+            ForEach(ReportReason.allCases) { reason in
+                Button {
+                    viewModel.selectedReason = reason
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: viewModel.selectedReason == reason ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(viewModel.selectedReason == reason ? AppPalette.accentBlue : AppPalette.textMuted)
+                        Text(reason.title)
+                            .font(AppTypography.body(13, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                        Spacer()
+                    }
+                    .padding(14)
+                    .appPanel(background: AppPalette.bgCard, radius: 12)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+    }
+
+    private var detailSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("상세 내용")
+                    .font(AppTypography.heading(16, weight: .bold))
+                Spacer()
+                Text(viewModel.selectedReason == .other ? "필수" : "선택")
+                    .font(AppTypography.body(11, weight: .semibold))
+                    .foregroundStyle(viewModel.selectedReason == .other ? AppPalette.accentRed : AppPalette.textMuted)
+            }
+            TextEditor(text: $viewModel.detailText)
+                .font(AppTypography.body(13))
+                .foregroundStyle(AppPalette.textPrimary)
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 120)
+                .padding(12)
+                .background(AppPalette.bgCard)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+    }
+}
+
+@MainActor
+final class BlockedUsersViewModel: ObservableObject {
+    @Published private(set) var state: ScreenLoadState<[BlockedUser]> = .initial
+    @Published private(set) var actionState: AsyncActionState = .idle
+    private let session: AppSessionViewModel
+
+    init(session: AppSessionViewModel) {
+        self.session = session
+    }
+
+    func load(force: Bool = false) async {
+        guard session.isAuthenticated else {
+            session.requireAuthentication(for: .settings)
+            state = .empty("로그인 후 차단한 사용자 목록을 확인할 수 있어요.")
+            return
+        }
+        if !force, case .content = state { return }
+
+        state = .loading
+        do {
+            let users = try await session.container.safetyRepository.blockedUsers()
+            session.container.localStore.setBlockedUsers(users)
+            state = users.isEmpty ? .empty("차단한 사용자가 없습니다.") : .content(users)
+        } catch let error as UserFacingError {
+            if session.container.safetyRepository.isCapabilityUnavailable(error) {
+                let localUsers = session.container.localStore.blockedUsers
+                state = localUsers.isEmpty ? .empty("차단한 사용자가 없습니다.") : .content(localUsers)
+                return
+            }
+            if error.requiresAuthentication {
+                session.requireReauthentication(for: .settings)
+                state = .empty("다시 로그인한 뒤 차단 목록을 확인해주세요.")
+            } else {
+                state = .error(error)
+            }
+        } catch {
+            state = .error(UserFacingError(title: "차단 목록 조회 실패", message: "차단한 사용자 목록을 불러오지 못했습니다."))
+        }
+    }
+
+    func unblock(_ user: BlockedUser) async {
+        if case .inProgress = actionState { return }
+        let previousUsers = session.container.localStore.blockedUsers
+        session.container.localStore.unblockUser(userID: user.userID)
+        session.markSafetyDataUpdated()
+        state = currentContentAfterRemoving(userID: user.userID)
+        actionState = .inProgress("차단을 해제하는 중입니다...")
+
+        do {
+            try await session.container.safetyRepository.unblockUser(userID: user.userID)
+            actionState = .success("차단을 해제했습니다.")
+            await load(force: true)
+        } catch let error as UserFacingError {
+            if session.container.safetyRepository.isCapabilityUnavailable(error) {
+                actionState = .success("서버 차단 API 연결 전이라 이 기기에서 차단을 해제했습니다.")
+                return
+            }
+            session.container.localStore.setBlockedUsers(previousUsers)
+            session.markSafetyDataUpdated()
+            state = previousUsers.isEmpty ? .empty("차단한 사용자가 없습니다.") : .content(previousUsers)
+            actionState = .failure(error.message)
+        } catch {
+            session.container.localStore.setBlockedUsers(previousUsers)
+            session.markSafetyDataUpdated()
+            state = previousUsers.isEmpty ? .empty("차단한 사용자가 없습니다.") : .content(previousUsers)
+            actionState = .failure("차단 해제를 완료하지 못했습니다.")
+        }
+    }
+
+    private func currentContentAfterRemoving(userID: String) -> ScreenLoadState<[BlockedUser]> {
+        let users = session.container.localStore.blockedUsers.filter { $0.userID != userID }
+        return users.isEmpty ? .empty("차단한 사용자가 없습니다.") : .content(users)
+    }
+}
+
+struct BlockedUsersScreen: View {
+    @ObservedObject var viewModel: BlockedUsersViewModel
+    let onBack: () -> Void
+    @State private var pendingUnblockUser: BlockedUser?
+
+    var body: some View {
+        screenScaffold(title: "차단한 사용자", onBack: onBack) {
+            Group {
+                switch viewModel.state {
+                case .initial, .loading:
+                    LoadingStateView(title: "차단 목록을 불러오는 중입니다")
+                        .task { await viewModel.load() }
+                case let .empty(message):
+                    EmptyStateView(title: "차단한 사용자", message: message)
+                        .padding(24)
+                case let .error(error):
+                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+                        .padding(24)
+                case let .content(users), let .refreshing(users):
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 10) {
+                            ForEach(users) { user in
+                                blockedUserRow(user)
+                            }
+                        }
+                        .padding(24)
+                    }
+                    .refreshable { await viewModel.load(force: true) }
+                }
+            }
+        }
+        .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .alert("차단을 해제할까요?", isPresented: unblockBinding) {
+            Button("취소", role: .cancel) { pendingUnblockUser = nil }
+            Button("해제", role: .destructive) {
+                guard let user = pendingUnblockUser else { return }
+                Task { await viewModel.unblock(user) }
+                pendingUnblockUser = nil
+            }
+        } message: {
+            Text("차단 해제 후 해당 사용자의 콘텐츠가 다시 보일 수 있습니다.")
+        }
+    }
+
+    private var unblockBinding: Binding<Bool> {
+        Binding(
+            get: { pendingUnblockUser != nil },
+            set: { if !$0 { pendingUnblockUser = nil } }
+        )
+    }
+
+    private func blockedUserRow(_ user: BlockedUser) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "person.crop.circle.badge.xmark")
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundStyle(AppPalette.textMuted)
+                .frame(width: 38, height: 38)
+                .background(AppPalette.bgTertiary)
+                .clipShape(Circle())
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(user.nickname)
+                    .font(AppTypography.body(14, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text("차단일 \(user.blockedAt.shortDateText)")
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textMuted)
+            }
+            Spacer()
+            Button("해제") {
+                pendingUnblockUser = user
+            }
+            .font(AppTypography.body(12, weight: .semibold))
+            .foregroundStyle(AppPalette.accentBlue)
+        }
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+}
+
+struct ReportGuideScreen: View {
+    let onBack: () -> Void
+
+    var body: some View {
+        screenScaffold(title: "신고하기 안내", onBack: onBack) {
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 16) {
+                    guideCard(
+                        icon: "exclamationmark.bubble.fill",
+                        title: "어디에서 신고할 수 있나요?",
+                        message: "사용자 프로필과 모집글 상세의 더보기 메뉴에서 신고하기를 선택할 수 있습니다."
+                    )
+                    guideCard(
+                        icon: "shield.lefthalf.filled",
+                        title: "차단과 함께 사용할 수 있어요",
+                        message: "불편한 사용자는 신고와 별도로 차단할 수 있으며, 차단한 사용자의 모집글과 프로필 노출을 줄입니다."
+                    )
+                    guideCard(
+                        icon: "checkmark.seal.fill",
+                        title: "검토 기준",
+                        message: "욕설/괴롭힘, 스팸/광고, 부적절한 프로필/콘텐츠, 사칭, 기타 사유를 선택해 접수할 수 있습니다."
+                    )
+                }
+                .padding(24)
+            }
+        }
+    }
+
+    private func guideCard(icon: String, title: String, message: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(AppPalette.accentBlue)
+                .frame(width: 34, height: 34)
+                .background(AppPalette.bgTertiary)
+                .clipShape(Circle())
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title)
+                    .font(AppTypography.body(14, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Text(message)
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+        }
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+}
+
 private enum SettingsSheet: Identifiable {
     case externalLink(AppExternalLink)
     case supportMail(SupportMailDraft)
@@ -11624,6 +12596,8 @@ struct SettingsScreen: View {
     @State private var showsProfileEdit = false
     @State private var activeSheet: SettingsSheet?
     @State private var externalLinkErrorMessage: String?
+    @State private var showsSignOutConfirmation = false
+    @State private var showsDeleteAccountConfirmation = false
 
     init(session: AppSessionViewModel, router: AppRouter, onBack: @escaping () -> Void) {
         self.session = session
@@ -11644,7 +12618,7 @@ struct SettingsScreen: View {
         screenScaffold(title: "설정", onBack: onBack, rightSystemImage: nil) {
             ScrollView(showsIndicators: false) {
                 VStack(spacing: 20) {
-                    Text("계정, 게임 설정, 공개 범위를 한 곳에서 관리합니다.")
+                    Text("계정, 안전 기능, 앱 정보를 한 곳에서 관리합니다.")
                         .font(AppTypography.body(12))
                         .foregroundStyle(AppPalette.textSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -11657,6 +12631,9 @@ struct SettingsScreen: View {
                         )
 
                         settingsSection(title: "계정", rows: [
+                            settingsRow("프로필 이미지 변경", subtitle: "로그인 후 사용", systemImage: "camera") {
+                                session.requireAuthentication(for: .profileSync)
+                            },
                             settingsRow("로그인", subtitle: "동기화 시작", systemImage: "person.crop.circle") {
                                 session.requireAuthentication(for: .settings)
                             },
@@ -11667,23 +12644,45 @@ struct SettingsScreen: View {
                             }
                         ])
 
-                        settingsSection(title: "게임 설정", rows: [
-                            settingsRow("기본 포지션 설정", subtitle: "로그인 후 저장", systemImage: "scope", valueTint: AppPalette.accentBlue) {
+                        settingsSection(title: "안전", rows: [
+                            settingsRow("차단한 사용자 관리", subtitle: "로그인 후 사용", systemImage: "person.crop.circle.badge.xmark") {
                                 session.requireAuthentication(for: .settings)
                             },
-                            settingsRow("내전 성향", subtitle: "로그인 후 저장", systemImage: "sparkles", valueTint: AppPalette.accentPurple) {
-                                session.requireAuthentication(for: .settings)
+                            settingsRow("신고하기 안내", subtitle: "접수 기준", systemImage: "exclamationmark.bubble") {
+                                router.push(.reportGuide)
                             }
                         ])
                     } else {
                         settingsSection(title: "계정", rows: [
-                            settingsRow("계정 관리", subtitle: session.profile?.email ?? "-", systemImage: "person.crop.circle") { showsProfileEdit = true },
-                            settingsRow("Riot ID 관리", subtitle: "추가한 Riot ID 확인", systemImage: "person.text.rectangle") { router.push(.riotAccounts) }
+                            settingsRow("프로필 이미지 변경", subtitle: "사진 선택", systemImage: "camera") {
+                                router.push(.editProfileImage)
+                            },
+                            settingsRow("계정 관리", subtitle: session.profile?.email ?? "-", systemImage: "person.crop.circle") {
+                                showsProfileEdit = true
+                            },
+                            settingsRow("Riot ID 관리", subtitle: "추가한 Riot ID 확인", systemImage: "person.text.rectangle") {
+                                router.push(.riotAccounts)
+                            },
+                            settingsRow("로그아웃", subtitle: "현재 기기에서 종료", systemImage: "rectangle.portrait.and.arrow.right", titleTint: AppPalette.accentRed, valueTint: AppPalette.accentRed) {
+                                showsSignOutConfirmation = true
+                            },
+                            settingsRow("회원 탈퇴", subtitle: "계정 삭제", systemImage: "trash", titleTint: AppPalette.accentRed, valueTint: AppPalette.accentRed) {
+                                showsDeleteAccountConfirmation = true
+                            }
                         ])
 
                         settingsSection(title: "게임 설정", rows: [
                             settingsRow("기본 포지션 설정", subtitle: "\(session.profile?.primaryPosition?.shortLabel ?? "MID") / \(session.profile?.secondaryPosition?.shortLabel ?? "TOP")", systemImage: "scope", valueTint: AppPalette.accentBlue) { showsProfileEdit = true },
                             settingsRow("내전 성향", subtitle: session.profile?.styleTags.joined(separator: ", ") ?? "빡겜", systemImage: "sparkles", valueTint: AppPalette.accentPurple) { showsProfileEdit = true }
+                        ])
+
+                        settingsSection(title: "안전", rows: [
+                            settingsRow("차단한 사용자 관리", subtitle: "\(session.container.localStore.blockedUsers.count)명", systemImage: "person.crop.circle.badge.xmark") {
+                                router.push(.blockedUsers)
+                            },
+                            settingsRow("신고하기 안내", subtitle: "접수 기준", systemImage: "exclamationmark.bubble") {
+                                router.push(.reportGuide)
+                            }
                         ])
                     }
 
@@ -11697,32 +12696,20 @@ struct SettingsScreen: View {
                     ])
 
                     settingsSection(title: "정보", rows: [
-                        settingsRow("문의하기", subtitle: "지원 페이지", systemImage: "bubble.left") {
-                            activeSheet = .externalLink(.support)
+                        settingsRow("문의하기", subtitle: AppSupportContact.emailAddress, systemImage: "bubble.left") {
+                            openSupport()
                         },
                         settingsRow("이용약관", subtitle: "커뮤니티 가이드라인", systemImage: "doc.text") {
                             activeSheet = .externalLink(.terms)
                         },
                         settingsRow("개인정보처리방침", subtitle: "정책 문서", systemImage: "doc.badge.shield") {
                             activeSheet = .externalLink(.privacy)
-                        }
+                        },
+                        settingsRow("오픈소스 라이선스", subtitle: "사용 라이브러리", systemImage: "curlybraces.square") {
+                            activeSheet = .externalLink(.openSource)
+                        },
+                        settingsRow("앱 버전", subtitle: appVersionText, systemImage: "info.circle", showsChevron: false) {}
                     ])
-
-                    Text(appVersionText)
-                        .font(AppTypography.body(12))
-                        .foregroundStyle(AppPalette.textMuted)
-
-                    if session.isAuthenticated {
-                        Button("로그아웃") {
-                            Task { await session.signOut(router: router) }
-                        }
-                        .font(AppTypography.body(15, weight: .semibold))
-                        .foregroundStyle(AppPalette.accentRed)
-                        .frame(maxWidth: .infinity)
-                        .frame(height: 48)
-                        .background(AppPalette.bgCard)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                    }
                 }
                 .padding(24)
             }
@@ -11750,6 +12737,23 @@ struct SettingsScreen: View {
         } message: {
             Text(externalLinkErrorMessage ?? "잠시 후 다시 시도해 주세요.")
         }
+        .alert("로그아웃할까요?", isPresented: $showsSignOutConfirmation) {
+            Button("취소", role: .cancel) {}
+            Button("로그아웃", role: .destructive) {
+                Task { await session.signOut(router: router) }
+            }
+        } message: {
+            Text("현재 기기에서 세션이 종료됩니다.")
+        }
+        .alert("회원 탈퇴", isPresented: $showsDeleteAccountConfirmation) {
+            Button("취소", role: .cancel) {}
+            Button("탈퇴", role: .destructive) {
+                Task { await session.deleteAccount(router: router) }
+            }
+        } message: {
+            Text("계정과 서버에 저장된 프로필 정보 삭제를 요청합니다. 탈퇴 후에는 현재 세션과 이 기기의 계정 캐시가 정리됩니다.")
+        }
+        .overlay(alignment: .bottom) { actionBanner(session.actionState) }
         .onChange(of: notificationsEnabled) { _, newValue in
             session.container.localStore.setNotificationsEnabled(newValue)
         }
@@ -11795,7 +12799,15 @@ struct SettingsScreen: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
-    private func settingsRow(_ title: String, subtitle: String, systemImage: String, valueTint: Color = AppPalette.textMuted, action: @escaping () -> Void) -> AnyView {
+    private func settingsRow(
+        _ title: String,
+        subtitle: String,
+        systemImage: String,
+        titleTint: Color = AppPalette.textPrimary,
+        valueTint: Color = AppPalette.textMuted,
+        showsChevron: Bool = true,
+        action: @escaping () -> Void
+    ) -> AnyView {
         AnyView(
             Button(action: action) {
                 HStack(spacing: 12) {
@@ -11804,12 +12816,14 @@ struct SettingsScreen: View {
                         .foregroundStyle(AppPalette.textSecondary)
                         .frame(width: 20)
                     Text(title)
-                        .foregroundStyle(AppPalette.textPrimary)
+                        .foregroundStyle(titleTint)
                     Spacer()
                     Text(subtitle)
                         .foregroundStyle(valueTint)
-                    Image(systemName: "chevron.right")
-                        .foregroundStyle(AppPalette.textMuted)
+                    if showsChevron {
+                        Image(systemName: "chevron.right")
+                            .foregroundStyle(AppPalette.textMuted)
+                    }
                 }
                 .font(AppTypography.body(13))
                 .padding(.horizontal, 16)
@@ -11817,6 +12831,19 @@ struct SettingsScreen: View {
             }
             .buttonStyle(.plain)
         )
+    }
+
+    private func openSupport() {
+        let draft = makeSupportMailDraft()
+        if MFMailComposeViewController.canSendMail() {
+            activeSheet = .supportMail(draft)
+            return
+        }
+        if let mailtoURL = draft.mailtoURL {
+            openURL(mailtoURL)
+            return
+        }
+        activeSheet = .externalLink(.support)
     }
 
     private func toggleRow(_ title: String, systemImage: String, isOn: Binding<Bool>) -> AnyView {
