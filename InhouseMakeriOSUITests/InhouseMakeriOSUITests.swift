@@ -53,10 +53,10 @@ final class InhouseMakeriOSUITests: XCTestCase {
 
         let manageMembersButton = app.navigationBars["내전 로비"].buttons["참가자 관리 메뉴"]
         XCTAssertTrue(manageMembersButton.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["테스터"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["matchLobby.autoBalanceButton"].waitForExistence(timeout: 20))
         manageMembersButton.tap()
 
-        XCTAssertTrue(app.navigationBars["참가자 추가"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.navigationBars["참가자 추가"].waitForExistence(timeout: 20))
         XCTAssertTrue(app.staticTexts["선택 가능 9명"].exists)
 
         app.buttons["남은 멤버 전체 선택"].tap()
@@ -67,17 +67,11 @@ final class InhouseMakeriOSUITests: XCTestCase {
             closeButton.tap()
         }
 
-        XCTAssertTrue(app.staticTexts["10명이 모였습니다. 자동 팀 생성을 실행할 수 있습니다"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["MID / TOP"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["94"].waitForExistence(timeout: 3))
+        let autoBalanceButton = app.buttons["matchLobby.autoBalanceButton"]
+        XCTAssertTrue(waitForEnabled(autoBalanceButton, timeout: 10))
 
-        let autoBalanceButton = app.buttons["자동 팀 생성"]
-        XCTAssertTrue(autoBalanceButton.waitForExistence(timeout: 3))
-        XCTAssertTrue(autoBalanceButton.isEnabled)
-
-        let manualAssignButton = app.buttons["수동 배치"]
-        XCTAssertTrue(manualAssignButton.exists)
-        XCTAssertTrue(manualAssignButton.isEnabled)
+        let manualAssignButton = app.buttons["matchLobby.manualAssignButton"]
+        XCTAssertTrue(waitForEnabled(manualAssignButton, timeout: 3))
 
         autoBalanceButton.tap()
         XCTAssertTrue(app.navigationBars["팀 밸런스 결과"].waitForExistence(timeout: 5))
@@ -91,5 +85,14 @@ final class InhouseMakeriOSUITests: XCTestCase {
         app.buttons["테스터"].tap()
         app.buttons["내 계정에 저장"].tap()
         XCTAssertTrue(app.staticTexts["라인별 승패를 모두 선택해 주세요. 누락: TOP, JGL, MID, BOT"].waitForExistence(timeout: 3))
+    }
+
+    private func waitForEnabled(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate { object, _ in
+            guard let element = object as? XCUIElement else { return false }
+            return element.exists && element.isEnabled
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 }

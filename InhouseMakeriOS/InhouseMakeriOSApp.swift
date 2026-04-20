@@ -482,6 +482,7 @@ private actor DebugGroupInviteFlowScenario {
         let method = request.httpMethod ?? "GET"
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let path = components?.path ?? url.path
+        let requestBody = requestBodyData(from: request)
 
         switch (method, path) {
         case ("GET", "/groups/\(Self.groupID)"):
@@ -505,7 +506,7 @@ private actor DebugGroupInviteFlowScenario {
 
         case ("POST", "/groups/\(Self.groupID)/members"):
             guard
-                let data = request.httpBody,
+                let data = requestBody,
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let userID = object["userId"] as? String
             else {
@@ -552,7 +553,7 @@ private actor DebugGroupInviteFlowScenario {
                 return serverError(statusCode: 404, code: "MATCH_NOT_FOUND", message: "Match not found.", path: path)
             }
             guard
-                let data = request.httpBody,
+                let data = requestBody,
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let players = object["players"] as? [[String: Any]]
             else {
@@ -675,6 +676,32 @@ private actor DebugGroupInviteFlowScenario {
         }
     }
 
+    private func requestBodyData(from request: URLRequest) -> Data? {
+        if let httpBody = request.httpBody {
+            return httpBody
+        }
+        guard let bodyStream = request.httpBodyStream else {
+            return nil
+        }
+
+        bodyStream.open()
+        defer { bodyStream.close() }
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while bodyStream.hasBytesAvailable {
+            let bytesRead = bodyStream.read(&buffer, maxLength: buffer.count)
+            if bytesRead > 0 {
+                data.append(contentsOf: buffer[..<bytesRead])
+            } else if bytesRead < 0 {
+                return nil
+            } else {
+                break
+            }
+        }
+        return data.isEmpty ? nil : data
+    }
+
     private func groupSummaryData() -> Data {
         try! JSONEncoder.app.encode(
             GroupSummaryDTO(
@@ -761,7 +788,7 @@ private actor DebugGroupInviteFlowScenario {
             userId: user.id,
             nickname: user.nickname,
             teamSide: nil,
-            assignedRole: nil,
+            assignedRole: user.primaryPosition,
             participationStatus: .accepted,
             isCaptain: user.id == Self.currentUser.id
         )

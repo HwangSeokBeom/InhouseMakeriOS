@@ -110,7 +110,14 @@ struct MatchLobbyFeature {
         Reduce { state, action in
             switch action {
             case let .load(force):
-                if !force, case .content = state.loadState { return .none }
+                if !force {
+                    switch state.loadState {
+                    case .content, .loading, .refreshing:
+                        return .none
+                    case .initial, .empty, .error:
+                        break
+                    }
+                }
                 state.loadState = .loading
                 let groupID = state.groupID
                 let matchID = state.matchID
@@ -560,9 +567,11 @@ struct MatchLobbyFeatureView: View {
                                 }
                             }
                             .buttonStyle(PrimaryButtonStyle())
+                            .accessibilityIdentifier("matchLobby.autoBalanceButton")
                         } else {
                             Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {}
                                 .buttonStyle(SecondaryButtonStyle())
+                                .accessibilityIdentifier("matchLobby.autoBalanceButton")
                                 .disabled(true)
                         }
 
@@ -570,6 +579,7 @@ struct MatchLobbyFeatureView: View {
                             router.push(.teamBalance(groupID: store.groupID, matchID: store.matchID))
                         }
                         .buttonStyle(SecondaryButtonStyle())
+                        .accessibilityIdentifier("matchLobby.manualAssignButton")
                         .disabled(readiness.participantCount < readiness.targetCount)
                     }
 
@@ -696,6 +706,7 @@ struct MatchLobbyFeatureView: View {
             }
         }
         .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
+        .task { store.send(.load()) }
         .onChange(of: store.pendingProtectedAction) { _, pendingAction in
             guard let pendingAction else { return }
             switch pendingAction {
