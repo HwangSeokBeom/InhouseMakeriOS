@@ -81,5 +81,7 @@ jobs:
             -configuration "${CONFIGURATION_NAME}" \
             -destination "${{ steps.simulator.outputs.destination }}" \
             -clonedSourcePackagesDirPath "${SOURCE_PACKAGES_DIR}" \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO \
             COMPILER_INDEX_STORE_ENABLE=NO

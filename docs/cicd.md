@@ -220,11 +220,18 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 ### iOS CI 확인
 
 ```bash
+mkdir -p .cache/source-packages
+destination="$(bash scripts/ios/select_simulator_destination.sh InhouseMakeriOS.xcodeproj InhouseMakeriOS-Dev)"
 xcodebuild test \
   -project InhouseMakeriOS.xcodeproj \
   -scheme InhouseMakeriOS-Dev \
   -configuration Debug \
-  -destination "platform=iOS Simulator,name=iPhone 17"
+  -destination "${destination}" \
+  -clonedSourcePackagesDirPath "${PWD}/.cache/source-packages" \
+  -skipPackagePluginValidation \
+  -skipMacroValidation \
+  CODE_SIGNING_ALLOWED=NO \
+  COMPILER_INDEX_STORE_ENABLE=NO
 ```
 
 ### Fastlane production 릴리즈
