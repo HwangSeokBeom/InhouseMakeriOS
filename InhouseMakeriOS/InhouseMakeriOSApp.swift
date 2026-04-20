@@ -368,7 +368,7 @@ private final class DebugUITestURLProtocol: URLProtocol {
             guard let client else { return }
 
             let httpResponse = HTTPURLResponse(
-                url: request.url ?? URL(string: "http://127.0.0.1")!,
+                url: request.url ?? URL(string: "https://example.invalid")!,
                 statusCode: response.statusCode,
                 httpVersion: "HTTP/1.1",
                 headerFields: ["Content-Type": response.contentType]

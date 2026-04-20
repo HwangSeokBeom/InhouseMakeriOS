@@ -4,7 +4,6 @@ on:
   pull_request:
     branches:
       - dev
-      - staging
       - main
     paths:
       - "InhouseMakeriOS/**"
@@ -16,7 +15,6 @@ on:
   push:
     branches:
       - dev
-      - staging
       - main
     paths:
       - "InhouseMakeriOS/**"
@@ -37,7 +35,7 @@ jobs:
     env:
       PROJECT_PATH: InhouseMakeriOS.xcodeproj
       SCHEME_NAME: InhouseMakeriOS-Dev
-      CONFIGURATION_NAME: Dev
+      CONFIGURATION_NAME: Debug
       SOURCE_PACKAGES_DIR: ${{ github.workspace }}/.cache/source-packages
     steps:
       - name: Check out source

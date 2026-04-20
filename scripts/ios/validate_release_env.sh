@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-environment_name="${1:?environment is required (staging|production)}"
+environment_name="${1:?environment is required (production)}"
 mode="${2:-build}"
 upper_environment="$(printf '%s' "${environment_name}" | tr '[:lower:]' '[:upper:]')"
 
 required_vars=(
-  "IOS_API_BASE_URL_${upper_environment}"
   "IOS_GOOGLE_CLIENT_ID_${upper_environment}"
   "IOS_GOOGLE_REVERSED_CLIENT_ID_${upper_environment}"
   "IOS_DEVELOPMENT_TEAM"

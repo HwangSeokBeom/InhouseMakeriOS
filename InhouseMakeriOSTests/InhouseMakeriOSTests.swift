@@ -10,24 +10,42 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(Position.support.shortLabel, "SUP")
     }
 
-    func testAppConfigurationLoadsEnvironmentSpecificValues() {
-        let configuration = AppConfiguration.fromInfoDictionary([
-            "APP_ENV": "staging",
-            "API_BASE_URL": "https://staging.example.internal",
-            "GIDClientID": "staging-client-id",
+    func testAppConfigurationLoadsDevelopmentEnvironmentSpecificValues() throws {
+        let configuration = try AppConfiguration.fromInfoDictionary([
+            "APP_ENV": "development",
+            "GIDClientID": "development-client-id",
         ])
 
-        XCTAssertEqual(configuration.environment, .staging)
-        XCTAssertEqual(configuration.baseURL.absoluteString, "https://staging.example.internal")
-        XCTAssertEqual(configuration.googleClientID, "staging-client-id")
+        XCTAssertEqual(configuration.environment, .development)
+        XCTAssertEqual(configuration.baseURL.absoluteString, "http://127.0.0.1:3000")
+        XCTAssertEqual(configuration.publicWebSocketURL.absoluteString, "ws://127.0.0.1:3000/ws/market")
+        XCTAssertEqual(configuration.privateWebSocketURL.absoluteString, "ws://127.0.0.1:3000/ws/trading")
+        XCTAssertEqual(configuration.googleClientID, "development-client-id")
     }
 
-    func testAppConfigurationFallsBackToSafeDefaults() {
-        let configuration = AppConfiguration.fromInfoDictionary([:])
+    func testAppConfigurationLoadsProductionEnvironmentSpecificValues() throws {
+        let configuration = try AppConfiguration.fromInfoDictionary([
+            "APP_ENV": "production",
+            "GIDClientID": "production-client-id",
+        ])
 
-        XCTAssertEqual(configuration.environment, .dev)
-        XCTAssertEqual(configuration.baseURL.absoluteString, "http://127.0.0.1:3000")
-        XCTAssertEqual(configuration.googleClientID, "")
+        XCTAssertEqual(configuration.environment, .production)
+        XCTAssertEqual(configuration.baseURL.absoluteString, "https://inhousemaker.duckdns.org")
+        XCTAssertEqual(configuration.publicWebSocketURL.absoluteString, "wss://inhousemaker.duckdns.org/ws/market")
+        XCTAssertEqual(configuration.privateWebSocketURL.absoluteString, "wss://inhousemaker.duckdns.org/ws/trading")
+        XCTAssertEqual(configuration.googleClientID, "production-client-id")
+    }
+
+    func testAppConfigurationRejectsMissingEnvironment() {
+        XCTAssertThrowsError(try AppConfiguration.fromInfoDictionary([:])) { error in
+            XCTAssertEqual(error as? AppConfigurationError, .missingEnvironment)
+        }
+    }
+
+    func testAppConfigurationRejectsUnexpectedEnvironmentValue() {
+        XCTAssertThrowsError(try AppConfiguration.fromInfoDictionary(["APP_ENV": "qa"])) { error in
+            XCTAssertEqual(error as? AppConfigurationError, .invalidEnvironment("qa"))
+        }
     }
 
     func testResultStatusTitle() {
@@ -5717,8 +5735,8 @@ final class InhouseMakeriOSTests: XCTestCase {
 
     private func makeConfiguration() -> AppConfiguration {
         AppConfiguration(
-            environment: .dev,
-            baseURL: URL(string: "http://localhost:3000")!,
+            environment: .development,
+            networkConfiguration: AppEnvironment.development.networkConfiguration,
             googleClientID: "test-google-client-id"
         )
     }
@@ -5953,7 +5971,7 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     private func queryItemValues(from url: URL?, named name: String) -> [String] {
-        URLComponents(url: url ?? URL(string: "http://localhost")!, resolvingAgainstBaseURL: false)?
+        URLComponents(url: url ?? URL(string: "https://example.invalid")!, resolvingAgainstBaseURL: false)?
             .queryItems?
             .filter { $0.name == name }
             .compactMap(\.value) ?? []
@@ -5980,7 +5998,7 @@ private final class MockURLProtocol: URLProtocol {
         do {
             let response = try handler(request)
             let urlResponse = HTTPURLResponse(
-                url: request.url ?? URL(string: "http://localhost")!,
+                url: request.url ?? URL(string: "https://example.invalid")!,
                 statusCode: response.statusCode,
                 httpVersion: nil,
                 headerFields: ["Content-Type": "application/json"]

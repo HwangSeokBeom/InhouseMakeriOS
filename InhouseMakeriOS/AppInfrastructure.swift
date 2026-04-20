@@ -2,29 +2,119 @@ import Foundation
 import Security
 import SwiftData
 
-enum AppEnvironment: String, Equatable {
-    case dev
-    case staging
+enum AppEnvironment: String, Equatable, CaseIterable {
+    case development
     case production
+
+    var networkConfiguration: NetworkConfiguration {
+        switch self {
+        case .development:
+            return NetworkConfiguration(
+                environment: self,
+                restBaseURL: "http://127.0.0.1:3000",
+                publicWebSocketURL: "ws://127.0.0.1:3000/ws/market",
+                privateWebSocketURL: "ws://127.0.0.1:3000/ws/trading"
+            )
+        case .production:
+            return NetworkConfiguration(
+                environment: self,
+                restBaseURL: "https://inhousemaker.duckdns.org",
+                publicWebSocketURL: "wss://inhousemaker.duckdns.org/ws/market",
+                privateWebSocketURL: "wss://inhousemaker.duckdns.org/ws/trading"
+            )
+        }
+    }
+}
+
+struct NetworkConfiguration: Equatable {
+    let restBaseURL: URL
+    let publicWebSocketURL: URL
+    let privateWebSocketURL: URL
+
+    init(
+        environment: AppEnvironment,
+        restBaseURL: String,
+        publicWebSocketURL: String,
+        privateWebSocketURL: String
+    ) {
+        self.restBaseURL = Self.validatedURL(
+            restBaseURL,
+            label: "REST base URL",
+            environment: environment
+        )
+        self.publicWebSocketURL = Self.validatedURL(
+            publicWebSocketURL,
+            label: "Public WS URL",
+            environment: environment
+        )
+        self.privateWebSocketURL = Self.validatedURL(
+            privateWebSocketURL,
+            label: "Private WS URL",
+            environment: environment
+        )
+    }
+
+    private static func validatedURL(
+        _ rawValue: String,
+        label: String,
+        environment: AppEnvironment
+    ) -> URL {
+        guard let url = URL(string: rawValue) else {
+            let message = "[NetworkConfiguration] Invalid \(label) for \(environment.rawValue): \(rawValue)"
+            assertionFailure(message)
+            fatalError(message)
+        }
+        return url
+    }
+}
+
+enum AppConfigurationError: Error, Equatable {
+    case missingEnvironment
+    case invalidEnvironment(String)
+
+    var debugDescription: String {
+        switch self {
+        case .missingEnvironment:
+            let supportedValues = AppEnvironment.allCases.map(\.rawValue).joined(separator: ", ")
+            return "APP_ENV is missing. Expected one of: \(supportedValues)"
+        case let .invalidEnvironment(value):
+            let supportedValues = AppEnvironment.allCases.map(\.rawValue).joined(separator: ", ")
+            return "APP_ENV '\(value)' is invalid. Expected one of: \(supportedValues)"
+        }
+    }
 }
 
 struct AppConfiguration {
     let environment: AppEnvironment
-    let baseURL: URL
+    let networkConfiguration: NetworkConfiguration
     let googleClientID: String
 
+    var baseURL: URL { networkConfiguration.restBaseURL }
+    var publicWebSocketURL: URL { networkConfiguration.publicWebSocketURL }
+    var privateWebSocketURL: URL { networkConfiguration.privateWebSocketURL }
+
     static func load(bundle: Bundle = .main) -> AppConfiguration {
-        fromInfoDictionary(bundle.infoDictionary ?? [:])
+        do {
+            return try fromInfoDictionary(bundle.infoDictionary ?? [:])
+        } catch let error as AppConfigurationError {
+            let message = "[AppConfiguration] \(error.debugDescription)"
+            assertionFailure(message)
+            fatalError(message)
+        } catch {
+            let message = "[AppConfiguration] Unexpected configuration error: \(error)"
+            assertionFailure(message)
+            fatalError(message)
+        }
     }
 
-    static func fromInfoDictionary(_ infoDictionary: [String: Any]) -> AppConfiguration {
-        let environment = AppEnvironment(
-            rawValue: stringValue(for: "APP_ENV", in: infoDictionary)?.lowercased() ?? ""
-        ) ?? .dev
+    static func fromInfoDictionary(_ infoDictionary: [String: Any]) throws -> AppConfiguration {
+        guard let rawEnvironment = stringValue(for: "APP_ENV", in: infoDictionary), !rawEnvironment.isEmpty else {
+            throw AppConfigurationError.missingEnvironment
+        }
+        guard let environment = AppEnvironment(rawValue: rawEnvironment.lowercased()) else {
+            throw AppConfigurationError.invalidEnvironment(rawEnvironment)
+        }
 
-        let rawValue = stringValue(for: "API_BASE_URL", in: infoDictionary)
-        let fallback = "http://127.0.0.1:3000"
-        let url = URL(string: rawValue ?? fallback) ?? URL(string: fallback)!
         let rawGoogleClientID = stringValue(for: "GIDClientID", in: infoDictionary)
         let googleClientID = (rawGoogleClientID?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
             ? rawGoogleClientID!.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -32,7 +122,7 @@ struct AppConfiguration {
 
         return AppConfiguration(
             environment: environment,
-            baseURL: url,
+            networkConfiguration: environment.networkConfiguration,
             googleClientID: googleClientID
         )
     }
@@ -1592,12 +1682,18 @@ final class APIClient {
         requiresAuth: Bool
     ) async throws -> URLRequest {
         guard var components = URLComponents(url: configuration.baseURL.appending(path: path), resolvingAgainstBaseURL: true) else {
+            assertionFailure(
+                "[APIClient] Failed to resolve request URL. baseURL=\(configuration.baseURL.absoluteString) path=\(path)"
+            )
             throw APIClientError.invalidURL
         }
         if !queryItems.isEmpty {
             components.queryItems = queryItems
         }
         guard let url = components.url else {
+            assertionFailure(
+                "[APIClient] Failed to build request URL. baseURL=\(configuration.baseURL.absoluteString) path=\(path)"
+            )
             throw APIClientError.invalidURL
         }
 
@@ -5029,5 +5125,13 @@ final class AppContainer {
             recruitingRepository: recruitingRepository
         )
         self.searchUseCase = SearchUseCase(repository: searchRepository)
+        Self.logConfiguration(configuration)
+    }
+
+    private static func logConfiguration(_ configuration: AppConfiguration) {
+        print("[AppContainer] Environment -> \(configuration.environment.rawValue)")
+        print("[AppContainer] REST base URL -> \(configuration.baseURL.absoluteString)")
+        print("[AppContainer] Public WS URL -> \(configuration.publicWebSocketURL.absoluteString)")
+        print("[AppContainer] Private WS URL -> \(configuration.privateWebSocketURL.absoluteString)")
     }
 }

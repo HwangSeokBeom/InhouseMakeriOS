@@ -2,16 +2,15 @@
 
 ## 개요
 
-이 저장소는 `dev / staging / main` 브랜치 전략을 기준으로 iOS 앱과 NestJS 서버를 분리된 파이프라인으로 운영하도록 정리했다.
+이 저장소는 iOS 앱은 `dev / main`, NestJS 서버는 `dev / staging / main` 브랜치 전략으로 운영한다.
 
-- `dev`: 일상 개발과 PR 검증 기준 브랜치
-- `staging`: 스테이징 릴리즈와 내부 검증 기준 브랜치
+- `dev`: iOS 일상 개발과 PR 검증 기준 브랜치
+- `staging`: 서버 스테이징 릴리즈와 내부 검증 기준 브랜치
 - `main`: 운영 릴리즈 기준 브랜치
 
 워크플로우는 GitHub Actions 기준으로 나뉜다.
 
 - iOS CI: PR / push 시 `InhouseMakeriOS-Dev` scheme 빌드 및 테스트
-- iOS Staging Release: `staging` push 시 Fastlane으로 TestFlight 업로드
 - iOS Production Release: `main` push 시 Fastlane으로 App Store Connect 업로드
 - Server CI: NestJS lint / typecheck / build / test
 - Server Staging Deploy: `staging` push 시 EC2 staging 서버 배포
@@ -20,10 +19,9 @@
 ## 권장 브랜치 전략
 
 - `feature/*` -> `dev`
-- `dev` -> `staging`
-- `staging` -> `main`
+- iOS 앱은 `dev` 에서 검증 후 `main` 으로 승격
 - 운영 긴급 수정은 `hotfix/*` 를 `main` 에서 분기
-- `hotfix/*` -> `main` 머지 후 동일 변경을 `staging`, `dev` 로 역병합
+- `hotfix/*` -> `main` 머지 후 동일 변경을 `dev` 로 역병합
 
 운영 브랜치에서 직접 기능 개발하지 않는 것을 기본 원칙으로 잡는다.
 
@@ -31,17 +29,15 @@
 
 ### Scheme / Configuration
 
-공유 scheme 3개를 추가했다.
+공유 scheme 2개를 사용한다.
 
 - `InhouseMakeriOS-Dev`
-- `InhouseMakeriOS-Staging`
 - `InhouseMakeriOS-Production`
 
-빌드 configuration 3개를 사용한다.
+빌드 configuration 2개를 사용한다.
 
-- `Dev`
-- `Staging`
-- `Production`
+- `Debug`
+- `Release`
 
 ### xcconfig 계층
 
@@ -49,8 +45,7 @@
 
 - `App.Base.xcconfig`: 공통 앱 설정
 - `App.Shared.xcconfig`: 공통 + 로컬 secrets include
-- `App.Dev.xcconfig`: dev 환경값
-- `App.Staging.xcconfig`: staging 환경값
+- `App.Dev.xcconfig`: development 환경값
 - `App.Production.xcconfig`: production 환경값
 - `UnitTests.*`, `UITests.*`: 테스트 타깃용 bundle id / host 설정
 - `Environment.secrets.template.xcconfig`: 로컬 개발용 템플릿
@@ -58,12 +53,11 @@
 로컬 개발에서는 아래처럼 사용한다.
 
 1. [Environment.secrets.template.xcconfig](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/InhouseMakeriOS/Configurations/Environment.secrets.template.xcconfig) 를 복사해서 `InhouseMakeriOS/Configurations/Local/Environment.secrets.xcconfig` 생성
-2. `INHOUSE_API_BASE_URL`, `INHOUSE_GOOGLE_CLIENT_ID`, `INHOUSE_GOOGLE_REVERSED_CLIENT_ID`, `INHOUSE_DEVELOPMENT_TEAM` 입력
+2. `INHOUSE_GOOGLE_CLIENT_ID`, `INHOUSE_GOOGLE_REVERSED_CLIENT_ID`, `INHOUSE_DEVELOPMENT_TEAM` 입력
 
-현재 분리된 값은 `Info.plist` 에서 build setting 으로 주입된다.
+환경명만 `Info.plist` 에서 build setting 으로 주입되고, REST / WebSocket URL 은 [AppInfrastructure.swift](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/InhouseMakeriOS/AppInfrastructure.swift) 의 `NetworkConfiguration` 에서 중앙 관리한다.
 
 - `APP_ENV`
-- `API_BASE_URL`
 - `APP_DISPLAY_NAME`
 - `GOOGLE_CLIENT_ID`
 - `GOOGLE_REVERSED_CLIENT_ID`
@@ -77,16 +71,15 @@
 
 현재 저장소에는 Widget/Extension 타깃이 없지만, 추가할 때는 다음 원칙만 지키면 된다.
 
-- 새 타깃에도 `Dev / Staging / Production` configuration 추가
+- 새 타깃에도 `Debug / Release` configuration 추가
 - 해당 타깃 전용 xcconfig 를 만들어 같은 suffix 규칙 적용
-- staging / production scheme 의 Build Action 에 새 타깃 포함
+- dev / production scheme 의 Build Action 에 새 타깃 포함
 - provisioning profile 이 extension bundle id 까지 커버하는지 확인
 
 ## Fastlane
 
 Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/fastlane) 아래에 있다.
 
-- `beta_staging`: staging archive + TestFlight 업로드
 - `release_production`: production archive + App Store Connect 업로드
 
 현재 릴리즈 lane 은 `App Store Connect API Key + Xcode automatic signing` 조합으로 설계했다.
@@ -94,7 +87,6 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 - `APP_STORE_CONNECT_API_KEY_CONTENT` 를 임시 `.p8` 파일로 생성
 - `gym` 에 `-allowProvisioningUpdates` 를 넘겨 archive 수행
 - release workflow 는 `IOS_FASTLANE_APP_IDENTIFIER` 를 `com.hwb.InhouseIOS` 로 고정해서 App Store Connect 대상 앱을 명시
-- staging 은 `upload_to_testflight`
 - production 은 `upload_to_app_store`
 
 향후 `fastlane match` 로 옮기려면 다음 값을 추가하고 lane 안에서 `match(...)` 를 `gym` 앞에 넣으면 된다.
@@ -157,7 +149,6 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 ### iOS
 
 - [ios-ci.yml](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/.github/workflows/ios-ci.yml): PR / push 빌드 검증
-- [ios-staging-release.yml](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/.github/workflows/ios-staging-release.yml): `staging` 전용 TestFlight 릴리즈
 - [ios-production-release.yml](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/.github/workflows/ios-production-release.yml): `main` 전용 App Store Connect 릴리즈
 
 ### 서버
@@ -179,11 +170,7 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 ### iOS
 
 - `IOS_DEVELOPMENT_TEAM`
-- `IOS_API_BASE_URL_STAGING`
-- `IOS_API_BASE_URL_PRODUCTION`
-- `IOS_GOOGLE_CLIENT_ID_STAGING`
 - `IOS_GOOGLE_CLIENT_ID_PRODUCTION`
-- `IOS_GOOGLE_REVERSED_CLIENT_ID_STAGING`
 - `IOS_GOOGLE_REVERSED_CLIENT_ID_PRODUCTION`
 - `APP_STORE_CONNECT_API_KEY_ID`
 - `APP_STORE_CONNECT_ISSUER_ID`
@@ -198,7 +185,7 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 
 `IOS_FASTLANE_APP_IDENTIFIER` 는 secret 이 아니라 release 실행 시 Fastlane에 넘기는 app identifier override 값이다.
 
-- staging / production 공통: `com.hwb.InhouseIOS`
+- production: `com.hwb.InhouseIOS`
 
 ### 서버
 
@@ -224,7 +211,6 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 
 아래 이름으로 GitHub Environments 를 만들어 secrets 를 나누는 것을 권장한다.
 
-- `ios-staging`
 - `ios-production`
 - `server-staging`
 - `server-production`
@@ -237,23 +223,22 @@ Fastlane 파일은 [fastlane](/Users/hwangseokbeom/Documents/GitHub/InhouseIOS/f
 xcodebuild test \
   -project InhouseMakeriOS.xcodeproj \
   -scheme InhouseMakeriOS-Dev \
-  -configuration Dev \
+  -configuration Debug \
   -destination "platform=iOS Simulator,name=iPhone 17"
 ```
 
-### Fastlane staging 릴리즈
+### Fastlane production 릴리즈
 
 ```bash
 bundle install
 export IOS_FASTLANE_APP_IDENTIFIER="com.hwb.InhouseIOS"
-export IOS_API_BASE_URL_STAGING="https://staging-api.example.com" # TODO: 실제 값으로 교체
-export IOS_GOOGLE_CLIENT_ID_STAGING="TODO"
-export IOS_GOOGLE_REVERSED_CLIENT_ID_STAGING="TODO"
+export IOS_GOOGLE_CLIENT_ID_PRODUCTION="TODO"
+export IOS_GOOGLE_REVERSED_CLIENT_ID_PRODUCTION="TODO"
 export IOS_DEVELOPMENT_TEAM="TODO"
 export APP_STORE_CONNECT_API_KEY_ID="TODO"
 export APP_STORE_CONNECT_ISSUER_ID="TODO"
 export APP_STORE_CONNECT_API_KEY_CONTENT="TODO"
-bundle exec fastlane beta_staging
+bundle exec fastlane release_production
 ```
 
 ### 서버 로컬 실행
@@ -276,7 +261,7 @@ bash scripts/server/deploy-production.sh
 
 ## 최초 세팅 체크리스트
 
-1. iOS staging / production bundle identifier 를 Apple Developer 에 등록
+1. iOS production bundle identifier 를 Apple Developer 에 등록
 2. Google Sign-In client id 와 reversed client id 를 환경별로 발급
 3. App Store Connect API Key 생성
 4. EC2 에 저장소 clone
@@ -292,7 +277,7 @@ bash scripts/server/deploy-production.sh
 - release workflow 가 바로 실패하면 secrets 누락인지 먼저 확인
 - signing 실패면 `IOS_DEVELOPMENT_TEAM`, bundle id, Apple Developer 권한 확인
 - Google 로그인 URL scheme 오작동이면 `GOOGLE_REVERSED_CLIENT_ID` 값 확인
-- API 통신이 dev URL 로 붙으면 생성된 CI xcconfig 와 `Info.plist` 값 주입 여부 확인
+- API 통신이 잘못된 URL 로 붙으면 `APP_ENV` 값과 `AppConfiguration` 로그 출력 확인
 
 ### 서버
 
@@ -304,7 +289,7 @@ bash scripts/server/deploy-production.sh
 
 ## 운영 권장 방식
 
-- iOS 는 staging 에서 TestFlight 검수 후 `staging -> main` 으로 승격
+- iOS 는 `dev` 에서 로컬 서버로 검증하고 `main` 에서 production 도메인으로 릴리즈
 - 서버는 staging 과 production EC2 를 분리 운영
 - production deploy 는 squash merge 또는 release PR 기준으로만 허용
 - `main` 직접 push 는 막고 branch protection 으로 강제
