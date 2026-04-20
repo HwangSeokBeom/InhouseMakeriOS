@@ -329,6 +329,14 @@ struct UserFacingError: Error, Equatable {
 }
 
 extension UserFacingError {
+    fileprivate static func normalizeErrorToken(_ value: String?) -> String {
+        value?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased() ?? ""
+    }
+
     var serverContractCode: ServerContractErrorCode {
         ServerContractErrorCode.resolve(code: code, details: details, statusCode: statusCode)
     }
@@ -347,6 +355,20 @@ extension UserFacingError {
             .replacingOccurrences(of: "-", with: "_")
             .replacingOccurrences(of: " ", with: "_")
             .uppercased()
+    }
+
+    fileprivate var normalizedDetailTokens: [String] {
+        guard let details else { return [] }
+        return details.values
+            .map { Self.normalizeErrorToken($0.stringValue) }
+            .filter { !$0.isEmpty }
+    }
+
+    fileprivate func containsNormalizedErrorToken(_ token: String) -> Bool {
+        let normalizedToken = Self.normalizeErrorToken(token)
+        guard !normalizedToken.isEmpty else { return false }
+        return ([normalizedCode, normalizedMessage] + normalizedDetailTokens)
+            .contains { $0.contains(normalizedToken) }
     }
 
     var requiresAuthentication: Bool {
@@ -371,6 +393,35 @@ extension UserFacingError {
 
     var isRecruitingClosed: Bool {
         serverContractCode == .recruitingClosed
+    }
+
+    var isRecruitingApplyEndpoint: Bool {
+        normalizedRequestMethod == "POST"
+            && (normalizedEndpoint.hasSuffix("/apply") || normalizedEndpoint.contains("/participants"))
+    }
+
+    var isRecruitingCapacityFull: Bool {
+        guard isRecruitingApplyEndpoint else { return false }
+        if containsNormalizedErrorToken("CAPACITY_FULL")
+            || containsNormalizedErrorToken("RECRUITING_FULL")
+            || containsNormalizedErrorToken("ALREADY_FULL") {
+            return true
+        }
+
+        let lowercasedMessage = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return (lowercasedMessage.contains("capacity") && lowercasedMessage.contains("full"))
+            || lowercasedMessage.contains("already full")
+            || lowercasedMessage.contains("is full")
+    }
+
+    var isRecruitingApplyClosedOrFull: Bool {
+        guard isRecruitingApplyEndpoint else { return false }
+        let lowercasedMessage = message
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        return isRecruitingClosed || isRecruitingCapacityFull || lowercasedMessage.contains("closed")
     }
 
     var isRateLimited: Bool {
@@ -421,6 +472,14 @@ extension UserFacingError {
         }
         return normalizedEndpoint == "/recruiting-posts"
             && normalizedRequestMethod == "POST"
+    }
+
+    var isMatchNotFoundResource: Bool {
+        guard statusCode == 404 else { return false }
+        if normalizedEndpoint.hasPrefix("/matches/") {
+            return true
+        }
+        return normalizedCode == "MATCH_NOT_FOUND"
     }
 
     fileprivate var groupNotFoundPresentationMessage: String {
@@ -474,6 +533,13 @@ enum ErrorMapper {
 
         if let mappedError = mapPermissionOrResourceError(error) {
             return mappedError
+        }
+
+        if error.isRecruitingApplyClosedOrFull {
+            return error.withPresentation(
+                title: "모집이 마감되었어요",
+                message: "모집이 마감되어 참가 신청할 수 없어요."
+            )
         }
 
         if error.statusCode == 400, case .unknown = error.serverContractCode {
@@ -744,6 +810,7 @@ enum Position: String, Codable, CaseIterable, Hashable {
     }
 
     static let duoLane: [Position] = [.adc, .support]
+    static let standardLanes: [Position] = [.top, .jungle, .mid, .adc, .support]
 }
 
 enum MatchStatus: String, Codable, Hashable {
@@ -1020,6 +1087,453 @@ struct UserSession: Equatable {
     var user: UserProfile
 }
 
+enum ChampionAggregationStatus: Codable, Hashable {
+    case disconnected
+    case syncing
+    case partial
+    case insufficientSample
+    case connectedEmpty
+    case ready
+    case unknown(String)
+
+    init(serverValue: String) {
+        let normalized = serverValue
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased()
+
+        switch normalized {
+        case "DISCONNECTED", "RIOT_DISCONNECTED", "RIOT_UNLINKED", "UNLINKED", "NO_RIOT_ACCOUNT", "NOT_CONNECTED":
+            self = .disconnected
+        case "SYNCING", "SYNC_PENDING", "PENDING", "QUEUED", "RUNNING", "NOT_SYNCED", "NEEDS_SYNC", "INSUFFICIENT_SYNC":
+            self = .syncing
+        case "PARTIAL", "PARTIALLY_READY", "PARTIALLY_COMPLETE", "INCOMPLETE":
+            self = .partial
+        case "INSUFFICIENT_SAMPLE", "NOT_ENOUGH_MATCHES", "NOT_ENOUGH_RANKED_MATCHES", "LOW_SAMPLE", "NO_RANKED_MATCHES":
+            self = .insufficientSample
+        case "CONNECTED_EMPTY", "EMPTY", "NO_DATA", "NO_CHAMPION_DATA":
+            self = .connectedEmpty
+        case "READY", "SUCCEEDED", "SUCCESS", "COMPLETED":
+            self = .ready
+        default:
+            self = .unknown(normalized)
+        }
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let stringValue = try? container.decode(String.self) {
+            self = ChampionAggregationStatus(serverValue: stringValue)
+            return
+        }
+        if let boolValue = try? container.decode(Bool.self) {
+            self = boolValue ? .ready : .connectedEmpty
+            return
+        }
+        self = .unknown("UNSUPPORTED")
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(debugValue)
+    }
+
+    var debugValue: String {
+        switch self {
+        case .disconnected:
+            return "disconnected"
+        case .syncing:
+            return "syncing"
+        case .partial:
+            return "partial"
+        case .insufficientSample:
+            return "insufficient_sample"
+        case .connectedEmpty:
+            return "connected_empty"
+        case .ready:
+            return "ready"
+        case let .unknown(value):
+            return value.lowercased()
+        }
+    }
+}
+
+struct ProfileTopChampionAggregation: Codable, Hashable {
+    let status: ChampionAggregationStatus?
+    let reason: String?
+    let message: String?
+    let syncCoverageSummary: String?
+
+    init(
+        status: ChampionAggregationStatus? = nil,
+        reason: String? = nil,
+        message: String? = nil,
+        syncCoverageSummary: String? = nil
+    ) {
+        self.status = status
+        self.reason = Self.trimmed(reason)
+        self.message = Self.trimmed(message)
+        self.syncCoverageSummary = Self.trimmed(syncCoverageSummary)
+    }
+
+    var normalizedReason: String? {
+        Self.normalizedToken(reason)
+    }
+
+    var preferredSubtitle: String? {
+        message ?? syncCoverageSummary
+    }
+
+    var isInsufficientBackfill: Bool {
+        guard let normalizedReason else { return false }
+        return normalizedReason.contains("INSUFFICIENT_BACKFILL")
+            || normalizedReason.contains("BACKFILL_PENDING")
+            || normalizedReason.contains("BACKFILL")
+    }
+
+    var isInsufficientSample: Bool {
+        if status == .insufficientSample {
+            return true
+        }
+
+        guard let normalizedReason else { return false }
+        return normalizedReason.contains("INSUFFICIENT_SAMPLE")
+            || normalizedReason.contains("NOT_ENOUGH_MATCHES")
+            || normalizedReason.contains("NOT_ENOUGH_RANKED_MATCHES")
+            || normalizedReason.contains("LOW_SAMPLE")
+            || normalizedReason.contains("NO_RANKED_MATCHES")
+    }
+
+    private static func trimmed(_ value: String?) -> String? {
+        let normalized = value?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized?.isEmpty == false ? normalized : nil
+    }
+
+    private static func normalizedToken(_ value: String?) -> String? {
+        let normalized = trimmed(value)?
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased()
+        return normalized?.isEmpty == false ? normalized : nil
+    }
+}
+
+struct ProfileTopChampion: Codable, Hashable {
+    let championId: Int?
+    let championKey: String
+    let championName: String
+    let games: Int
+    let wins: Int
+    let losses: Int
+    let winRate: Double
+    let kills: Double
+    let deaths: Double
+    let assists: Double
+    let kda: Double?
+    let lastPlayedAt: Date?
+}
+
+struct ProfileTopChampionViewState: Equatable, Identifiable {
+    let id: String
+    let rank: Int
+    let championKey: String
+    let championName: String
+    let gamesText: String
+    let winRateText: String
+    let kdaText: String?
+    let lastPlayedText: String?
+    let championIconURL: URL?
+
+    var isTopRanked: Bool {
+        rank == 1
+    }
+}
+
+enum ProfileTopChampionsDisplayState: String, Equatable {
+    case content
+    case syncing
+    case backfillPending = "backfill_pending"
+    case insufficientSample = "insufficient_sample"
+    case disconnected
+    case genericEmpty = "generic_empty"
+}
+
+enum ProfileTopChampionsSectionState: Equatable {
+    case hidden
+    case empty(state: ProfileTopChampionsDisplayState, title: String, message: String, subtitle: String?)
+    case content([ProfileTopChampionViewState], subtitle: String?)
+
+    static func build(
+        champions: [ProfileTopChampion],
+        aggregation: ProfileTopChampionAggregation?,
+        riotAccountsViewState: RiotLinkedAccountsViewState
+    ) -> ProfileTopChampionsSectionState {
+        let rows = championRows(from: champions)
+        let displayState = resolvedDisplayState(
+            champions: champions,
+            aggregation: aggregation,
+            riotAccountsViewState: riotAccountsViewState
+        )
+        let subtitle = aggregation?.preferredSubtitle
+
+        if displayState == .content {
+            return .content(rows, subtitle: subtitle)
+        }
+
+        let copy = emptyCopy(for: displayState)
+        return .empty(state: displayState, title: copy.title, message: copy.message, subtitle: subtitle)
+    }
+
+    static func build(
+        champions: [ProfileTopChampion],
+        aggregationStatus: ChampionAggregationStatus?,
+        riotAccountsViewState: RiotLinkedAccountsViewState
+    ) -> ProfileTopChampionsSectionState {
+        build(
+            champions: champions,
+            aggregation: ProfileTopChampionAggregation(status: aggregationStatus),
+            riotAccountsViewState: riotAccountsViewState
+        )
+    }
+
+    static func build(
+        champions: [ProfileTopChampion],
+        hasLinkedRiotAccount: Bool
+    ) -> ProfileTopChampionsSectionState {
+        build(
+            champions: champions,
+            aggregation: hasLinkedRiotAccount ? nil : ProfileTopChampionAggregation(status: .disconnected),
+            riotAccountsViewState: hasLinkedRiotAccount ? .loading : .noLinkedAccounts
+        )
+    }
+
+    var debugState: ProfileTopChampionsDisplayState {
+        switch self {
+        case .hidden:
+            return .genericEmpty
+        case let .empty(state, _, _, _):
+            return state
+        case .content:
+            return .content
+        }
+    }
+
+    var renderedChampions: [ProfileTopChampionViewState] {
+        switch self {
+        case let .content(items, _):
+            return items
+        case .hidden, .empty:
+            return []
+        }
+    }
+
+    var headerSubtitle: String {
+        switch self {
+        case .hidden:
+            return Self.defaultHeaderSubtitle
+        case let .empty(_, _, _, subtitle), let .content(_, subtitle):
+            return subtitle ?? Self.defaultHeaderSubtitle
+        }
+    }
+
+    private static let defaultHeaderSubtitle = "서버 집계 기준 가장 많이 플레이한 챔피언"
+
+    private static func championRows(from champions: [ProfileTopChampion]) -> [ProfileTopChampionViewState] {
+        champions
+            .sorted { lhs, rhs in
+                if lhs.games == rhs.games {
+                    if lhs.winRate == rhs.winRate {
+                        return resolvedChampionName(lhs).localizedCaseInsensitiveCompare(resolvedChampionName(rhs)) == .orderedAscending
+                    }
+                    return normalizedWinRate(for: lhs) > normalizedWinRate(for: rhs)
+                }
+                return lhs.games > rhs.games
+            }
+            .prefix(3)
+            .enumerated()
+            .map { index, champion in
+                ProfileTopChampionViewState(
+                    id: championIdentity(champion, rank: index + 1),
+                    rank: index + 1,
+                    championKey: champion.championKey.trimmingCharacters(in: .whitespacesAndNewlines),
+                    championName: resolvedChampionName(champion),
+                    gamesText: "\(champion.games)판",
+                    winRateText: "승률 \(formatPercentage(normalizedWinRate(for: champion)))",
+                    kdaText: formattedKDA(champion.kda),
+                    lastPlayedText: formattedLastPlayed(champion.lastPlayedAt),
+                    championIconURL: championIconURL(for: champion)
+                )
+            }
+    }
+
+    private static func resolvedDisplayState(
+        champions: [ProfileTopChampion],
+        aggregation: ProfileTopChampionAggregation?,
+        riotAccountsViewState: RiotLinkedAccountsViewState
+    ) -> ProfileTopChampionsDisplayState {
+        if !champions.isEmpty {
+            return .content
+        }
+
+        if isSyncing(aggregation: aggregation, riotAccountsViewState: riotAccountsViewState) {
+            return .syncing
+        }
+
+        if aggregation?.status == .partial, aggregation?.isInsufficientBackfill == true {
+            return .backfillPending
+        }
+
+        if aggregation?.isInsufficientSample == true {
+            return .insufficientSample
+        }
+
+        if let status = aggregation?.status {
+            switch status {
+            case .disconnected:
+                return .disconnected
+            case .connectedEmpty, .ready, .partial, .syncing, .insufficientSample, .unknown:
+                break
+            }
+        }
+
+        if case .noLinkedAccounts = riotAccountsViewState {
+            return .disconnected
+        }
+
+        return .genericEmpty
+    }
+
+    private static func isSyncing(
+        aggregation: ProfileTopChampionAggregation?,
+        riotAccountsViewState: RiotLinkedAccountsViewState
+    ) -> Bool {
+        if aggregation?.status == .syncing {
+            return true
+        }
+
+        switch riotAccountsViewState {
+        case .loading:
+            return true
+        case .noLinkedAccounts, .error:
+            return false
+        case let .loaded(accounts):
+            guard !accounts.isEmpty else { return false }
+            if accounts.contains(where: { $0.syncStatus.isInFlight || $0.syncStatus == .idle }) {
+                return true
+            }
+            return false
+        }
+    }
+
+    private static func emptyCopy(for state: ProfileTopChampionsDisplayState) -> (title: String, message: String) {
+        switch state {
+        case .content:
+            return (
+                "주 챔피언을 불러왔어요",
+                "상위 챔피언을 표시합니다."
+            )
+        case .syncing:
+            return (
+                "최근 전적을 분석 중이에요",
+                "동기화가 끝나면 주 챔피언이 자동으로 채워집니다."
+            )
+        case .backfillPending:
+            return (
+                "전적 동기화가 더 필요해요",
+                "이전 랭크 전적이 더 반영되면 주 챔피언을 보여드릴게요."
+            )
+        case .insufficientSample:
+            return (
+                "랭크 기록이 더 필요해요",
+                "집계 가능한 랭크 기록이 더 쌓이면 주 챔피언을 보여드릴게요."
+            )
+        case .disconnected:
+            return (
+                "Riot 계정 연결이 필요해요",
+                "Riot ID를 연결하면 주 챔피언을 분석해 보여드릴게요."
+            )
+        case .genericEmpty:
+            return (
+                "아직 표시할 챔피언이 없어요",
+                "서버 집계가 완료되면 상위 챔피언을 보여드릴게요."
+            )
+        }
+    }
+
+    private static func resolvedChampionName(_ champion: ProfileTopChampion) -> String {
+        let normalizedName = champion.championName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedName.isEmpty {
+            return normalizedName
+        }
+
+        let normalizedKey = champion.championKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalizedKey.isEmpty ? "알 수 없는 챔피언" : normalizedKey
+    }
+
+    private static func championIdentity(_ champion: ProfileTopChampion, rank: Int) -> String {
+        let normalizedKey = champion.championKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalizedKey.isEmpty {
+            return "\(normalizedKey)-\(rank)"
+        }
+        return "\(resolvedChampionName(champion))-\(rank)"
+    }
+
+    private static func normalizedWinRate(for champion: ProfileTopChampion) -> Double {
+        let rawValue = champion.winRate
+        let normalized: Double
+        if rawValue > 0 {
+            normalized = rawValue <= 1 ? rawValue * 100 : rawValue
+        } else if champion.games > 0 {
+            normalized = Double(champion.wins) / Double(champion.games) * 100
+        } else {
+            normalized = 0
+        }
+
+        return min(max(normalized, 0), 100)
+    }
+
+    private static func formatPercentage(_ value: Double) -> String {
+        let rounded = (value * 10).rounded() / 10
+        if rounded.rounded() == rounded {
+            return "\(Int(rounded))%"
+        }
+        return String(format: "%.1f%%", rounded)
+    }
+
+    private static func formattedKDA(_ value: Double?) -> String? {
+        guard let value, value.isFinite, value > 0 else { return nil }
+        let rounded = (value * 10).rounded() / 10
+        let text: String
+        if rounded.rounded() == rounded {
+            text = "\(Int(rounded))"
+        } else {
+            text = String(format: "%.1f", rounded)
+        }
+        return "KDA \(text)"
+    }
+
+    private static func formattedLastPlayed(_ date: Date?) -> String? {
+        guard let date else { return nil }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "ko_KR")
+        formatter.dateFormat = "M.d"
+        return "최근 \(formatter.string(from: date))"
+    }
+
+    private static func championIconURL(for champion: ProfileTopChampion) -> URL? {
+        let normalizedKey = champion.championKey
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: " ", with: "")
+        if !normalizedKey.isEmpty {
+            return URL(string: "https://ddragon.leagueoflegends.com/cdn/16.8.1/img/champion/\(normalizedKey).png")
+        }
+
+        guard let championId = champion.championId else { return nil }
+        return URL(string: "https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/champion-icons/\(championId).png")
+    }
+}
+
 struct UserProfile: Codable, Hashable {
     let id: String
     let email: String
@@ -1030,12 +1544,213 @@ struct UserProfile: Codable, Hashable {
     var styleTags: [String]
     let mannerScore: Double
     let noshowCount: Int
+    var topChampions: [ProfileTopChampion] = []
+    var topChampionAggregation: ProfileTopChampionAggregation? = nil
+
+    init(
+        id: String,
+        email: String,
+        nickname: String,
+        primaryPosition: Position?,
+        secondaryPosition: Position?,
+        isFillAvailable: Bool,
+        styleTags: [String],
+        mannerScore: Double,
+        noshowCount: Int,
+        topChampions: [ProfileTopChampion] = [],
+        championAggregationStatus: ChampionAggregationStatus? = nil,
+        topChampionAggregation: ProfileTopChampionAggregation? = nil
+    ) {
+        self.id = id
+        self.email = email
+        self.nickname = nickname
+        self.primaryPosition = primaryPosition
+        self.secondaryPosition = secondaryPosition
+        self.isFillAvailable = isFillAvailable
+        self.styleTags = styleTags
+        self.mannerScore = mannerScore
+        self.noshowCount = noshowCount
+        self.topChampions = topChampions
+        self.topChampionAggregation = topChampionAggregation ?? ProfileTopChampionAggregation(status: championAggregationStatus)
+    }
+
+    var championAggregationStatus: ChampionAggregationStatus? {
+        topChampionAggregation?.status
+    }
+}
+
+enum ProfilePositionAssignmentSource: String, Codable, Equatable {
+    case server
+    case fallback
+}
+
+struct ProfilePositionSummaryViewState: Equatable {
+    let primary: Position?
+    let secondary: Position?
+    let source: ProfilePositionAssignmentSource
+    let primaryPowerText: String?
+    let secondaryPowerText: String?
+    let captionText: String
+
+    static func build(profile: UserProfile, power: PowerProfile?) -> ProfilePositionSummaryViewState {
+        var resolvedPositions: [Position] = []
+
+        func appendIfNeeded(_ position: Position?) {
+            guard let position, !resolvedPositions.contains(position) else { return }
+            resolvedPositions.append(position)
+        }
+
+        appendIfNeeded(power?.primaryPosition)
+        appendIfNeeded(power?.secondaryPosition)
+        appendIfNeeded(profile.primaryPosition)
+        appendIfNeeded(profile.secondaryPosition)
+
+        let source: ProfilePositionAssignmentSource
+        if resolvedPositions.isEmpty {
+            source = .fallback
+        } else {
+            source = .server
+        }
+
+        fallbackPositions(from: power?.lanePower ?? [:]).forEach { appendIfNeeded($0) }
+
+        return ProfilePositionSummaryViewState(
+            primary: resolvedPositions.first,
+            secondary: resolvedPositions.dropFirst().first,
+            source: source,
+            primaryPowerText: scoreText(for: resolvedPositions.first, lanePower: power?.lanePower ?? [:]),
+            secondaryPowerText: scoreText(for: resolvedPositions.dropFirst().first, lanePower: power?.lanePower ?? [:]),
+            captionText: source == .server ? "서버 산정 라인 적용" : "라인 파워 기준 임시 산정"
+        )
+    }
+
+    private static func fallbackPositions(from lanePower: [Position: Double]) -> [Position] {
+        Position.standardLanes
+            .compactMap { position -> (Position, Double)? in
+                guard let value = lanePower[position] else { return nil }
+                return (position, value)
+            }
+            .sorted { lhs, rhs in
+                if lhs.1 == rhs.1 {
+                    return laneOrder(lhs.0) < laneOrder(rhs.0)
+                }
+                return lhs.1 > rhs.1
+            }
+            .map(\.0)
+    }
+
+    private static func laneOrder(_ position: Position) -> Int {
+        Position.standardLanes.firstIndex(of: position) ?? Int.max
+    }
+
+    private static func scoreText(for position: Position?, lanePower: [Position: Double]) -> String? {
+        guard let position, let value = lanePower[position], value.isFinite else { return nil }
+        return "\(Int(value.rounded()))"
+    }
+}
+
+struct ProfilePowerStatViewState: Equatable, Identifiable {
+    let id: String
+    let label: String
+    let valueText: String
+    let emphasis: ProfilePowerStatEmphasis
+}
+
+enum ProfilePowerStatEmphasis: Equatable {
+    case primary
+    case secondary
+    case gold
+}
+
+struct ProfileLanePowerRowViewState: Equatable, Identifiable {
+    let id: String
+    let position: Position
+    let powerText: String
+    let progressValue: Double
+    let isPrimary: Bool
+    let isSecondary: Bool
+    let roleBadgeText: String?
+    let differenceText: String?
+}
+
+struct ProfilePowerSectionViewState: Equatable {
+    let overallText: String
+    let positionSummary: ProfilePositionSummaryViewState
+    let stats: [ProfilePowerStatViewState]
+    let laneRows: [ProfileLanePowerRowViewState]
+    let calculationHintText: String?
+
+    static func build(power: PowerProfile, positionSummary: ProfilePositionSummaryViewState) -> ProfilePowerSectionViewState {
+        let referencePower = positionSummary.primary.flatMap { power.lanePower[$0] } ?? power.lanePower.values.max()
+        let laneRows = Position.standardLanes.map { position in
+            let lanePower = power.lanePower[position]
+            return ProfileLanePowerRowViewState(
+                id: position.rawValue,
+                position: position,
+                powerText: lanePower.map { "\(Int($0.rounded()))" } ?? "--",
+                progressValue: min(max(lanePower ?? 0, 0), 100),
+                isPrimary: position == positionSummary.primary,
+                isSecondary: position == positionSummary.secondary,
+                roleBadgeText: position == positionSummary.primary ? "주" : (position == positionSummary.secondary ? "부" : nil),
+                differenceText: differenceText(
+                    currentPower: lanePower,
+                    referencePower: referencePower,
+                    isPrimary: position == positionSummary.primary
+                )
+            )
+        }
+
+        return ProfilePowerSectionViewState(
+            overallText: "\(Int(power.overallPower.rounded()))",
+            positionSummary: positionSummary,
+            stats: [
+                ProfilePowerStatViewState(id: "form", label: "최근 폼", valueText: "\(Int(power.formScore.rounded()))", emphasis: .primary),
+                ProfilePowerStatViewState(id: "stability", label: "안정성", valueText: "\(Int(power.stability.rounded()))", emphasis: .secondary),
+                ProfilePowerStatViewState(id: "carry", label: "캐리 기여", valueText: "\(Int(power.carry.rounded()))", emphasis: .secondary),
+                ProfilePowerStatViewState(id: "team", label: "팀 기여도", valueText: "\(Int(power.teamContribution.rounded()))", emphasis: .secondary),
+                ProfilePowerStatViewState(id: "mmr", label: "내전 MMR", valueText: "\(Int(power.inhouseMMR.rounded()))", emphasis: .gold),
+            ],
+            laneRows: laneRows,
+            calculationHintText: calculationHint(for: power, source: positionSummary.source)
+        )
+    }
+
+    private static func calculationHint(for power: PowerProfile, source: ProfilePositionAssignmentSource) -> String? {
+        if let autoAssignmentBasis = power.autoAssignmentBasis?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !autoAssignmentBasis.isEmpty {
+            return autoAssignmentBasis
+        }
+        if let historicalContributionSummary = power.historicalContributionSummary?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !historicalContributionSummary.isEmpty {
+            return historicalContributionSummary
+        }
+        return source == .fallback ? "서버 라인 값이 비어 있어 라인 파워 순서로 표시합니다." : "라인 파워와 최근/이전 시즌 지표가 함께 반영됩니다."
+    }
+
+    private static func differenceText(
+        currentPower: Double?,
+        referencePower: Double?,
+        isPrimary: Bool
+    ) -> String? {
+        guard let currentPower, currentPower.isFinite else { return nil }
+        if isPrimary {
+            return "기준"
+        }
+        guard let referencePower, referencePower.isFinite else { return nil }
+        let difference = Int((currentPower - referencePower).rounded())
+        if difference == 0 {
+            return "동일"
+        }
+        return difference > 0 ? "+\(difference)" : "\(difference)"
+    }
 }
 
 struct PowerProfile: Codable, Hashable {
     let userID: String
     let overallPower: Double
     let lanePower: [Position: Double]
+    let primaryPosition: Position?
+    let secondaryPosition: Position?
     let stability: Double
     let carry: Double
     let teamContribution: Double
@@ -1046,6 +1761,95 @@ struct PowerProfile: Codable, Hashable {
     let inhouseConfidence: Double
     let version: String
     let calculatedAt: Date
+    let laneScoreBreakdown: [Position: Double]?
+    let autoAssignmentBasis: String?
+    let historicalContributionSummary: String?
+    let topChampions: [ProfileTopChampion]?
+    let topChampionAggregation: ProfileTopChampionAggregation?
+
+    init(
+        userID: String,
+        overallPower: Double,
+        lanePower: [Position: Double],
+        primaryPosition: Position?,
+        secondaryPosition: Position?,
+        stability: Double,
+        carry: Double,
+        teamContribution: Double,
+        laneInfluence: Double,
+        basePower: Double,
+        formScore: Double,
+        inhouseMMR: Double,
+        inhouseConfidence: Double,
+        version: String,
+        calculatedAt: Date,
+        laneScoreBreakdown: [Position: Double]? = nil,
+        autoAssignmentBasis: String? = nil,
+        historicalContributionSummary: String? = nil,
+        topChampions: [ProfileTopChampion]? = nil,
+        topChampionAggregation: ProfileTopChampionAggregation? = nil
+    ) {
+        self.userID = userID
+        self.overallPower = overallPower
+        self.lanePower = lanePower
+        self.primaryPosition = primaryPosition
+        self.secondaryPosition = secondaryPosition
+        self.stability = stability
+        self.carry = carry
+        self.teamContribution = teamContribution
+        self.laneInfluence = laneInfluence
+        self.basePower = basePower
+        self.formScore = formScore
+        self.inhouseMMR = inhouseMMR
+        self.inhouseConfidence = inhouseConfidence
+        self.version = version
+        self.calculatedAt = calculatedAt
+        self.laneScoreBreakdown = laneScoreBreakdown
+        self.autoAssignmentBasis = autoAssignmentBasis
+        self.historicalContributionSummary = historicalContributionSummary
+        self.topChampions = topChampions
+        self.topChampionAggregation = topChampionAggregation
+    }
+
+    var championAggregationStatus: ChampionAggregationStatus? {
+        topChampionAggregation?.status
+    }
+
+    var preferredPositions: [Position] {
+        var ordered: [Position] = []
+
+        func appendIfNeeded(_ position: Position?) {
+            guard let position, !ordered.contains(position) else { return }
+            ordered.append(position)
+        }
+
+        appendIfNeeded(primaryPosition)
+        appendIfNeeded(secondaryPosition)
+
+        let laneOrdered = lanePower
+            .sorted { lhs, rhs in
+                if lhs.value == rhs.value {
+                    return Self.laneOrder(lhs.key) < Self.laneOrder(rhs.key)
+                }
+                return lhs.value > rhs.value
+            }
+            .map(\.key)
+
+        laneOrdered.forEach { appendIfNeeded($0) }
+        return ordered
+    }
+
+    var resolvedPrimaryPosition: Position? {
+        preferredPositions.first
+    }
+
+    var resolvedSecondaryPosition: Position? {
+        preferredPositions.dropFirst().first
+    }
+
+    private static func laneOrder(_ position: Position) -> Int {
+        Position.standardLanes.firstIndex(of: position) ?? Int.max
+    }
 }
 
 struct RiotAccount: Codable, Hashable, Identifiable {
@@ -1093,6 +1897,12 @@ struct RiotAccount: Codable, Hashable, Identifiable {
     var syncStatusSummary: String {
         if syncUIState.isFailure, let lastSyncErrorMessage, !lastSyncErrorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return lastSyncErrorMessage
+        }
+        if syncUIState == .syncing,
+           let lastSyncRequestedAt,
+           Date().timeIntervalSince(lastSyncRequestedAt) >= 12
+        {
+            return "최근 전적을 불러오는 중이에요. 서버 응답에 따라 조금 더 걸릴 수 있어요."
         }
         return syncUIState.summary
     }
@@ -1498,6 +2308,84 @@ struct LocalMatchRecord: Codable, Hashable, Identifiable {
     let mvpUserID: String
 }
 
+enum HistoryFilter: String, CaseIterable, Identifiable {
+    case all
+    case recent
+    case local
+    case saved
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .all: return "전체"
+        case .recent: return "최근"
+        case .local: return "로컬"
+        case .saved: return "저장"
+        }
+    }
+
+    var emptyMessage: String {
+        switch self {
+        case .all:
+            return "아직 기록된 내전이 없습니다."
+        case .recent:
+            return "최근 기록이 없습니다."
+        case .local:
+            return "로컬에 저장된 기록이 없습니다."
+        case .saved:
+            return "저장한 기록이 없습니다."
+        }
+    }
+
+    var debugName: String { rawValue }
+}
+
+enum HistoryItemSource: String, Hashable {
+    case remote
+    case local
+}
+
+struct HistoryListItem: Hashable, Identifiable {
+    var id: String { matchID }
+
+    let matchID: String
+    let source: HistoryItemSource
+    let remoteItem: MatchHistoryItem?
+    let localItem: LocalMatchRecord?
+    let isSaved: Bool
+
+    init(remoteItem: MatchHistoryItem, isSaved: Bool) {
+        self.matchID = remoteItem.matchID
+        self.source = .remote
+        self.remoteItem = remoteItem
+        self.localItem = nil
+        self.isSaved = isSaved
+    }
+
+    init(localItem: LocalMatchRecord, isSaved: Bool) {
+        self.matchID = localItem.matchID
+        self.source = .local
+        self.remoteItem = nil
+        self.localItem = localItem
+        self.isSaved = isSaved
+    }
+
+    var sortDate: Date {
+        remoteItem?.scheduledAt ?? localItem?.savedAt ?? .distantPast
+    }
+}
+
+struct HistoryViewState: Equatable {
+    let selectedFilter: HistoryFilter
+    let allItems: [HistoryListItem]
+    let displayedItems: [HistoryListItem]
+
+    var emptyMessage: String {
+        selectedFilter.emptyMessage
+    }
+}
+
 struct RecentSearchKeyword: Codable, Hashable, Identifiable {
     let id: String
     let keyword: String
@@ -1822,6 +2710,9 @@ struct HomeSnapshot: Equatable {
     let profile: UserProfile
     let riotAccountsViewState: RiotLinkedAccountsViewState
     let power: PowerProfile?
+    let homeSummaryState: HomeSummaryLoadState
+    let trackedGroupsState: HomeTrackedGroupsLoadState
+    let currentMatchState: HomeCurrentMatchLoadState
     let groups: [GroupSummary]
     let currentMatch: Match?
     let latestHistory: MatchHistoryItem?
@@ -1838,6 +2729,22 @@ struct GuestHomeSnapshot: Equatable {
 enum HomeContentState: Equatable {
     case guest(GuestHomeSnapshot)
     case authenticated(HomeSnapshot)
+}
+
+enum HomeSummaryLoadState: Equatable {
+    case loaded
+}
+
+enum HomeTrackedGroupsLoadState: Equatable {
+    case loaded
+    case partial
+    case missing
+}
+
+enum HomeCurrentMatchLoadState: Equatable {
+    case loaded
+    case partial
+    case missing
 }
 
 struct GroupDetailSnapshot: Equatable {
@@ -1878,7 +2785,10 @@ struct ProfileSnapshot: Equatable {
     let profile: UserProfile
     let riotAccountsViewState: RiotLinkedAccountsViewState
     let power: PowerProfile?
+    let positionSummary: ProfilePositionSummaryViewState
+    let powerSection: ProfilePowerSectionViewState?
     let history: [MatchHistoryItem]
+    let topChampionsSection: ProfileTopChampionsSectionState
 }
 
 struct GuestProfileSnapshot: Equatable {
@@ -1900,7 +2810,6 @@ struct MatchDetailSnapshot: Equatable {
 
 struct RiotAccountSnapshot: Equatable {
     let accounts: [RiotAccount]
-    let syncInProgressIDs: Set<String>
 }
 
 struct RecruitBoardSnapshot: Equatable {
@@ -1912,6 +2821,6 @@ struct RecruitBoardSnapshot: Equatable {
 }
 
 enum HistoryContentState: Equatable {
-    case guest([LocalMatchRecord])
-    case authenticated([MatchHistoryItem])
+    case guest(HistoryViewState)
+    case authenticated(HistoryViewState)
 }

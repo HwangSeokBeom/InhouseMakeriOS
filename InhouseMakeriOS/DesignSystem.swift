@@ -440,6 +440,9 @@ struct AppTabBar: View {
     let selectedTab: AppTab
     let onSelect: (AppTab) -> Void
 
+    private let previousOuterBottomPadding: CGFloat = 8
+    private let outerBottomPadding: CGFloat = 4
+
     var body: some View {
         HStack(spacing: 6) {
             ForEach(AppTab.allCases, id: \.self) { tab in
@@ -499,7 +502,18 @@ struct AppTabBar: View {
         )
         .padding(.horizontal, 12)
         .padding(.top, 4)
-        .padding(.bottom, 8)
+        .padding(.bottom, outerBottomPadding)
+        .onAppear {
+            debugTabBarLayout(
+                "bottomInsetAdjusted old=\(Int(previousOuterBottomPadding)) new=\(Int(outerBottomPadding))"
+            )
+        }
+    }
+
+    private func debugTabBarLayout(_ message: String) {
+        #if DEBUG
+        print("[TabBarLayoutDebug] \(message)")
+        #endif
     }
 }
 
@@ -757,6 +771,8 @@ struct ScreenScaffold<Content: View>: View {
     let title: String
     var showBack: Bool = true
     var rightSystemImage: String? = nil
+    var rightAccessibilityLabel: String? = nil
+    var rightAccessibilityIdentifier: String? = nil
     var onBack: () -> Void
     var onRightTap: (() -> Void)?
     let content: Content
@@ -773,10 +789,21 @@ struct ScreenScaffold<Content: View>: View {
                     Button(action: { onRightTap?() }) {
                         Image(systemName: rightSystemImage)
                     }
+                    .accessibilityLabel(rightAccessibilityLabel ?? rightToolbarAccessibilityLabel(for: rightSystemImage))
+                    .accessibilityIdentifier(rightAccessibilityIdentifier ?? "")
                 }
             }
         }
         .appNavigationBarStyle(.inline)
+    }
+
+    private func rightToolbarAccessibilityLabel(for systemImage: String) -> String {
+        switch systemImage {
+        case "ellipsis", "ellipsis.circle":
+            return "더보기"
+        default:
+            return "도구"
+        }
     }
 }
 
@@ -785,12 +812,16 @@ func screenScaffold<Content: View>(
     title: String,
     onBack: @escaping () -> Void,
     rightSystemImage: String? = nil,
+    rightAccessibilityLabel: String? = nil,
+    rightAccessibilityIdentifier: String? = nil,
     onRightTap: (() -> Void)? = nil,
     @ViewBuilder content: () -> Content
 ) -> some View {
     ScreenScaffold(
         title: title,
         rightSystemImage: rightSystemImage,
+        rightAccessibilityLabel: rightAccessibilityLabel,
+        rightAccessibilityIdentifier: rightAccessibilityIdentifier,
         onBack: onBack,
         onRightTap: onRightTap,
         content: content()

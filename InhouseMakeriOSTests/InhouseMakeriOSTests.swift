@@ -1,5 +1,6 @@
 import Combine
 import ComposableArchitecture
+import SwiftUI
 import XCTest
 @testable import InhouseMakeriOS
 
@@ -741,6 +742,845 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(mappedError.message, "모집이 종료되어 더 이상 진행할 수 없어요.")
     }
 
+    func testErrorMapperMapsRecruitingApplyClosedOrFullToFriendlyMessage() {
+        let mappedError = UserFacingError(
+            title: "서버 오류",
+            message: "Capacity full.",
+            code: "UNKNOWN_SERVER_ERROR",
+            statusCode: 409,
+            endpoint: "/recruiting-posts/post-1/participants",
+            requestMethod: "POST"
+        ).serverContractMapped
+
+        XCTAssertEqual(mappedError.title, "모집이 마감되었어요")
+        XCTAssertEqual(mappedError.message, "모집이 마감되어 참가 신청할 수 없어요.")
+    }
+
+    func testPowerProfileDTODecodesSeededProfileWithoutStyleStability() throws {
+        let payload = """
+        {
+          "userId": "seed-user",
+          "overallPower": 81.5,
+          "lanePower": {
+            "MID": 84,
+            "TOP": 78,
+            "ADC": 74
+          },
+          "primaryPosition": "MID",
+          "secondaryPosition": "TOP",
+          "style": {
+            "carry": 79,
+            "teamContribution": 76,
+            "laneInfluence": 80
+          }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(PowerProfileDTO.self, from: payload)
+        let profile = dto.toDomain(requestedUserID: "seed-user")
+
+        XCTAssertEqual(profile.userID, "seed-user")
+        XCTAssertEqual(profile.primaryPosition, .mid)
+        XCTAssertEqual(profile.secondaryPosition, .top)
+        XCTAssertEqual(profile.overallPower, 81.5, accuracy: 0.001)
+        XCTAssertEqual(profile.stability, 81.5, accuracy: 0.001)
+        XCTAssertEqual(profile.carry, 79, accuracy: 0.001)
+        XCTAssertEqual(profile.teamContribution, 76, accuracy: 0.001)
+        XCTAssertEqual(profile.laneInfluence, 80, accuracy: 0.001)
+        XCTAssertEqual(dto.missingFieldPaths, [
+            "style.stability",
+            "basePower",
+            "formScore",
+            "inhouseMmr",
+            "inhouseConfidence",
+            "version",
+            "calculatedAt",
+        ])
+    }
+
+    func testPowerProfileDTOKeepsLobbyDataWhenOptionalFieldsAreMissing() throws {
+        let payload = """
+        {
+          "userId": "seed-user",
+          "lanePower": {
+            "SUPPORT": 71,
+            "ADC": 68
+          },
+          "overallPower": 70,
+          "style": {}
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(PowerProfileDTO.self, from: payload)
+        let profile = dto.toDomain(requestedUserID: "seed-user")
+
+        XCTAssertNil(profile.primaryPosition)
+        XCTAssertNil(profile.secondaryPosition)
+        XCTAssertEqual(profile.resolvedPrimaryPosition, .support)
+        XCTAssertEqual(profile.resolvedSecondaryPosition, .adc)
+        XCTAssertEqual(profile.basePower, 70, accuracy: 0.001)
+        XCTAssertEqual(profile.formScore, 70, accuracy: 0.001)
+        XCTAssertEqual(profile.stability, 70, accuracy: 0.001)
+    }
+
+    func testPowerProfileDTODecodesTopChampionsAndAggregationDetails() throws {
+        let payload = """
+        {
+          "userId": "seed-user",
+          "overallPower": 84,
+          "lanePower": {
+            "MID": 84,
+            "TOP": 76
+          },
+          "topChampions": [
+            {
+              "championId": 103,
+              "championKey": "Ahri",
+              "championName": "아리",
+              "games": 18,
+              "wins": 10,
+              "losses": 8,
+              "winRate": 55.6
+            }
+          ],
+          "topChampionAggregationStatus": {
+            "status": "PARTIAL",
+            "reason": "INSUFFICIENT_BACKFILL",
+            "message": "부분 집계 상태예요.",
+            "syncCoverageSummary": "최근 30일 기준"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(PowerProfileDTO.self, from: payload)
+        let profile = dto.toDomain(requestedUserID: "seed-user")
+
+        XCTAssertEqual(profile.topChampions?.count, 1)
+        XCTAssertEqual(profile.topChampions?.first?.championKey, "Ahri")
+        XCTAssertEqual(profile.topChampionAggregation?.status, .partial)
+        XCTAssertEqual(profile.topChampionAggregation?.normalizedReason, "INSUFFICIENT_BACKFILL")
+        XCTAssertEqual(profile.topChampionAggregation?.message, "부분 집계 상태예요.")
+        XCTAssertEqual(profile.topChampionAggregation?.syncCoverageSummary, "최근 30일 기준")
+    }
+
+    func testPowerProfileDTODropsMalformedTopChampionItemsWithoutFailingDecode() throws {
+        let payload = """
+        {
+          "userId": "seed-user",
+          "overallPower": 84,
+          "lanePower": {
+            "MID": 84,
+            "TOP": 76
+          },
+          "topChampions": [
+            "broken",
+            {
+              "championKey": "Ahri",
+              "championName": "아리",
+              "games": "18",
+              "wins": "10",
+              "winRate": "55.6"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(PowerProfileDTO.self, from: payload)
+        let profile = dto.toDomain(requestedUserID: "seed-user")
+
+        XCTAssertEqual(profile.topChampions?.count, 1)
+        XCTAssertEqual(profile.topChampions?.first?.championName, "아리")
+        XCTAssertEqual(profile.topChampions?.first?.games, 18)
+    }
+
+    func testProfilePositionSummaryUsesServerPositionsBeforeManualProfileSettings() {
+        let profile = makeProfile()
+        let power = PowerProfile(
+            userID: "u1",
+            overallPower: 88,
+            lanePower: [.support: 91, .adc: 87, .mid: 73],
+            primaryPosition: .support,
+            secondaryPosition: .adc,
+            stability: 82,
+            carry: 79,
+            teamContribution: 86,
+            laneInfluence: 91,
+            basePower: 84,
+            formScore: 88,
+            inhouseMMR: 1020,
+            inhouseConfidence: 0.9,
+            version: "test",
+            calculatedAt: Date()
+        )
+
+        let summary = ProfilePositionSummaryViewState.build(profile: profile, power: power)
+
+        XCTAssertEqual(summary.primary, .support)
+        XCTAssertEqual(summary.secondary, .adc)
+        XCTAssertEqual(summary.source, .server)
+        XCTAssertEqual(summary.primaryPowerText, "91")
+        XCTAssertEqual(summary.secondaryPowerText, "87")
+    }
+
+    func testProfilePositionSummaryFallsBackToLanePowerWhenServerPositionsAreEmpty() {
+        var profile = makeProfile()
+        profile.primaryPosition = nil
+        profile.secondaryPosition = nil
+        let power = PowerProfile(
+            userID: "u1",
+            overallPower: 80,
+            lanePower: [.jungle: 92, .top: 84, .mid: 77],
+            primaryPosition: nil,
+            secondaryPosition: nil,
+            stability: 80,
+            carry: 80,
+            teamContribution: 80,
+            laneInfluence: 80,
+            basePower: 80,
+            formScore: 80,
+            inhouseMMR: 980,
+            inhouseConfidence: 0.7,
+            version: "test",
+            calculatedAt: Date()
+        )
+
+        let summary = ProfilePositionSummaryViewState.build(profile: profile, power: power)
+        let powerSection = ProfilePowerSectionViewState.build(power: power, positionSummary: summary)
+
+        XCTAssertEqual(summary.primary, .jungle)
+        XCTAssertEqual(summary.secondary, .top)
+        XCTAssertEqual(summary.source, .fallback)
+        XCTAssertEqual(powerSection.laneRows.first(where: { $0.position == .jungle })?.roleBadgeText, "주")
+        XCTAssertEqual(powerSection.laneRows.first(where: { $0.position == .top })?.roleBadgeText, "부")
+    }
+
+    func testProfilePositionSummaryUsesUserProfilePositionsBeforeLaneFallback() {
+        let profile = makeProfile()
+        let power = PowerProfile(
+            userID: "u1",
+            overallPower: 80,
+            lanePower: [.jungle: 92, .top: 84, .mid: 77],
+            primaryPosition: nil,
+            secondaryPosition: nil,
+            stability: 80,
+            carry: 80,
+            teamContribution: 80,
+            laneInfluence: 80,
+            basePower: 80,
+            formScore: 80,
+            inhouseMMR: 980,
+            inhouseConfidence: 0.7,
+            version: "test",
+            calculatedAt: Date()
+        )
+
+        let summary = ProfilePositionSummaryViewState.build(profile: profile, power: power)
+
+        XCTAssertEqual(summary.primary, .mid)
+        XCTAssertEqual(summary.secondary, .top)
+        XCTAssertEqual(summary.source, .server)
+    }
+
+    func testUserProfileDTODecodesTopChampionsAndMapsToDomain() throws {
+        let payload = """
+        {
+          "id": "u1",
+          "email": "user@example.com",
+          "nickname": "tester",
+          "primaryPosition": "MID",
+          "secondaryPosition": "TOP",
+          "isFillAvailable": true,
+          "styleTags": ["빡겜"],
+          "mannerScore": 100,
+          "noshowCount": 0,
+          "championAggregationStatus": "READY",
+          "topChampions": [
+            {
+              "championId": 103,
+              "championKey": "Ahri",
+              "championName": "아리",
+              "games": 24,
+              "wins": 14,
+              "losses": 10,
+              "winRate": 58.3,
+              "kills": 8.2,
+              "deaths": 3.1,
+              "assists": 6.4,
+              "kda": 4.7,
+              "lastPlayedAt": "2026-04-18T09:30:00Z"
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(UserProfileDTO.self, from: payload)
+        let profile = dto.toDomain()
+
+        XCTAssertEqual(profile.id, "u1")
+        XCTAssertEqual(profile.topChampions.count, 1)
+        XCTAssertEqual(profile.topChampions.first?.championId, 103)
+        XCTAssertEqual(profile.topChampions.first?.championKey, "Ahri")
+        XCTAssertEqual(profile.topChampions.first?.championName, "아리")
+        XCTAssertEqual(profile.topChampions.first?.games, 24)
+        XCTAssertEqual(profile.topChampions.first?.kda ?? 0, 4.7, accuracy: 0.001)
+        XCTAssertNotNil(profile.topChampions.first?.lastPlayedAt)
+        XCTAssertEqual(profile.championAggregationStatus, .ready)
+    }
+
+    func testUserProfileDTODecodesTopChampionAggregationObject() throws {
+        let payload = """
+        {
+          "id": "u1",
+          "email": "user@example.com",
+          "nickname": "tester",
+          "isFillAvailable": true,
+          "styleTags": [],
+          "mannerScore": 100,
+          "noshowCount": 0,
+          "topChampionAggregationStatus": {
+            "status": "PARTIAL",
+            "reason": "INSUFFICIENT_BACKFILL",
+            "message": "백필이 더 필요해요.",
+            "syncCoverageSummary": "최근 랭크 전적 일부만 반영"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(UserProfileDTO.self, from: payload)
+        let profile = dto.toDomain()
+
+        XCTAssertEqual(profile.championAggregationStatus, .partial)
+        XCTAssertEqual(profile.topChampionAggregation?.normalizedReason, "INSUFFICIENT_BACKFILL")
+        XCTAssertEqual(profile.topChampionAggregation?.message, "백필이 더 필요해요.")
+        XCTAssertEqual(profile.topChampionAggregation?.syncCoverageSummary, "최근 랭크 전적 일부만 반영")
+    }
+
+    func testUserProfileDTODoesNotFailWhenTopChampionsShapeIsUnexpected() throws {
+        let payload = """
+        {
+          "id": "u1",
+          "email": "user@example.com",
+          "nickname": "tester",
+          "primaryPosition": "MID",
+          "secondaryPosition": "TOP",
+          "isFillAvailable": true,
+          "styleTags": ["빡겜"],
+          "mannerScore": 100,
+          "noshowCount": 0,
+          "topChampions": {
+            "championKey": "Ahri"
+          }
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(UserProfileDTO.self, from: payload)
+        let profile = dto.toDomain()
+
+        XCTAssertEqual(profile.nickname, "tester")
+        XCTAssertTrue(profile.topChampions.isEmpty)
+    }
+
+    func testUserProfileDTODropsMalformedTopChampionItemsWithoutFailingMeDecode() throws {
+        let payload = """
+        {
+          "id": "u1",
+          "email": "user@example.com",
+          "nickname": "tester",
+          "primaryPosition": "MID",
+          "secondaryPosition": "TOP",
+          "isFillAvailable": true,
+          "styleTags": ["빡겜"],
+          "mannerScore": 100,
+          "noshowCount": 0,
+          "topChampions": [
+            "broken",
+            {
+              "championKey": "Ahri",
+              "championName": "아리",
+              "games": "12",
+              "wins": "7",
+              "winRate": "58.3"
+            },
+            {
+              "championKey": "",
+              "championName": "",
+              "games": 99
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+
+        let dto = try JSONDecoder.app.decode(UserProfileDTO.self, from: payload)
+        let profile = dto.toDomain()
+
+        XCTAssertEqual(profile.nickname, "tester")
+        XCTAssertEqual(profile.topChampions.count, 1)
+        XCTAssertEqual(profile.topChampions.first?.championKey, "Ahri")
+        XCTAssertEqual(profile.topChampions.first?.games, 12)
+    }
+
+    func testProfileTopChampionsSectionStateBuildsThreeRowsAndUsesContentState() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [
+                makeTopChampion(championKey: "Ahri", championName: "아리", games: 24, wins: 14, winRate: 58.3, kda: 4.7),
+                makeTopChampion(championKey: "Orianna", championName: "오리아나", games: 18, wins: 10, winRate: 55.6, kda: nil),
+                makeTopChampion(championKey: "Syndra", championName: "신드라", games: 12, wins: 7, winRate: 58.3, kda: 3.2),
+                makeTopChampion(championKey: "Lux", championName: "럭스", games: 0, wins: 0, winRate: 0, kda: 2.1),
+            ],
+            aggregation: ProfileTopChampionAggregation(status: .ready),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .succeeded)])
+        )
+
+        guard case let .content(items, subtitle) = state else {
+            return XCTFail("Expected content state")
+        }
+
+        XCTAssertEqual(items.count, 3)
+        XCTAssertEqual(items.map(\.championName), ["아리", "오리아나", "신드라"])
+        XCTAssertEqual(items.first?.gamesText, "24판")
+        XCTAssertEqual(items.first?.winRateText, "승률 58.3%")
+        XCTAssertEqual(items.first?.kdaText, "KDA 4.7")
+        XCTAssertNil(items[1].kdaText)
+        XCTAssertNil(subtitle)
+        XCTAssertEqual(state.debugState, .content)
+    }
+
+    func testProfileTopChampionsSectionStateSupportsTwoChampionRows() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [
+                makeTopChampion(championKey: "Ahri", championName: "아리", games: 9, wins: 5, winRate: 55.6, kda: 3.4),
+                makeTopChampion(championKey: "LeBlanc", championName: "르블랑", games: 7, wins: 4, winRate: 57.1, kda: 2.9),
+            ],
+            aggregation: ProfileTopChampionAggregation(status: .ready),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .succeeded)])
+        )
+
+        guard case let .content(items, _) = state else {
+            return XCTFail("Expected content state")
+        }
+
+        XCTAssertEqual(items.count, 2)
+        XCTAssertEqual(items.map(\.rank), [1, 2])
+    }
+
+    func testProfileTopChampionsSectionStateShowsContentWhenPartialStatusHasChampions() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [makeTopChampion(championKey: "Ahri", championName: "아리", games: 4, wins: 2, winRate: 50, kda: 2.2)],
+            aggregation: ProfileTopChampionAggregation(status: .partial, message: "부분 집계 상태예요."),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .partial)])
+        )
+
+        guard case let .content(items, subtitle) = state else {
+            return XCTFail("Expected content state")
+        }
+
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(subtitle, "부분 집계 상태예요.")
+        XCTAssertEqual(state.debugState, .content)
+    }
+
+    func testProfileTopChampionsSectionStateShowsContentWhenBackfillReasonHasChampions() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [makeTopChampion(championKey: "Ahri", championName: "아리", games: 1, wins: 1, winRate: 100, kda: nil)],
+            aggregation: ProfileTopChampionAggregation(
+                status: .partial,
+                reason: "INSUFFICIENT_BACKFILL",
+                message: "백필이 더 필요해요."
+            ),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .partial)])
+        )
+
+        guard case let .content(items, subtitle) = state else {
+            return XCTFail("Expected content state")
+        }
+
+        XCTAssertEqual(items.first?.championName, "아리")
+        XCTAssertEqual(subtitle, "백필이 더 필요해요.")
+        XCTAssertEqual(state.debugState, .content)
+    }
+
+    func testProfileTopChampionsSectionStateShowsContentForZeroGameChampionWhenNonEmpty() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [makeTopChampion(championKey: "Ahri", championName: "아리", games: 0, wins: 0, winRate: 0, kda: nil)],
+            aggregation: ProfileTopChampionAggregation(status: .partial),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .partial)])
+        )
+
+        guard case let .content(items, _) = state else {
+            return XCTFail("Expected content state")
+        }
+
+        XCTAssertEqual(items.first?.championName, "아리")
+        XCTAssertEqual(items.first?.gamesText, "0판")
+    }
+
+    func testProfileTopChampionsSectionStateShowsDisconnectedWhenEmptyAndRiotDisconnected() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [],
+            aggregation: nil,
+            riotAccountsViewState: .noLinkedAccounts
+        )
+
+        guard case let .empty(displayState, title, message, _) = state else {
+            return XCTFail("Expected disconnected empty state")
+        }
+
+        XCTAssertEqual(displayState, .disconnected)
+        XCTAssertEqual(title, "Riot 계정 연결이 필요해요")
+        XCTAssertEqual(message, "Riot ID를 연결하면 주 챔피언을 분석해 보여드릴게요.")
+    }
+
+    func testProfileTopChampionsSectionStateShowsSyncingWhenEmptyAndSyncRunning() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [],
+            aggregation: nil,
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .running)])
+        )
+
+        guard case let .empty(displayState, title, message, _) = state else {
+            return XCTFail("Expected syncing empty state")
+        }
+
+        XCTAssertEqual(displayState, .syncing)
+        XCTAssertEqual(title, "최근 전적을 분석 중이에요")
+        XCTAssertEqual(message, "동기화가 끝나면 주 챔피언이 자동으로 채워집니다.")
+    }
+
+    func testProfileTopChampionsSectionStateShowsBackfillPendingWhenEmptyAndBackfillPending() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [],
+            aggregation: ProfileTopChampionAggregation(
+                status: .partial,
+                reason: "INSUFFICIENT_BACKFILL",
+                message: "이전 전적이 더 필요해요."
+            ),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .partial)])
+        )
+
+        guard case let .empty(displayState, title, message, subtitle) = state else {
+            return XCTFail("Expected backfill pending empty state")
+        }
+
+        XCTAssertEqual(displayState, .backfillPending)
+        XCTAssertEqual(title, "전적 동기화가 더 필요해요")
+        XCTAssertEqual(message, "이전 랭크 전적이 더 반영되면 주 챔피언을 보여드릴게요.")
+        XCTAssertEqual(subtitle, "이전 전적이 더 필요해요.")
+    }
+
+    func testProfileTopChampionsSectionStateShowsInsufficientSampleWhenEmptyAndSampleIsInsufficient() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [],
+            aggregation: ProfileTopChampionAggregation(
+                status: .insufficientSample,
+                reason: "INSUFFICIENT_SAMPLE"
+            ),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .succeeded)])
+        )
+
+        guard case let .empty(displayState, title, message, _) = state else {
+            return XCTFail("Expected insufficient sample state")
+        }
+
+        XCTAssertEqual(displayState, .insufficientSample)
+        XCTAssertEqual(title, "랭크 기록이 더 필요해요")
+        XCTAssertEqual(message, "집계 가능한 랭크 기록이 더 쌓이면 주 챔피언을 보여드릴게요.")
+    }
+
+    func testProfileTopChampionsSectionStateShowsGenericEmptyWhenServerDidNotMarkSampleInsufficient() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [],
+            aggregation: ProfileTopChampionAggregation(status: .connectedEmpty),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .succeeded)])
+        )
+
+        guard case let .empty(displayState, title, message, _) = state else {
+            return XCTFail("Expected generic empty state")
+        }
+
+        XCTAssertEqual(displayState, .genericEmpty)
+        XCTAssertEqual(title, "아직 표시할 챔피언이 없어요")
+        XCTAssertEqual(message, "서버 집계가 완료되면 상위 챔피언을 보여드릴게요.")
+    }
+
+    func testProfileTopChampionsSectionStateUsesServerStatusBeforeRiotSyncFallback() {
+        let state = ProfileTopChampionsSectionState.build(
+            champions: [],
+            aggregation: ProfileTopChampionAggregation(status: .syncing),
+            riotAccountsViewState: .loaded([makeRiotAccount(syncStatus: .succeeded)])
+        )
+
+        guard case let .empty(displayState, title, message, _) = state else {
+            return XCTFail("Expected syncing empty state")
+        }
+
+        XCTAssertEqual(displayState, .syncing)
+        XCTAssertEqual(title, "최근 전적을 분석 중이에요")
+        XCTAssertEqual(message, "동기화가 끝나면 주 챔피언이 자동으로 채워집니다.")
+    }
+
+    @MainActor
+    func testProfileViewModelBuildsSnapshotWithAutoPositionsAndTopChampions() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/me"):
+                    let profile = UserProfileDTO(
+                        id: "u1",
+                        email: "user@example.com",
+                        nickname: "tester",
+                        primaryPosition: .mid,
+                        secondaryPosition: .top,
+                        isFillAvailable: true,
+                        styleTags: ["빡겜"],
+                        mannerScore: 100,
+                        noshowCount: 0,
+                        topChampions: [
+                            ProfileTopChampionDTO(
+                                championId: 103,
+                                championKey: "Ahri",
+                                championName: "아리",
+                                games: 14,
+                                wins: 8,
+                                losses: 6,
+                                winRate: 57.1,
+                                kills: 0,
+                                deaths: 0,
+                                assists: 0,
+                                kda: 4.1
+                            ),
+                        ],
+                        championAggregationStatus: .ready
+                    )
+                    return (200, try JSONEncoder.app.encode(profile))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [self.makeRiotAccountDTO(syncStatus: .succeeded)])))
+                case ("GET", "/users/u1/power-profile"):
+                    let power = PowerProfileDTO(
+                        userId: "u1",
+                        overallPower: 89,
+                        lanePower: ["SUPPORT": 91, "ADC": 86, "MID": 72],
+                        primaryPosition: .support,
+                        secondaryPosition: .adc,
+                        style: PowerProfileDTO.StyleDTO(stability: 83, carry: 78, teamContribution: 90, laneInfluence: 91),
+                        basePower: 86,
+                        formScore: 88,
+                        inhouseMmr: 1040,
+                        inhouseConfidence: 0.9,
+                        version: "test",
+                        calculatedAt: Date(),
+                        autoAssignmentBasis: "라인 파워 기준 주라인 산정"
+                    )
+                    return (200, try JSONEncoder.app.encode(power))
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = ProfileViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test")
+
+        guard case let .content(.authenticated(snapshot)) = viewModel.state else {
+            return XCTFail("Expected authenticated profile snapshot")
+        }
+        XCTAssertEqual(snapshot.positionSummary.primary, .support)
+        XCTAssertEqual(snapshot.positionSummary.secondary, .adc)
+        XCTAssertEqual(snapshot.positionSummary.source, .server)
+        XCTAssertEqual(snapshot.powerSection?.laneRows.first(where: { $0.position == .support })?.roleBadgeText, "주")
+        guard case let .content(champions, subtitle) = snapshot.topChampionsSection else {
+            return XCTFail("Expected top champions content")
+        }
+        XCTAssertEqual(champions.first?.championName, "아리")
+        XCTAssertEqual(champions.first?.championKey, "Ahri")
+        XCTAssertNil(subtitle)
+        XCTAssertEqual(snapshot.topChampionsSection.headerSubtitle, "서버 집계 기준 가장 많이 플레이한 챔피언")
+        XCTAssertTrue(snapshot.history.isEmpty)
+    }
+
+    @MainActor
+    func testProfileViewModelPrefersPowerProfileTopChampionsWhenProfileIsEmpty() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/me"):
+                    let profile = UserProfileDTO(
+                        id: "u1",
+                        email: "user@example.com",
+                        nickname: "tester",
+                        primaryPosition: .mid,
+                        secondaryPosition: .top,
+                        isFillAvailable: true,
+                        styleTags: ["빡겜"],
+                        mannerScore: 100,
+                        noshowCount: 0,
+                        topChampions: [],
+                        championAggregationStatus: .disconnected
+                    )
+                    return (200, try JSONEncoder.app.encode(profile))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [self.makeRiotAccountDTO(syncStatus: .partial)])))
+                case ("GET", "/users/u1/power-profile"):
+                    let power = PowerProfileDTO(
+                        userId: "u1",
+                        overallPower: 89,
+                        lanePower: ["MID": 91, "TOP": 83],
+                        primaryPosition: .mid,
+                        secondaryPosition: .top,
+                        style: PowerProfileDTO.StyleDTO(stability: 83, carry: 78, teamContribution: 90, laneInfluence: 91),
+                        basePower: 86,
+                        formScore: 88,
+                        inhouseMmr: 1040,
+                        inhouseConfidence: 0.9,
+                        version: "test",
+                        calculatedAt: Date(),
+                        topChampions: [
+                            ProfileTopChampionDTO(
+                                championId: 103,
+                                championKey: "Ahri",
+                                championName: "아리",
+                                games: 6,
+                                wins: 4,
+                                losses: 2,
+                                winRate: 66.7,
+                                kills: 0,
+                                deaths: 0,
+                                assists: 0,
+                                kda: 4.1
+                            ),
+                        ],
+                        topChampionAggregation: ProfileTopChampionAggregationDTO(
+                            status: .partial,
+                            reason: "INSUFFICIENT_BACKFILL",
+                            message: "부분 집계 상태예요."
+                        )
+                    )
+                    return (200, try JSONEncoder.app.encode(power))
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = ProfileViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test")
+
+        guard case let .content(.authenticated(snapshot)) = viewModel.state else {
+            return XCTFail("Expected authenticated profile snapshot")
+        }
+        guard case let .content(champions, subtitle) = snapshot.topChampionsSection else {
+            return XCTFail("Expected top champions content from power profile")
+        }
+        XCTAssertEqual(champions.first?.championName, "아리")
+        XCTAssertEqual(snapshot.topChampionsSection.debugState, .content)
+        XCTAssertEqual(subtitle, "부분 집계 상태예요.")
+    }
+
+    @MainActor
+    func testProfileViewModelFallsBackToProfileTopChampionsWhenPowerResponseIsEmpty() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/me"):
+                    let profile = UserProfileDTO(
+                        id: "u1",
+                        email: "user@example.com",
+                        nickname: "tester",
+                        primaryPosition: .mid,
+                        secondaryPosition: .top,
+                        isFillAvailable: true,
+                        styleTags: ["빡겜"],
+                        mannerScore: 100,
+                        noshowCount: 0,
+                        topChampions: [
+                            ProfileTopChampionDTO(
+                                championId: 103,
+                                championKey: "Ahri",
+                                championName: "아리",
+                                games: 11,
+                                wins: 7,
+                                losses: 4,
+                                winRate: 63.6,
+                                kills: 0,
+                                deaths: 0,
+                                assists: 0,
+                                kda: 4.1
+                            ),
+                        ],
+                        championAggregationStatus: .ready
+                    )
+                    return (200, try JSONEncoder.app.encode(profile))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [self.makeRiotAccountDTO(syncStatus: .succeeded)])))
+                case ("GET", "/users/u1/power-profile"):
+                    let power = PowerProfileDTO(
+                        userId: "u1",
+                        overallPower: 89,
+                        lanePower: ["MID": 91, "TOP": 83],
+                        primaryPosition: .mid,
+                        secondaryPosition: .top,
+                        style: PowerProfileDTO.StyleDTO(stability: 83, carry: 78, teamContribution: 90, laneInfluence: 91),
+                        basePower: 86,
+                        formScore: 88,
+                        inhouseMmr: 1040,
+                        inhouseConfidence: 0.9,
+                        version: "test",
+                        calculatedAt: Date(),
+                        topChampions: [],
+                        topChampionAggregation: ProfileTopChampionAggregationDTO(
+                            status: .connectedEmpty,
+                            message: "이번 집계에는 챔피언이 비어 있어요."
+                        )
+                    )
+                    return (200, try JSONEncoder.app.encode(power))
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = ProfileViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test")
+
+        guard case let .content(.authenticated(snapshot)) = viewModel.state else {
+            return XCTFail("Expected authenticated profile snapshot")
+        }
+        guard case let .content(champions, _) = snapshot.topChampionsSection else {
+            return XCTFail("Expected top champions content from profile fallback")
+        }
+        XCTAssertEqual(champions.first?.championName, "아리")
+        XCTAssertEqual(snapshot.topChampionsSection.debugState, .content)
+    }
+
     func testEmailSignUpRequestUsesExpectedEndpointAndPayload() async throws {
         let tokenStore = makeTokenStore()
         let repository = AuthRepository(
@@ -1068,6 +1908,26 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(restored.resultPreviewDraft, resultDraft)
     }
 
+    func testSavedHistoryMatchIDsPersistAcrossLocalStoreRecreation() {
+        let suiteName = "InhouseMakeriOSTests.localstore.saved-history.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let store = AppLocalStore(defaults: defaults)
+        XCTAssertFalse(store.isHistorySaved(matchID: "match-1"))
+
+        store.setHistorySaved(matchID: " match-1 ", isSaved: true)
+
+        let restored = AppLocalStore(defaults: defaults)
+        XCTAssertTrue(restored.isHistorySaved(matchID: "match-1"))
+        XCTAssertEqual(restored.savedHistoryMatchIDs, Set(["match-1"]))
+
+        restored.toggleHistorySaved(matchID: "match-1")
+        XCTAssertFalse(AppLocalStore(defaults: defaults).isHistorySaved(matchID: "match-1"))
+    }
+
     func testLocalStoreRemoveGroupClearsTrackedGroupAndRecentMatchContext() {
         let suiteName = "InhouseMakeriOSTests.localstore.remove-group.\(UUID().uuidString)"
         guard let defaults = UserDefaults(suiteName: suiteName) else {
@@ -1092,6 +1952,127 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(store.storedGroupIDs, ["group-2"])
         XCTAssertNil(store.groupName(for: "group-1"))
         XCTAssertTrue(store.recentMatches.isEmpty)
+    }
+
+    @MainActor
+    func testHistoryViewModelFiltersRemoteLocalAndSavedItemsWithoutRefetching() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.history.filters.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        let baseDate = Date(timeIntervalSince1970: 1_776_643_200)
+
+        localStore.cacheResult(
+            matchID: "remote-1",
+            metadata: CachedResultMetadata(
+                winningTeam: .blue,
+                mvpUserID: "local-mvp-1",
+                balanceRating: 4,
+                updatedAt: baseDate.addingTimeInterval(10)
+            )
+        )
+        localStore.cacheResult(
+            matchID: "local-only",
+            metadata: CachedResultMetadata(
+                winningTeam: .red,
+                mvpUserID: "local-mvp-2",
+                balanceRating: 3,
+                updatedAt: baseDate.addingTimeInterval(20)
+            )
+        )
+        localStore.setHistorySaved(matchID: "remote-2", isSaved: true)
+        localStore.setHistorySaved(matchID: "local-only", isSaved: true)
+
+        let requestLock = NSLock()
+        var historyRequestCount = 0
+        let remoteItems = (1...12).map { index in
+            HistoryItemDTO(
+                matchId: "remote-\(index)",
+                scheduledAt: baseDate.addingTimeInterval(Double(index) * 100),
+                role: .mid,
+                teamSide: index.isMultiple(of: 2) ? .blue : .red,
+                result: index.isMultiple(of: 2) ? "WIN" : "LOSE",
+                kda: "\(index)/1/5",
+                deltaMmr: Double(index)
+            )
+        }
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/users/u1/inhouse-history"):
+                    requestLock.lock()
+                    historyRequestCount += 1
+                    requestLock.unlock()
+                    let payload = try JSONEncoder.app.encode(HistoryResponseDTO(items: remoteItems))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HistoryViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test")
+
+        requestLock.lock()
+        let initialRequestCount = historyRequestCount
+        requestLock.unlock()
+        XCTAssertEqual(initialRequestCount, 1)
+
+        guard case let .content(.authenticated(allState)) = viewModel.state else {
+            return XCTFail("Expected authenticated history content, got \(viewModel.state)")
+        }
+        XCTAssertEqual(allState.selectedFilter, .all)
+        XCTAssertEqual(allState.allItems.count, 13)
+        XCTAssertEqual(allState.displayedItems.count, 13)
+        XCTAssertEqual(allState.displayedItems.filter { $0.matchID == "remote-1" }.count, 1)
+        XCTAssertEqual(allState.displayedItems.first?.matchID, "remote-12")
+
+        viewModel.selectFilter(.recent)
+        guard case let .content(.authenticated(recentState)) = viewModel.state else {
+            return XCTFail("Expected recent history content")
+        }
+        XCTAssertEqual(recentState.selectedFilter, .recent)
+        XCTAssertEqual(recentState.displayedItems.count, HistoryViewModel.recentItemLimit)
+        XCTAssertEqual(recentState.displayedItems.first?.matchID, "remote-12")
+        XCTAssertEqual(recentState.displayedItems.last?.matchID, "remote-3")
+
+        viewModel.selectFilter(.local)
+        guard case let .content(.authenticated(localState)) = viewModel.state else {
+            return XCTFail("Expected local history content")
+        }
+        XCTAssertEqual(localState.selectedFilter, .local)
+        XCTAssertEqual(localState.displayedItems.map(\.matchID), ["local-only", "remote-1"])
+        XCTAssertTrue(localState.displayedItems.allSatisfy { $0.source == .local })
+
+        viewModel.selectFilter(.saved)
+        guard case let .content(.authenticated(savedState)) = viewModel.state else {
+            return XCTFail("Expected saved history content")
+        }
+        XCTAssertEqual(savedState.selectedFilter, .saved)
+        XCTAssertEqual(savedState.displayedItems.map(\.matchID), ["remote-2", "local-only"])
+
+        viewModel.toggleSaved(matchID: "remote-3")
+        guard case let .content(.authenticated(updatedSavedState)) = viewModel.state else {
+            return XCTFail("Expected updated saved history content")
+        }
+        XCTAssertEqual(updatedSavedState.displayedItems.map(\.matchID), ["remote-3", "remote-2", "local-only"])
+
+        requestLock.lock()
+        let finalRequestCount = historyRequestCount
+        requestLock.unlock()
+        XCTAssertEqual(finalRequestCount, 1)
     }
 
     func testGroupPublicRequestOmitsAuthorizationHeader() async throws {
@@ -2013,18 +2994,22 @@ final class InhouseMakeriOSTests: XCTestCase {
                 requestLock.unlock()
 
                 switch (request.httpMethod, request.url?.path) {
-                case ("GET", "/groups/active-group"):
+                case ("GET", "/groups"):
                     let payload = try JSONEncoder.app.encode(
-                        GroupSummaryDTO(
-                            id: "active-group",
-                            name: "남은 그룹",
-                            description: nil,
-                            visibility: .private,
-                            joinPolicy: .inviteOnly,
-                            tags: ["서울"],
-                            ownerUserId: "u1",
-                            memberCount: 5,
-                            recentMatches: 0
+                        GroupSummaryListDTO(
+                            items: [
+                                GroupSummaryDTO(
+                                    id: "active-group",
+                                    name: "남은 그룹",
+                                    description: nil,
+                                    visibility: .private,
+                                    joinPolicy: .inviteOnly,
+                                    tags: ["서울"],
+                                    ownerUserId: "u1",
+                                    memberCount: 5,
+                                    recentMatches: 0
+                                ),
+                            ]
                         )
                     )
                     return (200, payload)
@@ -2068,8 +3053,219 @@ final class InhouseMakeriOSTests: XCTestCase {
         requestLock.unlock()
 
         XCTAssertFalse(capturedPaths.contains("/groups/deleted-group"))
-        XCTAssertTrue(capturedPaths.contains("/groups/active-group"))
+        XCTAssertTrue(capturedPaths.contains("/groups"))
         XCTAssertEqual(localStore.storedGroupIDs, ["active-group"])
+    }
+
+    @MainActor
+    func testHomeViewModelClearsStaleUITestHomeContextAndKeepsContent() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.stale-ui-seed.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "group-ui-test", name: "오래된 UI 테스트 그룹")
+        localStore.trackGroup(id: "active-group", name: "남은 그룹")
+        localStore.trackMatch(
+            RecentMatchContext(
+                matchID: "match-ui-test",
+                groupID: "group-ui-test",
+                groupName: "오래된 UI 테스트 그룹",
+                createdAt: Date(timeIntervalSince1970: 1_713_484_800)
+            )
+        )
+
+        let requestLock = NSLock()
+        var requestedPaths: [String] = []
+        let historyDate = Date(timeIntervalSince1970: 1_776_643_200)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                requestLock.lock()
+                requestedPaths.append(request.url?.path ?? "nil")
+                requestLock.unlock()
+
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryListDTO(
+                            items: [
+                                GroupSummaryDTO(
+                                    id: "active-group",
+                                    name: "남은 그룹",
+                                    description: nil,
+                                    visibility: .private,
+                                    joinPolicy: .inviteOnly,
+                                    tags: ["서울"],
+                                    ownerUserId: "u1",
+                                    memberCount: 5,
+                                    recentMatches: 0
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/recruiting-posts"):
+                    return (200, try JSONEncoder.app.encode(RecruitPostListDTO(items: [])))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [])))
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(
+                        HistoryResponseDTO(
+                            items: [
+                                HistoryItemDTO(
+                                    matchId: "match-1",
+                                    scheduledAt: historyDate,
+                                    role: .mid,
+                                    teamSide: .blue,
+                                    result: "WIN",
+                                    kda: "3/1/5",
+                                    deltaMmr: 12
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test_ui_seed_cleanup")
+
+        requestLock.lock()
+        let capturedPaths = requestedPaths
+        requestLock.unlock()
+
+        XCTAssertFalse(capturedPaths.contains("/matches/match-ui-test"))
+        XCTAssertEqual(localStore.storedGroupIDs, ["active-group"])
+        XCTAssertTrue(localStore.recentMatches.isEmpty)
+
+        switch viewModel.state {
+        case let .content(.authenticated(snapshot)):
+            XCTAssertEqual(snapshot.groups.map(\.id), ["active-group"])
+            XCTAssertEqual(snapshot.trackedGroupsState, .partial)
+            XCTAssertEqual(snapshot.currentMatchState, .partial)
+            XCTAssertNil(snapshot.currentMatch)
+            XCTAssertEqual(snapshot.latestHistory?.matchID, "match-1")
+        default:
+            XCTFail("Expected authenticated home content")
+        }
+    }
+
+    @MainActor
+    func testHomeViewModelClearsMissingCurrentMatchAndKeepsContent() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.missing-current-match.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "active-group", name: "남은 그룹")
+        localStore.trackMatch(
+            RecentMatchContext(
+                matchID: "missing-match",
+                groupID: "active-group",
+                groupName: "남은 그룹",
+                createdAt: Date(timeIntervalSince1970: 1_713_484_800)
+            )
+        )
+
+        let historyDate = Date(timeIntervalSince1970: 1_776_643_200)
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryListDTO(
+                            items: [
+                                GroupSummaryDTO(
+                                    id: "active-group",
+                                    name: "남은 그룹",
+                                    description: nil,
+                                    visibility: .private,
+                                    joinPolicy: .inviteOnly,
+                                    tags: ["서울"],
+                                    ownerUserId: "u1",
+                                    memberCount: 5,
+                                    recentMatches: 0
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/matches/missing-match"):
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "MATCH_NOT_FOUND",
+                            message: "Match not found."
+                        )
+                    )
+                case ("GET", "/recruiting-posts"):
+                    return (200, try JSONEncoder.app.encode(RecruitPostListDTO(items: [])))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [])))
+                case ("GET", "/users/u1/inhouse-history"):
+                    let payload = try JSONEncoder.app.encode(
+                        HistoryResponseDTO(
+                            items: [
+                                HistoryItemDTO(
+                                    matchId: "match-1",
+                                    scheduledAt: historyDate,
+                                    role: .mid,
+                                    teamSide: .blue,
+                                    result: "WIN",
+                                    kda: "3/1/5",
+                                    deltaMmr: 12
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test_missing_current_match")
+
+        XCTAssertTrue(localStore.recentMatches.isEmpty)
+
+        switch viewModel.state {
+        case let .content(.authenticated(snapshot)):
+            XCTAssertEqual(snapshot.groups.map(\.id), ["active-group"])
+            XCTAssertEqual(snapshot.trackedGroupsState, .loaded)
+            XCTAssertEqual(snapshot.currentMatchState, .partial)
+            XCTAssertNil(snapshot.currentMatch)
+            XCTAssertEqual(snapshot.latestHistory?.matchID, "match-1")
+        default:
+            XCTFail("Expected authenticated home content")
+        }
     }
 
     @MainActor
@@ -3148,10 +4344,37 @@ final class InhouseMakeriOSTests: XCTestCase {
                                 message: "You must be a group admin to perform this action."
                             )
                         )
+                    case 4:
+                        return (
+                            404,
+                            self.makeServerErrorData(
+                                statusCode: 404,
+                                code: "GROUP_UNAVAILABLE",
+                                message: "Group is unavailable."
+                            )
+                        )
+                    case 5:
+                        return (
+                            500,
+                            self.makeServerErrorData(
+                                statusCode: 500,
+                                code: "FK_CONSTRAINT_FAILED",
+                                message: "Foreign key constraint failed."
+                            )
+                        )
                     default:
                         XCTFail("Unexpected invite attempt \(currentAttempt)")
                         return (500, Data())
                     }
+                case (_, let path?) where path.hasSuffix("/power-profile"):
+                    return (
+                        404,
+                        self.makeServerErrorData(
+                            statusCode: 404,
+                            code: "RESOURCE_NOT_FOUND",
+                            message: "Power profile not found."
+                        )
+                    )
                 default:
                     XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
                     return (500, Data())
@@ -3198,6 +4421,28 @@ final class InhouseMakeriOSTests: XCTestCase {
                 profileImageURL: nil
             )
         )
+        let unavailableGroupResult = await viewModel.inviteMember(
+            GroupMemberInviteUser(
+                id: "group-missing-user",
+                nickname: "GroupMissing",
+                primaryPosition: nil,
+                secondaryPosition: nil,
+                recentPower: nil,
+                riotDisplayName: nil,
+                profileImageURL: nil
+            )
+        )
+        let serverFailureResult = await viewModel.inviteMember(
+            GroupMemberInviteUser(
+                id: "server-error-user",
+                nickname: "ServerError",
+                primaryPosition: nil,
+                secondaryPosition: nil,
+                recentPower: nil,
+                riotDisplayName: nil,
+                profileImageURL: nil
+            )
+        )
 
         guard case let .failure(notFoundMessage) = notFoundResult else {
             return XCTFail("Expected not-found failure")
@@ -3208,10 +4453,50 @@ final class InhouseMakeriOSTests: XCTestCase {
         guard case let .failure(forbiddenMessage) = forbiddenResult else {
             return XCTFail("Expected forbidden failure")
         }
+        guard case let .failure(unavailableGroupMessage) = unavailableGroupResult else {
+            return XCTFail("Expected unavailable-group failure")
+        }
+        guard case let .failure(serverFailureMessage) = serverFailureResult else {
+            return XCTFail("Expected server failure")
+        }
 
         XCTAssertEqual(notFoundMessage, "추가할 사용자를 찾을 수 없어요.")
         XCTAssertEqual(duplicateMessage, "이미 그룹에 참여 중인 사용자예요.")
         XCTAssertEqual(forbiddenMessage, "이 그룹의 멤버를 추가할 권한이 없어요.")
+        XCTAssertEqual(unavailableGroupMessage, "더 이상 접근할 수 없는 그룹입니다.")
+        XCTAssertEqual(serverFailureMessage, "팀원 추가에 실패했어요. 잠시 후 다시 시도해 주세요.")
+    }
+
+    @MainActor
+    func testGroupMemberInviteViewModelMarksCurrentUserAsSelfEvenIfAlreadyMember() {
+        let suiteName = "InhouseMakeriOSTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        let localStore = AppLocalStore(defaults: defaults)
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            localStore: localStore
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+
+        let viewModel = GroupMemberInviteViewModel(
+            session: session,
+            currentUserID: "u1",
+            existingMemberUserIDs: ["u1", "u2"],
+            permission: GroupInvitePermissionState(isEnabled: true, note: "검색 후 팀원을 추가할 수 있어요.")
+        )
+
+        let me = GroupMemberInviteUser(
+            id: "u1",
+            nickname: "tester",
+            primaryPosition: .mid,
+            secondaryPosition: .top,
+            recentPower: 80,
+            riotDisplayName: "tester#KR1",
+            profileImageURL: nil
+        )
+
+        XCTAssertEqual(viewModel.availability(for: me), .selfUser)
     }
 
     @MainActor
@@ -3282,6 +4567,189 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testMatchLobbyFeatureSelectAllEligibleMembersKeepsExistingPlayersExcluded() async {
+        let group = GroupSummary(
+            id: "g1",
+            name: "테스트 그룹",
+            description: nil,
+            visibility: .private,
+            joinPolicy: .inviteOnly,
+            tags: ["서울"],
+            ownerUserID: "u1",
+            memberCount: 3,
+            recentMatches: 0
+        )
+        let snapshot = MatchLobbySnapshot(
+            match: Match(
+                id: "m1",
+                groupID: "g1",
+                status: .recruiting,
+                scheduledAt: nil,
+                balanceMode: nil,
+                selectedCandidateNo: nil,
+                players: [
+                    MatchPlayer(
+                        id: "mp-1",
+                        userID: "u1",
+                        nickname: "tester",
+                        teamSide: nil,
+                        assignedRole: .mid,
+                        participationStatus: .accepted,
+                        isCaptain: false
+                    )
+                ],
+                candidates: []
+            ),
+            group: group,
+            members: [
+                GroupMember(id: "gm-1", userID: "u1", nickname: "tester", role: .owner),
+                GroupMember(id: "gm-2", userID: "u2", nickname: "Alpha", role: .member),
+                GroupMember(id: "gm-3", userID: "u3", nickname: "Beta", role: .member),
+            ],
+            powerProfiles: [:]
+        )
+
+        let store = TestStore(initialState: MatchLobbyFeature.State(groupID: "g1", matchID: "m1")) {
+            MatchLobbyFeature()
+        }
+
+        await store.send(.loadResponse(.success(snapshot))) {
+            $0.loadState = .content(snapshot)
+        }
+
+        await store.send(.selectAllEligibleMembersTapped) {
+            $0.selectedMemberIDs = ["u2", "u3"]
+        }
+
+        await store.send(.clearSelectedMembersTapped) {
+            $0.selectedMemberIDs = []
+        }
+    }
+
+    @MainActor
+    func testMatchLobbyFeatureReadinessRequiresTenParticipantsAndPositions() async {
+        let roles: [Position] = [.top, .jungle, .mid, .adc, .support]
+        let players: [MatchPlayer] = (1...10).map { index in
+            let assignedRole: Position? = index == 10 ? nil : roles[(index - 1) % roles.count]
+            return MatchPlayer(
+                id: "mp-\(index)",
+                userID: "u\(index)",
+                nickname: "P\(index)",
+                teamSide: nil,
+                assignedRole: assignedRole,
+                participationStatus: .accepted,
+                isCaptain: index == 1
+            )
+        }
+        let snapshot = MatchLobbySnapshot(
+            match: Match(
+                id: "m1",
+                groupID: "g1",
+                status: .recruiting,
+                scheduledAt: nil,
+                balanceMode: nil,
+                selectedCandidateNo: nil,
+                players: players,
+                candidates: []
+            ),
+            group: GroupSummary(
+                id: "g1",
+                name: "테스트 그룹",
+                description: nil,
+                visibility: .private,
+                joinPolicy: .inviteOnly,
+                tags: ["서울"],
+                ownerUserID: "u1",
+                memberCount: 10,
+                recentMatches: 0
+            ),
+            members: [],
+            powerProfiles: [:]
+        )
+
+        var state = MatchLobbyFeature.State(groupID: "g1", matchID: "m1")
+        state.loadState = .content(snapshot)
+
+        XCTAssertEqual(state.balanceReadiness.participantCount, 10)
+        XCTAssertEqual(state.balanceReadiness.missingParticipantCount, 0)
+        XCTAssertEqual(state.balanceReadiness.missingPositionCount, 1)
+        XCTAssertFalse(state.balanceReadiness.canAutoBalance)
+    }
+
+    @MainActor
+    func testMatchLobbyFeatureFallbackProfilesEnableAutoBalanceReadiness() async {
+        let players: [MatchPlayer] = (1...10).map { index in
+            MatchPlayer(
+                id: "mp-\(index)",
+                userID: "u\(index)",
+                nickname: "P\(index)",
+                teamSide: nil,
+                assignedRole: nil,
+                participationStatus: .accepted,
+                isCaptain: index == 1
+            )
+        }
+        let powerProfiles = Dictionary(uniqueKeysWithValues: (1...10).map { index -> (String, PowerProfile) in
+            let primary: Position = [.top, .jungle, .mid, .adc, .support][(index - 1) % 5]
+            let secondary: Position = [.mid, .top, .adc, .support, .jungle][(index - 1) % 5]
+            return (
+                "u\(index)",
+                PowerProfile(
+                    userID: "u\(index)",
+                    overallPower: Double(70 + index),
+                    lanePower: [primary: Double(70 + index), secondary: Double(65 + index)],
+                    primaryPosition: primary,
+                    secondaryPosition: secondary,
+                    stability: Double(70 + index),
+                    carry: Double(70 + index),
+                    teamContribution: Double(70 + index),
+                    laneInfluence: Double(70 + index),
+                    basePower: Double(68 + index),
+                    formScore: Double(69 + index),
+                    inhouseMMR: Double(900 + index),
+                    inhouseConfidence: 0.8,
+                    version: "test",
+                    calculatedAt: Date()
+                )
+            )
+        })
+        let resolvedMatch = MatchLobbyFeature.effectiveMatch(match: Match(
+            id: "m1",
+            groupID: "g1",
+            status: .recruiting,
+            scheduledAt: nil,
+            balanceMode: nil,
+            selectedCandidateNo: nil,
+            players: players,
+            candidates: []
+        ), powerProfiles: powerProfiles)
+        let snapshot = MatchLobbySnapshot(
+            match: resolvedMatch,
+            group: GroupSummary(
+                id: "g1",
+                name: "테스트 그룹",
+                description: nil,
+                visibility: .private,
+                joinPolicy: .inviteOnly,
+                tags: ["서울"],
+                ownerUserID: "u1",
+                memberCount: 10,
+                recentMatches: 0
+            ),
+            members: [],
+            powerProfiles: powerProfiles
+        )
+
+        var state = MatchLobbyFeature.State(groupID: "g1", matchID: "m1")
+        state.loadState = .content(snapshot)
+
+        XCTAssertEqual(state.balanceReadiness.missingPositionCount, 0)
+        XCTAssertTrue(state.balanceReadiness.canAutoBalance)
+        XCTAssertEqual(snapshot.match.players.first?.assignedRole, .top)
+        XCTAssertEqual(snapshot.powerProfiles["u1"]?.overallPower, 71)
+    }
+
+    @MainActor
     func testTeamBalanceFeatureAuthRequiredQueuesRetryIntent() async {
         let store = TestStore(initialState: TeamBalanceFeature.State(groupID: "g1", matchID: "m1")) {
             TeamBalanceFeature()
@@ -3294,6 +4762,51 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testTeamBalanceFeatureShowsEmptyReasonWhenNoCandidatesReturned() async {
+        let roles: [Position] = [.top, .jungle, .mid, .adc, .support]
+        let match = Match(
+            id: "m1",
+            groupID: "g1",
+            status: .locked,
+            scheduledAt: nil,
+            balanceMode: nil,
+            selectedCandidateNo: nil,
+            players: (1...10).map { index in
+                let assignedRole = roles[(index - 1) % roles.count]
+                return MatchPlayer(
+                    id: "mp-\(index)",
+                    userID: "u\(index)",
+                    nickname: "P\(index)",
+                    teamSide: nil,
+                    assignedRole: assignedRole,
+                    participationStatus: .accepted,
+                    isCaptain: index == 1
+                )
+            },
+            candidates: []
+        )
+        let snapshot = TeamBalanceSnapshot(match: match, candidates: [])
+        let payload = TeamBalanceFeature.LoadPayload(
+            snapshot: snapshot,
+            groupName: "테스트 그룹",
+            preferredPositions: [:]
+        )
+        let expectedMessage = "추천 조합이 없습니다.\n서버가 추천 조합을 반환하지 않았어요. 다시 시도하거나 로비에서 참가자 구성을 확인해 주세요."
+
+        let store = TestStore(initialState: TeamBalanceFeature.State(groupID: "g1", matchID: "m1")) {
+            TeamBalanceFeature()
+        }
+
+        await store.send(.loadResponse(.success(payload))) {
+            $0.groupName = "테스트 그룹"
+            $0.preferredPositions = [:]
+            $0.emptyReasonMessage = expectedMessage
+            $0.loadState = .empty(expectedMessage)
+            $0.selectedMode = .balanced
+        }
+    }
+
+    @MainActor
     func testMatchResultFeatureAuthRequiredQueuesRetryIntent() async {
         let store = TestStore(initialState: MatchResultFeature.State(matchID: "m1")) {
             MatchResultFeature()
@@ -3302,6 +4815,79 @@ final class InhouseMakeriOSTests: XCTestCase {
         await store.send(.submitResponse(.failure(.authRequiredFallback()))) {
             $0.actionState = .idle
             $0.pendingProtectedAction = .submit
+        }
+    }
+
+    @MainActor
+    func testMatchResultFeatureValidationGuidesMVPAndLaneMissingStates() async {
+        let snapshot = MatchDetailSnapshot(
+            match: Match(
+                id: "m1",
+                groupID: "g1",
+                status: .resultPending,
+                scheduledAt: nil,
+                balanceMode: .balanced,
+                selectedCandidateNo: 1,
+                players: [
+                    MatchPlayer(
+                        id: "mp-1",
+                        userID: "u1",
+                        nickname: "Blue",
+                        teamSide: .blue,
+                        assignedRole: .mid,
+                        participationStatus: .accepted,
+                        isCaptain: true
+                    ),
+                    MatchPlayer(
+                        id: "mp-2",
+                        userID: "u2",
+                        nickname: "Red",
+                        teamSide: .red,
+                        assignedRole: .mid,
+                        participationStatus: .accepted,
+                        isCaptain: false
+                    ),
+                ],
+                candidates: []
+            ),
+            result: nil,
+            cachedMetadata: nil
+        )
+
+        let store = TestStore(initialState: MatchResultFeature.State(matchID: "m1")) {
+            MatchResultFeature()
+        }
+
+        await store.send(.loadResponse(.success(snapshot))) {
+            $0.loadState = .content(snapshot)
+            $0.winningTeam = .blue
+            $0.selectedMVPUserID = nil
+            $0.laneResults = [:]
+            $0.selectedLaneResultKeys = []
+            $0.balanceFeeling = 5
+            $0.kdaInputs = [
+                "u1": MatchResultFeature.State.KDAInput(),
+                "u2": MatchResultFeature.State.KDAInput(),
+            ]
+        }
+
+        await store.send(.submitTapped) {
+            $0.validationMessage = "MVP를 선택해 주세요."
+            $0.highlightedValidationSection = .mvp
+            $0.actionState = .failure("MVP를 선택해 주세요.")
+        }
+
+        await store.send(.mvpSelected("u1")) {
+            $0.selectedMVPUserID = "u1"
+            $0.validationMessage = nil
+            $0.highlightedValidationSection = nil
+        }
+
+        await store.send(.submitTapped) {
+            let message = "라인별 승패를 모두 선택해 주세요. 누락: TOP, JGL, MID, BOT"
+            $0.validationMessage = message
+            $0.highlightedValidationSection = .lanes
+            $0.actionState = .failure(message)
         }
     }
 
@@ -3499,6 +5085,628 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(succeeded.syncStatusTimestamp, now)
     }
 
+    @MainActor
+    func testRiotAccountsLoadMapsServerErrorToServerStateMessage() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    return (
+                        500,
+                        self.makeServerErrorData(
+                            statusCode: 500,
+                            code: "INTERNAL_SERVER_ERROR",
+                            message: "The column `riot_accounts.sync_phase` does not exist in the current database."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        await viewModel.load(force: true, source: "test_server_error")
+
+        guard case let .error(error) = viewModel.state else {
+            return XCTFail("Expected error state")
+        }
+        XCTAssertEqual(error.title, "Riot ID 목록을 불러오는 중 문제가 발생했어요.")
+        XCTAssertEqual(error.message, "서버 설정 또는 동기화 상태에 문제가 있을 수 있어요. 잠시 후 다시 시도해 주세요.")
+        XCTAssertEqual(error.code, "INTERNAL_SERVER_ERROR")
+        XCTAssertEqual(error.statusCode, 500)
+        XCTAssertEqual(error.endpoint, "/riot-accounts")
+    }
+
+    @MainActor
+    func testRiotAccountsLoadMapsOfflineNetworkErrorToNetworkStateMessage() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    throw URLError(.notConnectedToInternet)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        await viewModel.load(force: true, source: "test_network_error")
+
+        guard case let .error(error) = viewModel.state else {
+            return XCTFail("Expected error state")
+        }
+        XCTAssertEqual(error.title, "네트워크 연결을 확인해 주세요.")
+        XCTAssertEqual(error.message, "인터넷 연결 상태를 확인한 뒤 다시 시도해 주세요.")
+        XCTAssertEqual(error.code, "NETWORK_OFFLINE")
+        XCTAssertEqual(error.endpoint, "/riot-accounts")
+    }
+
+    @MainActor
+    func testRiotAccountsLoadMapsEmptyListToEmptyState() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(RiotAccountListDTO(items: []))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        await viewModel.load(force: true, source: "test_empty")
+
+        guard case let .empty(message) = viewModel.state else {
+            return XCTFail("Expected empty state")
+        }
+        XCTAssertEqual(message, "연결된 Riot ID가 없어요.")
+    }
+
+    @MainActor
+    func testRiotAccountsLoadDropsDuplicateFetchWhileRequestIsInFlight() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let requestStarted = expectation(description: "riot accounts request started")
+        let releaseRequest = DispatchSemaphore(value: 0)
+        let requestLock = NSLock()
+        var requestCount = 0
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    requestLock.lock()
+                    requestCount += 1
+                    requestLock.unlock()
+                    requestStarted.fulfill()
+                    _ = releaseRequest.wait(timeout: .now() + 2)
+                    let payload = try JSONEncoder.app.encode(RiotAccountListDTO(items: []))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        let firstLoad = Task { await viewModel.load(force: true, source: "first") }
+        await fulfillment(of: [requestStarted], timeout: 1)
+
+        await viewModel.load(source: "second")
+        releaseRequest.signal()
+        await firstLoad.value
+
+        requestLock.lock()
+        let finalRequestCount = requestCount
+        requestLock.unlock()
+
+        XCTAssertEqual(finalRequestCount, 1)
+        guard case let .empty(message) = viewModel.state else {
+            return XCTFail("Expected empty state")
+        }
+        XCTAssertEqual(message, "연결된 Riot ID가 없어요.")
+    }
+
+    @MainActor
+    func testRiotAccountsLoadReusesSessionErrorStateWithoutRefetchOnNewViewModel() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let requestLock = NSLock()
+        var requestCount = 0
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    requestLock.lock()
+                    requestCount += 1
+                    requestLock.unlock()
+                    return (
+                        500,
+                        self.makeServerErrorData(
+                            statusCode: 500,
+                            code: "INTERNAL_SERVER_ERROR",
+                            message: "The column `riot_accounts.sync_phase` does not exist in the current database."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+
+        let firstViewModel = RiotAccountsViewModel(session: session)
+        await firstViewModel.load(force: true, source: "initial")
+
+        let secondViewModel = RiotAccountsViewModel(session: session)
+        await secondViewModel.load(source: "reenter")
+
+        requestLock.lock()
+        let finalRequestCount = requestCount
+        requestLock.unlock()
+
+        XCTAssertEqual(finalRequestCount, 1)
+        guard case let .error(error) = secondViewModel.state else {
+            return XCTFail("Expected reused error state")
+        }
+        XCTAssertEqual(error.title, "Riot ID 목록을 불러오는 중 문제가 발생했어요.")
+    }
+
+    @MainActor
+    func testRiotAccountsLoadRetryKeepsSameErrorStateWithoutRepublishing() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let requestLock = NSLock()
+        var requestCount = 0
+        let noStateRepublish = expectation(description: "no state republish for same error")
+        noStateRepublish.isInverted = true
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    requestLock.lock()
+                    requestCount += 1
+                    requestLock.unlock()
+                    return (
+                        500,
+                        self.makeServerErrorData(
+                            statusCode: 500,
+                            code: "INTERNAL_SERVER_ERROR",
+                            message: "The column `riot_accounts.sync_phase` does not exist in the current database."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        await viewModel.load(force: true, source: "initial")
+
+        let cancellable = viewModel.$state
+            .dropFirst()
+            .sink { _ in
+                noStateRepublish.fulfill()
+            }
+
+        await viewModel.load(force: true, source: "retry")
+        await fulfillment(of: [noStateRepublish], timeout: 0.3)
+
+        requestLock.lock()
+        let finalRequestCount = requestCount
+        requestLock.unlock()
+
+        XCTAssertEqual(finalRequestCount, 2)
+        guard case let .error(error) = viewModel.state else {
+            return XCTFail("Expected error state")
+        }
+        XCTAssertEqual(error.title, "Riot ID 목록을 불러오는 중 문제가 발생했어요.")
+        withExtendedLifetime(cancellable) {}
+    }
+
+    @MainActor
+    func testRiotAccountsLoadRetryRecoversFromServerErrorToLoadedState() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let requestLock = NSLock()
+        var requestCount = 0
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    requestLock.lock()
+                    requestCount += 1
+                    let currentRequestCount = requestCount
+                    requestLock.unlock()
+
+                    if currentRequestCount == 1 {
+                        return (
+                            500,
+                            self.makeServerErrorData(
+                                statusCode: 500,
+                                code: "INTERNAL_SERVER_ERROR",
+                                message: "The column `riot_accounts.sync_phase` does not exist in the current database."
+                            )
+                        )
+                    }
+
+                    let payload = try JSONEncoder.app.encode(
+                        RiotAccountListDTO(items: [self.makeRiotAccountDTO(syncStatus: .succeeded)])
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        await viewModel.load(force: true, source: "initial")
+        guard case .error = viewModel.state else {
+            return XCTFail("Expected initial error state")
+        }
+
+        await viewModel.load(force: true, source: "retry_after_fix")
+
+        requestLock.lock()
+        let finalRequestCount = requestCount
+        requestLock.unlock()
+
+        XCTAssertEqual(finalRequestCount, 2)
+        guard case let .content(snapshot) = viewModel.state else {
+            return XCTFail("Expected loaded content state")
+        }
+        XCTAssertEqual(snapshot.accounts.count, 1)
+    }
+
+    @MainActor
+    func testRiotAccountsPollingSkipsDuplicateStartAndStopsAtSucceededState() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let requestLock = NSLock()
+        let firstSyncStatusRequestStarted = expectation(description: "first sync-status request started")
+        let syncCompleted = expectation(description: "sync completed")
+        let releaseFirstSyncStatusRequest = DispatchSemaphore(value: 0)
+        var didFulfillCompletion = false
+        var syncStatusRequestCount = 0
+        let requestedAt = Date(timeIntervalSince1970: 1_713_081_600)
+        let succeededAt = requestedAt.addingTimeInterval(45)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(
+                        RiotAccountListDTO(items: [
+                            self.makeRiotAccountDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt),
+                        ])
+                    )
+                    return (200, payload)
+                case ("GET", "/riot-accounts/ra1/sync-status"):
+                    requestLock.lock()
+                    syncStatusRequestCount += 1
+                    let currentCount = syncStatusRequestCount
+                    requestLock.unlock()
+
+                    if currentCount == 1 {
+                        firstSyncStatusRequestStarted.fulfill()
+                        _ = releaseFirstSyncStatusRequest.wait(timeout: .now() + 2)
+                        let payload = try JSONEncoder.app.encode(
+                            self.makeRiotSyncStatusDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt)
+                        )
+                        return (200, payload)
+                    }
+
+                    let payload = try JSONEncoder.app.encode(
+                        self.makeRiotSyncStatusDTO(
+                            syncStatus: .succeeded,
+                            lastSyncRequestedAt: requestedAt,
+                            lastSyncSucceededAt: succeededAt
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+        let cancellable = viewModel.$state.sink { state in
+            guard
+                !didFulfillCompletion,
+                case let .content(snapshot) = state,
+                snapshot.accounts.first?.syncStatus == .succeeded
+            else { return }
+            didFulfillCompletion = true
+            syncCompleted.fulfill()
+        }
+
+        viewModel.handleViewAppear()
+        await viewModel.load(force: true)
+
+        await fulfillment(of: [firstSyncStatusRequestStarted], timeout: 1)
+        viewModel.handleViewAppear()
+        try await Task.sleep(nanoseconds: 200_000_000)
+
+        requestLock.lock()
+        let requestsWhileFirstWasInFlight = syncStatusRequestCount
+        requestLock.unlock()
+        XCTAssertEqual(requestsWhileFirstWasInFlight, 1)
+
+        releaseFirstSyncStatusRequest.signal()
+        await fulfillment(of: [syncCompleted], timeout: 4)
+
+        requestLock.lock()
+        let finalRequestCount = syncStatusRequestCount
+        requestLock.unlock()
+
+        XCTAssertEqual(finalRequestCount, 2)
+        XCTAssertEqual(viewModel.state.value?.accounts.first?.syncStatus, .succeeded)
+        XCTAssertTrue(viewModel.syncInProgressIDs.isEmpty)
+        XCTAssertEqual(session.riotLinkedDataRevision, 1)
+        withExtendedLifetime(cancellable) {}
+    }
+
+    @MainActor
+    func testRiotAccountsPollingDropsRepeatedRunningResponsesWithoutRepublishingState() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let repeatedRunningResponseReceived = expectation(description: "repeated running response received")
+        repeatedRunningResponseReceived.assertForOverFulfill = false
+        let noStateRepublish = expectation(description: "no state republish")
+        noStateRepublish.isInverted = true
+        let requestLock = NSLock()
+        var syncStatusRequestCount = 0
+        let requestedAt = Date(timeIntervalSince1970: 1_713_081_600)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(
+                        RiotAccountListDTO(items: [
+                            self.makeRiotAccountDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt),
+                        ])
+                    )
+                    return (200, payload)
+                case ("GET", "/riot-accounts/ra1/sync-status"):
+                    requestLock.lock()
+                    syncStatusRequestCount += 1
+                    let currentCount = syncStatusRequestCount
+                    requestLock.unlock()
+
+                    if currentCount >= 2 {
+                        repeatedRunningResponseReceived.fulfill()
+                    }
+
+                    let payload = try JSONEncoder.app.encode(
+                        self.makeRiotSyncStatusDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt)
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        viewModel.handleViewAppear()
+        await viewModel.load(force: true)
+
+        let cancellable = viewModel.$state
+            .dropFirst()
+            .sink { _ in
+                noStateRepublish.fulfill()
+            }
+
+        await fulfillment(of: [repeatedRunningResponseReceived, noStateRepublish], timeout: 3)
+
+        XCTAssertEqual(viewModel.state.value?.accounts.first?.syncStatus, .running)
+        XCTAssertEqual(session.riotLinkedDataRevision, 0)
+        viewModel.handleViewDisappear()
+        withExtendedLifetime(cancellable) {}
+    }
+
+    @MainActor
+    func testRiotAccountsPollingPausesInBackgroundAndResumesOnActive() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let firstSyncStatusResponseReceived = expectation(description: "first sync-status response received")
+        let resumedSyncStatusResponseReceived = expectation(description: "resumed sync-status response received")
+        let requestLock = NSLock()
+        var syncStatusRequestCount = 0
+        let requestedAt = Date(timeIntervalSince1970: 1_713_081_600)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(
+                        RiotAccountListDTO(items: [
+                            self.makeRiotAccountDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt),
+                        ])
+                    )
+                    return (200, payload)
+                case ("GET", "/riot-accounts/ra1/sync-status"):
+                    requestLock.lock()
+                    syncStatusRequestCount += 1
+                    let currentCount = syncStatusRequestCount
+                    requestLock.unlock()
+
+                    if currentCount == 1 {
+                        firstSyncStatusResponseReceived.fulfill()
+                    } else if currentCount == 2 {
+                        resumedSyncStatusResponseReceived.fulfill()
+                    }
+
+                    let payload = try JSONEncoder.app.encode(
+                        self.makeRiotSyncStatusDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt)
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+
+        viewModel.handleViewAppear()
+        await viewModel.load(force: true)
+        await fulfillment(of: [firstSyncStatusResponseReceived], timeout: 1)
+
+        viewModel.handleScenePhaseChange(.background)
+        try await Task.sleep(nanoseconds: 1_700_000_000)
+
+        requestLock.lock()
+        let pausedRequestCount = syncStatusRequestCount
+        requestLock.unlock()
+        XCTAssertEqual(pausedRequestCount, 1)
+
+        viewModel.handleScenePhaseChange(.active)
+        await fulfillment(of: [resumedSyncStatusResponseReceived], timeout: 1)
+
+        requestLock.lock()
+        let resumedRequestCount = syncStatusRequestCount
+        requestLock.unlock()
+        XCTAssertEqual(resumedRequestCount, 2)
+        viewModel.handleViewDisappear()
+    }
+
+    @MainActor
+    func testRiotAccountsPollingStopsAtFailedState() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+
+        let syncFailed = expectation(description: "sync failed")
+        var didFulfillFailure = false
+        let requestedAt = Date(timeIntervalSince1970: 1_713_081_600)
+        let failedAt = requestedAt.addingTimeInterval(20)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/riot-accounts"):
+                    let payload = try JSONEncoder.app.encode(
+                        RiotAccountListDTO(items: [
+                            self.makeRiotAccountDTO(syncStatus: .running, lastSyncRequestedAt: requestedAt),
+                        ])
+                    )
+                    return (200, payload)
+                case ("GET", "/riot-accounts/ra1/sync-status"):
+                    let payload = try JSONEncoder.app.encode(
+                        self.makeRiotSyncStatusDTO(
+                            syncStatus: .failed,
+                            lastSyncRequestedAt: requestedAt,
+                            lastSyncFailedAt: failedAt,
+                            lastSyncErrorCode: "RIOT_NETWORK_ERROR",
+                            lastSyncErrorMessage: "Riot API timeout"
+                        )
+                    )
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RiotAccountsViewModel(session: session)
+        let cancellable = viewModel.$state.sink { state in
+            guard
+                !didFulfillFailure,
+                case let .content(snapshot) = state,
+                snapshot.accounts.first?.syncStatus == .failed
+            else { return }
+            didFulfillFailure = true
+            syncFailed.fulfill()
+        }
+
+        viewModel.handleViewAppear()
+        await viewModel.load(force: true)
+        await fulfillment(of: [syncFailed], timeout: 1)
+
+        let failedAccount = try XCTUnwrap(viewModel.state.value?.accounts.first)
+        XCTAssertEqual(failedAccount.syncStatus, .failed)
+        XCTAssertEqual(failedAccount.syncStatusSummary, "Riot API timeout")
+        XCTAssertTrue(viewModel.syncInProgressIDs.isEmpty)
+        XCTAssertEqual(session.riotLinkedDataRevision, 0)
+        withExtendedLifetime(cancellable) {}
+    }
+
     private func makeTokens() -> AuthTokens {
         AuthTokens(
             user: AuthUser(id: "u1", email: "user@example.com", nickname: "tester"),
@@ -3562,6 +5770,30 @@ final class InhouseMakeriOSTests: XCTestCase {
         )
     }
 
+    private func makeTopChampion(
+        championKey: String,
+        championName: String,
+        games: Int,
+        wins: Int,
+        winRate: Double,
+        kda: Double?
+    ) -> ProfileTopChampion {
+        ProfileTopChampion(
+            championId: nil,
+            championKey: championKey,
+            championName: championName,
+            games: games,
+            wins: wins,
+            losses: max(games - wins, 0),
+            winRate: winRate,
+            kills: 0,
+            deaths: 0,
+            assists: 0,
+            kda: kda,
+            lastPlayedAt: nil
+        )
+    }
+
     private func makeRiotAccount(
         syncStatus: RiotSyncStatus,
         lastSyncErrorCode: String? = nil,
@@ -3586,6 +5818,54 @@ final class InhouseMakeriOSTests: XCTestCase {
             lastSyncErrorCode: lastSyncErrorCode,
             lastSyncErrorMessage: lastSyncErrorMessage,
             lastSyncedAt: lastSyncedAt
+        )
+    }
+
+    private func makeRiotAccountDTO(
+        id: String = "ra1",
+        syncStatus: RiotSyncStatus,
+        lastSyncRequestedAt: Date? = nil,
+        lastSyncSucceededAt: Date? = nil,
+        lastSyncFailedAt: Date? = nil,
+        lastSyncErrorCode: String? = nil,
+        lastSyncErrorMessage: String? = nil,
+        lastSyncedAt: Date? = nil
+    ) -> RiotAccountDTO {
+        RiotAccountDTO(
+            id: id,
+            riotGameName: "Hide on bush",
+            tagLine: "KR1",
+            region: "kr",
+            puuid: "puuid-1",
+            isPrimary: true,
+            verificationStatus: .claimed,
+            syncStatus: syncStatus,
+            lastSyncRequestedAt: lastSyncRequestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: lastSyncErrorCode,
+            lastSyncErrorMessage: lastSyncErrorMessage,
+            lastSyncedAt: lastSyncedAt
+        )
+    }
+
+    private func makeRiotSyncStatusDTO(
+        id: String = "ra1",
+        syncStatus: RiotSyncStatus,
+        lastSyncRequestedAt: Date? = nil,
+        lastSyncSucceededAt: Date? = nil,
+        lastSyncFailedAt: Date? = nil,
+        lastSyncErrorCode: String? = nil,
+        lastSyncErrorMessage: String? = nil
+    ) -> RiotAccountSyncStatusDTO {
+        RiotAccountSyncStatusDTO(
+            riotAccountId: id,
+            syncStatus: syncStatus,
+            lastSyncRequestedAt: lastSyncRequestedAt,
+            lastSyncSucceededAt: lastSyncSucceededAt,
+            lastSyncFailedAt: lastSyncFailedAt,
+            lastSyncErrorCode: lastSyncErrorCode,
+            lastSyncErrorMessage: lastSyncErrorMessage
         )
     }
 

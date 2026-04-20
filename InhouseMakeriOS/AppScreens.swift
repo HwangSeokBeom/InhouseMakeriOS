@@ -1,5 +1,6 @@
 import AuthenticationServices
 import ComposableArchitecture
+import Foundation
 import GoogleSignIn
 import MessageUI
 import SafariServices
@@ -10,58 +11,170 @@ import UIKit
 final class AppRouter: ObservableObject {
     @Published var path: [AppRoute] = []
     private var pendingRouteRequest: AppRoute?
+    private var recentRouteRequests: [AppRoute: Date] = [:]
+    private let duplicateRouteRequestWindow: TimeInterval = 0.35
 
-    func push(_ route: AppRoute) {
-        debugRoute("requested", route: route)
+    func push(_ route: AppRoute, source: String = "unknown") {
+        let requestID = UUID().uuidString
+        let now = Date()
+        debugRoute(
+            source: "NavigationRequestObserver",
+            action: "receive",
+            route: route,
+            requestID: requestID,
+            detail: "requestedBy=\(source) depth=\(path.count)"
+        )
 
         if pendingRouteRequest == route {
-            debugRoute("ignored duplicate", route: route, detail: "reason=same_runloop_request")
+            debugRoute(
+                source: "NavigationRequestObserver",
+                action: "drop",
+                route: route,
+                requestID: requestID,
+                accepted: false,
+                reason: "same_runloop_request",
+                detail: "requestedBy=\(source)"
+            )
             return
         }
+
+        if isRecentlyConsumed(route, at: now) {
+            debugRoute(
+                source: "NavigationRequestObserver",
+                action: "drop",
+                route: route,
+                requestID: requestID,
+                accepted: false,
+                reason: "duplicate_request_window",
+                detail: "requestedBy=\(source)"
+            )
+            return
+        }
+
         pendingRouteRequest = route
         Task { @MainActor [weak self] in
             self?.pendingRouteRequest = nil
         }
 
         if path.last == route {
-            debugRoute("ignored duplicate", route: route, detail: "reason=already_visible")
+            debugRoute(
+                source: "NavigationRequestObserver",
+                action: "drop",
+                route: route,
+                requestID: requestID,
+                accepted: false,
+                reason: "already_visible",
+                detail: "requestedBy=\(source)"
+            )
             return
         }
 
         if let existingIndex = path.lastIndex(of: route) {
             let nextPath = Array(path.prefix(existingIndex + 1))
             guard nextPath != path else {
-                debugRoute("ignored duplicate", route: route, detail: "reason=no_path_change")
+                debugRoute(
+                    source: "NavigationRequestObserver",
+                    action: "drop",
+                    route: route,
+                    requestID: requestID,
+                    accepted: false,
+                    reason: "no_path_change",
+                    detail: "requestedBy=\(source)"
+                )
                 return
             }
             path = nextPath
-            debugRoute("reused", route: route, detail: "depth=\(existingIndex)")
+            recordConsumed(route, at: now)
+            debugRoute(
+                source: "NavigationRequestObserver",
+                action: "replace",
+                route: route,
+                requestID: requestID,
+                accepted: true,
+                detail: "requestedBy=\(source) depth=\(existingIndex) pathCount=\(path.count)"
+            )
             return
         }
+
         path.append(route)
-        debugRoute("accepted", route: route)
+        recordConsumed(route, at: now)
+        debugRoute(
+            source: "NavigationRequestObserver",
+            action: "push",
+            route: route,
+            requestID: requestID,
+            accepted: true,
+            detail: "requestedBy=\(source) pathCount=\(path.count)"
+        )
     }
 
     func pop() {
+        guard let route = path.last else {
+            debugRoute(source: "AppRouter", action: "pop", route: nil, accepted: false, reason: "empty_path")
+            return
+        }
         _ = path.popLast()
+        debugRoute(source: "AppRouter", action: "pop", route: route, accepted: true, detail: "pathCount=\(path.count)")
     }
 
     func removeRoutes(referencingGroupID groupID: String) {
         guard let firstMatchIndex = path.firstIndex(where: { $0.references(groupID: groupID) }) else { return }
         path = Array(path.prefix(firstMatchIndex))
+        debugRoute(
+            source: "AppRouter",
+            action: "replace",
+            route: nil,
+            accepted: true,
+            reason: "remove_group_routes",
+            detail: "groupID=\(groupID) pathCount=\(path.count)"
+        )
     }
 
     func reset() {
+        let previousCount = path.count
         path.removeAll()
+        recentRouteRequests.removeAll()
+        debugRoute(source: "AppRouter", action: "reset", route: nil, accepted: true, detail: "previousPathCount=\(previousCount)")
     }
 
-    private func debugRoute(_ event: String, route: AppRoute, detail: String? = nil) {
+    private func isRecentlyConsumed(_ route: AppRoute, at now: Date) -> Bool {
+        recentRouteRequests = recentRouteRequests.filter { now.timeIntervalSince($0.value) <= duplicateRouteRequestWindow }
+        guard let lastConsumedAt = recentRouteRequests[route] else { return false }
+        return now.timeIntervalSince(lastConsumedAt) <= duplicateRouteRequestWindow
+    }
+
+    private func recordConsumed(_ route: AppRoute, at now: Date) {
+        recentRouteRequests[route] = now
+    }
+
+    private func debugRoute(
+        source: String,
+        action: String,
+        route: AppRoute?,
+        requestID: String? = nil,
+        accepted: Bool? = nil,
+        reason: String? = nil,
+        detail: String? = nil
+    ) {
 #if DEBUG
-        if let detail {
-            print("[Route] \(event) route=\(route.debugDescription) \(detail)")
-        } else {
-            print("[Route] \(event) route=\(route.debugDescription)")
+        var parts = [
+            "source=\(source)",
+            "action=\(action)",
+            "route=\(route?.debugDescription ?? "none")",
+        ]
+        if let requestID {
+            parts.append("requestId=\(requestID)")
         }
+        if let accepted {
+            parts.append("accepted=\(accepted)")
+        }
+        if let reason {
+            parts.append("reason=\(reason)")
+        }
+        if let detail {
+            parts.append(detail)
+        }
+        print("[RouteDebug] \(parts.joined(separator: " "))")
 #endif
     }
 }
@@ -104,6 +217,43 @@ private extension AppRoute {
         }
     }
 
+    var lifecycleScreenName: String {
+        switch self {
+        case .search:
+            return "SearchScreen"
+        case .notifications:
+            return "NotificationsScreen"
+        case .riotAccounts:
+            return "RiotAccountsScreen"
+        case .settings:
+            return "SettingsScreen"
+        case .homeUpcomingMatches:
+            return "HomeUpcomingMatchesScreen"
+        case .homeGroups:
+            return "HomeGroupsScreen"
+        case .powerDetail:
+            return "PowerDetailScreen"
+        case .memberProfile:
+            return "MemberProfileScreen"
+        case .homeRecentMatches:
+            return "HomeRecentMatchesScreen"
+        case .groupDetail:
+            return "GroupDetailScreen"
+        case .matchLobby:
+            return "MatchLobbyFeatureView"
+        case .teamBalance:
+            return "TeamBalanceFeatureView"
+        case .manualAdjust:
+            return "ManualAdjustFeatureView"
+        case .matchResult:
+            return "MatchResultFeatureView"
+        case .matchDetail:
+            return "MatchDetailScreen"
+        case .recruitDetail:
+            return "RecruitDetailScreen"
+        }
+    }
+
     func references(groupID: String) -> Bool {
         switch self {
         case let .groupDetail(routeGroupID):
@@ -123,6 +273,28 @@ enum SessionState {
     case guest
     case authenticating
     case authenticated(UserSession)
+}
+
+private extension SessionState {
+    var debugName: String {
+        switch self {
+        case .bootstrapping:
+            return "bootstrapping"
+        case .guest:
+            return "guest"
+        case .authenticating:
+            return "authenticating"
+        case .authenticated:
+            return "authenticated"
+        }
+    }
+
+    var debugUserID: String? {
+        if case let .authenticated(session) = self {
+            return session.user.id
+        }
+        return nil
+    }
 }
 
 enum OnboardingPresentationState: Equatable {
@@ -157,15 +329,15 @@ private final class InitialLoadTracker {
 
     func begin(force: Bool, trigger: String) -> Bool {
         if isInFlight {
-            debugSkip(trigger: trigger, reason: .inFlight)
+            debugDecision(force: force, trigger: trigger, started: false, reason: .inFlight)
             return false
         }
         if !force, hasLoadedInitialData {
-            debugSkip(trigger: trigger, reason: .alreadyLoaded)
+            debugDecision(force: force, trigger: trigger, started: false, reason: .alreadyLoaded)
             return false
         }
+        debugDecision(force: force, trigger: trigger, started: true)
         isInFlight = true
-        debugStart(trigger: trigger)
         return true
     }
 
@@ -174,6 +346,7 @@ private final class InitialLoadTracker {
         if success {
             hasLoadedInitialData = true
         }
+        debugFinish(success: success)
     }
 
     func reset() {
@@ -182,26 +355,130 @@ private final class InitialLoadTracker {
     }
 
     func logSessionReused(trigger: String) {
-        debugSkip(trigger: trigger, reason: .sessionReused)
+        debugDecision(force: false, trigger: trigger, started: false, reason: .sessionReused)
     }
 
-    private func debugStart(trigger: String) {
+    private func debugDecision(force: Bool, trigger: String, started: Bool, reason: InitialLoadSkipReason? = nil) {
         #if DEBUG
-        print("[InitialLoad] screen=\(screen) trigger=\(trigger) started")
+        var parts = [
+            "screen=\(screen)",
+            "trigger=\(trigger)",
+            "force=\(force)",
+            "inFlight=\(isInFlight)",
+            "hasLoaded=\(hasLoadedInitialData)",
+            "started=\(started)",
+        ]
+        if let reason {
+            parts.append("reason=\(reason.rawValue)")
+        }
+        print("[InitialLoadDebug] \(parts.joined(separator: " "))")
         #endif
     }
 
-    private func debugSkip(trigger: String, reason: InitialLoadSkipReason) {
+    private func debugFinish(success: Bool) {
         #if DEBUG
-        print("[InitialLoad] screen=\(screen) trigger=\(trigger) skipped reason=\(reason.rawValue)")
+        print("[InitialLoadDebug] screen=\(screen) action=finish success=\(success) inFlight=\(isInFlight) hasLoaded=\(hasLoadedInitialData)")
         #endif
     }
 }
 
 private func debugSkipDeletedGroupReload(groupID: String) {
     #if DEBUG
-    print("[InitialLoad] skip deleted group reload groupId=\(groupID)")
+    print("[InitialLoadDebug] action=skipDeletedGroupReload groupId=\(groupID)")
     #endif
+}
+
+private enum RiotAccountsDisplayErrorType: String {
+    case networkError = "network_error"
+    case serverError = "server_error"
+    case authError = "auth_error"
+    case genericError = "generic_error"
+}
+
+private func debugRiotAccounts(_ message: String) {
+    #if DEBUG
+    print("[RiotAccountsDebug] \(message)")
+    #endif
+}
+
+private func riotAccountsEndpoint(_ endpoint: String?) -> String {
+    let trimmed = endpoint?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    guard !trimmed.isEmpty else { return "/riot-accounts" }
+    return trimmed.components(separatedBy: "?").first ?? trimmed
+}
+
+private func riotAccountsPresentedError(
+    from error: UserFacingError,
+    title: String,
+    message: String
+) -> UserFacingError {
+    UserFacingError(
+        title: title,
+        message: message,
+        code: error.code,
+        provider: error.provider,
+        statusCode: error.statusCode,
+        details: error.details,
+        endpoint: error.endpoint,
+        requestMethod: error.requestMethod
+    )
+}
+
+private func riotAccountsNetworkError(from error: URLError) -> UserFacingError {
+    let code: String
+    let message: String
+
+    switch error.code {
+    case .notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed:
+        code = "NETWORK_OFFLINE"
+        message = "인터넷 연결을 확인한 뒤 다시 시도해 주세요."
+    case .timedOut:
+        code = "NETWORK_TIMEOUT"
+        message = "응답이 지연되고 있어요. 잠시 후 다시 시도해 주세요."
+    default:
+        code = "NETWORK_ERROR"
+        message = "네트워크 오류로 Riot ID 목록을 불러오지 못했습니다."
+    }
+
+    return UserFacingError(
+        title: "네트워크 오류",
+        message: message,
+        code: code,
+        endpoint: "/riot-accounts",
+        requestMethod: HTTPMethod.get.rawValue
+    )
+}
+
+private func riotAccountsUnknownLoadError() -> UserFacingError {
+    UserFacingError(
+        title: "Riot ID 로딩 실패",
+        message: "Riot ID 목록을 불러오지 못했습니다.",
+        code: "RIOT_ACCOUNTS_LOAD_FAILED",
+        endpoint: "/riot-accounts",
+        requestMethod: HTTPMethod.get.rawValue
+    )
+}
+
+@MainActor
+private enum LifecycleDebug {
+    private static var counts: [String: Int] = [:]
+
+    static func log(screen: String, event: String, detail: String? = nil) {
+        #if DEBUG
+        let key = "\(screen).\(event)"
+        let nextCount = (counts[key] ?? 0) + 1
+        counts[key] = nextCount
+        var parts = [
+            "screen=\(screen)",
+            "event=\(event)",
+            "count=\(nextCount)",
+        ]
+        if let detail {
+            parts.append(detail)
+        }
+        print("[LifecycleDebug] \(parts.joined(separator: " "))")
+        #endif
+    }
 }
 
 @MainActor
@@ -211,7 +488,20 @@ final class AppSessionViewModel: ObservableObject {
         let action: (@MainActor () -> Void)?
     }
 
-    @Published var state: SessionState = .bootstrapping
+    private struct HistoryWriteSyncMarker {
+        let matchID: String
+        let userID: String
+        let revision: Int
+        var refreshTriggered: Bool
+    }
+
+    @Published var state: SessionState = .bootstrapping {
+        didSet {
+            debugSession(
+                "action=session_state_changed from=\(oldValue.debugName) to=\(state.debugName) fromUserId=\(oldValue.debugUserID ?? "nil") toUserId=\(state.debugUserID ?? "nil")"
+            )
+        }
+    }
     @Published var selectedTab: AppTab = .home
     @Published var actionState: AsyncActionState = .idle
     @Published var authPrompt: AuthPromptContext?
@@ -219,6 +509,7 @@ final class AppSessionViewModel: ObservableObject {
     @Published private(set) var activeModal: AppModalKind?
     @Published private(set) var riotAccountsViewState: RiotLinkedAccountsViewState = .loading
     @Published private(set) var riotLinkedDataRevision = 0
+    @Published private(set) var historyDataRevision = 0
 
     let container: AppContainer
     private(set) var userSession: UserSession?
@@ -226,6 +517,8 @@ final class AppSessionViewModel: ObservableObject {
     private var deferredAuthPrompt: AuthPromptContext?
     private var suppressNextAuthPromptDismissSync = false
     private var deletedGroupIDs: Set<String> = []
+    private var lastHistoryWriteSyncMarker: HistoryWriteSyncMarker?
+    private var riotAccountsRefreshTask: Task<RiotLinkedAccountsViewState, Never>?
 
     init(container: AppContainer) {
         self.container = container
@@ -234,6 +527,24 @@ final class AppSessionViewModel: ObservableObject {
     func debugLog(_ message: String) {
         #if DEBUG
         print("[AppSession] \(message)")
+        #endif
+    }
+
+    func debugSession(_ message: String) {
+        #if DEBUG
+        print("[SessionDebug] \(message)")
+        #endif
+    }
+
+    func debugHistoryWrite(_ message: String) {
+        #if DEBUG
+        print("[HistoryWriteDebug] \(message)")
+        #endif
+    }
+
+    func debugHistoryConsistency(_ message: String) {
+        #if DEBUG
+        print("[HistoryConsistencyDebug] \(message)")
         #endif
     }
 
@@ -275,29 +586,41 @@ final class AppSessionViewModel: ObservableObject {
         userSession.map { "authenticated:\($0.user.id)" } ?? "guest"
     }
 
+    var shouldForceHistoryReloadAfterResultSave: Bool {
+        lastHistoryWriteSyncMarker?.refreshTriggered == false
+    }
+
     func bootstrap() async {
-        guard case .bootstrapping = state else { return }
+        debugSession("action=bootstrap_start state=\(state.debugName)")
+        guard case .bootstrapping = state else {
+            debugSession("action=bootstrap_skipped reason=state_not_bootstrapping state=\(state.debugName)")
+            return
+        }
         await bootstrapLiveSession()
     }
 
     private func bootstrapLiveSession() async {
+        debugSession("action=bootstrap_load_persisted_tokens")
         let persistedTokens = await container.authRepository.loadPersistedTokens()
 
         guard let persistedTokens else {
             syncOnboardingPresentation(hasAuthenticatedSession: false)
             updateRiotAccountsViewState(.noLinkedAccounts)
             debugLog("bootstrap completed without persisted tokens; session changed to guest")
+            debugSession("action=bootstrap_guest reason=no_persisted_tokens")
             state = .guest
             return
         }
 
         do {
+            debugSession("action=bootstrap_restore_profile_request endpoint=/me")
             let profile = try await container.profileRepository.me()
             let session = UserSession(authTokens: persistedTokens, user: profile)
             userSession = session
             syncOnboardingPresentation(hasAuthenticatedSession: true)
             updateRiotAccountsViewState(.loading)
             debugLog("bootstrap restored authenticated session for user \(session.user.id)")
+            debugSession("action=bootstrap_restored userId=\(session.user.id)")
             state = .authenticated(session)
         } catch {
             await container.authRepository.signOut()
@@ -305,6 +628,7 @@ final class AppSessionViewModel: ObservableObject {
             syncOnboardingPresentation(hasAuthenticatedSession: false)
             updateRiotAccountsViewState(.noLinkedAccounts)
             debugLog("bootstrap failed to restore session; falling back to guest")
+            debugSession("action=bootstrap_failed error=\(error.localizedDescription)")
             state = .guest
         }
     }
@@ -371,7 +695,7 @@ final class AppSessionViewModel: ObservableObject {
 
     func openProtectedRoute(_ route: AppRoute, requirement: AuthRequirement, router: AppRouter) {
         requireAuthentication(for: requirement) {
-            router.push(route)
+            router.push(route, source: "AppSession.openProtectedRoute requirement=\(String(describing: requirement))")
         }
     }
 
@@ -505,9 +829,59 @@ final class AppSessionViewModel: ObservableObject {
         state = .authenticated(session)
     }
 
+    func recordResultSavedForHistory(matchID: String, userID: String?) {
+        let writeUserID = userID ?? currentUserID ?? "nil"
+        historyDataRevision &+= 1
+        lastHistoryWriteSyncMarker = HistoryWriteSyncMarker(
+            matchID: matchID,
+            userID: writeUserID,
+            revision: historyDataRevision,
+            refreshTriggered: false
+        )
+        debugHistoryWrite(
+            "action=history_invalidation scheduled=true reason=result_saved matchId=\(matchID) userId=\(writeUserID) revision=\(historyDataRevision)"
+        )
+    }
+
+    func markHistoryReadStarted(userID: String, force: Bool, source: String) {
+        guard var marker = lastHistoryWriteSyncMarker else { return }
+        let sameUser = marker.userID == userID
+        marker.refreshTriggered = true
+        lastHistoryWriteSyncMarker = marker
+        debugHistoryConsistency(
+            "writeUserId=\(marker.userID) readUserId=\(userID) sameUser=\(sameUser) source=\(source) force=\(force)"
+        )
+        debugHistoryConsistency(
+            "matchId=\(marker.matchID) historyRefreshTriggered=true revision=\(marker.revision)"
+        )
+    }
+
+    func markHistoryReadCompleted(userID: String, items: [MatchHistoryItem]) {
+        guard let marker = lastHistoryWriteSyncMarker else { return }
+        let sameUser = marker.userID == userID
+        let containsSavedMatch = items.contains { $0.matchID == marker.matchID }
+        debugHistoryConsistency(
+            "writeUserId=\(marker.userID) readUserId=\(userID) sameUser=\(sameUser) itemCount=\(items.count)"
+        )
+        debugHistoryConsistency(
+            "matchId=\(marker.matchID) historyRefreshTriggered=\(marker.refreshTriggered) historyItemsContainSavedMatch=\(containsSavedMatch)"
+        )
+    }
+
+    func logHistoryEmptySyncState(userID: String) {
+        guard let marker = lastHistoryWriteSyncMarker else {
+            debugHistoryConsistency("readUserId=\(userID) serverReturnedEmpty=true lastWriteTracked=false")
+            return
+        }
+        debugHistoryConsistency(
+            "readUserId=\(userID) serverReturnedEmpty=true lastWriteMatchId=\(marker.matchID) lastWriteUserId=\(marker.userID) historyRefreshTriggered=\(marker.refreshTriggered)"
+        )
+    }
+
     func refreshRiotAccountsViewState(
         force: Bool = false,
-        invalidateDependents: Bool = false
+        invalidateDependents: Bool = false,
+        source: String = "unknown"
     ) async -> RiotLinkedAccountsViewState {
         guard isAuthenticated else {
             updateRiotAccountsViewState(.noLinkedAccounts, invalidateDependents: invalidateDependents)
@@ -523,25 +897,36 @@ final class AppSessionViewModel: ObservableObject {
             }
         }
 
+        if let existingTask = riotAccountsRefreshTask {
+            debugRiotAccounts("action=drop_fetch reason=in_flight source=\(source)")
+            let reusedState = await existingTask.value
+            if invalidateDependents {
+                updateRiotAccountsViewState(reusedState, invalidateDependents: true)
+            }
+            return reusedState
+        }
+
         updateRiotAccountsViewState(.loading)
 
-        do {
-            let accounts = try await container.riotRepository.list()
-            let nextState = RiotLinkedAccountsViewState(accounts: accounts)
-            updateRiotAccountsViewState(nextState, invalidateDependents: invalidateDependents)
-            return nextState
-        } catch let error as UserFacingError {
-            let mappedError = error.serverContractMapped
-            updateRiotAccountsViewState(.error(mappedError), invalidateDependents: invalidateDependents)
-            return .error(mappedError)
-        } catch {
-            let mappedError = UserFacingError(
-                title: "Riot ID 로딩 실패",
-                message: "Riot ID를 불러오지 못했습니다."
-            )
-            updateRiotAccountsViewState(.error(mappedError), invalidateDependents: invalidateDependents)
-            return .error(mappedError)
+        let container = self.container
+        let task = Task { () -> RiotLinkedAccountsViewState in
+            do {
+                let accounts = try await container.riotRepository.list()
+                return RiotLinkedAccountsViewState(accounts: accounts)
+            } catch let error as UserFacingError {
+                return .error(error.serverContractMapped)
+            } catch let error as URLError {
+                return .error(riotAccountsNetworkError(from: error))
+            } catch {
+                return .error(riotAccountsUnknownLoadError())
+            }
         }
+        riotAccountsRefreshTask = task
+
+        let nextState = await task.value
+        riotAccountsRefreshTask = nil
+        updateRiotAccountsViewState(nextState, invalidateDependents: invalidateDependents)
+        return nextState
     }
 
     func applyRiotAccounts(_ accounts: [RiotAccount], invalidateDependents: Bool = false) {
@@ -606,7 +991,9 @@ final class AppSessionViewModel: ObservableObject {
         _ nextState: RiotLinkedAccountsViewState,
         invalidateDependents: Bool = false
     ) {
-        riotAccountsViewState = nextState
+        if riotAccountsViewState != nextState {
+            riotAccountsViewState = nextState
+        }
         if invalidateDependents {
             riotLinkedDataRevision &+= 1
         }
@@ -753,6 +1140,16 @@ private enum RecruitOptionCatalog {
 final class HomeViewModel: ObservableObject {
     @Published private(set) var state: ScreenLoadState<HomeContentState> = .initial
 
+    private struct TrackedGroupsLoadResult {
+        let groups: [GroupSummary]
+        let state: HomeTrackedGroupsLoadState
+    }
+
+    private struct CurrentMatchLoadResult {
+        let match: Match?
+        let state: HomeCurrentMatchLoadState
+    }
+
     private let session: AppSessionViewModel
     private let initialLoadTracker = InitialLoadTracker(screen: "home")
 
@@ -763,36 +1160,56 @@ final class HomeViewModel: ObservableObject {
     func load(force: Bool = false, trigger: String = "unknown") async {
         guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
         var didSucceed = false
-        defer { initialLoadTracker.finish(success: didSucceed) }
+        var homeSummaryLoaded = false
+        var trackedGroupsCount = 0
+        var currentMatchID: String?
+        defer {
+            initialLoadTracker.finish(success: didSucceed)
+            debugHomeLoadDetail(
+                "action=finish success=\(didSucceed) homeSummaryLoaded=\(homeSummaryLoaded) trackedGroupsCount=\(trackedGroupsCount) currentMatch=\(currentMatchID ?? "nil")"
+            )
+        }
+        debugHomeLoad("load start trigger=\(trigger) force=\(force) scope=\(session.dataScopeKey)")
         state = .loading
 
         if let profile = session.profile, let userID = session.currentUserID {
             do {
-                let groups = try await loadTrackedGroups()
-                let currentMatch = try await loadCurrentMatch()
-                let posts = try await loadRecruitingPostsForHome(isAuthenticated: true)
+                let trackedGroupsSnapshot = session.container.localStore.storedGroupIDsSnapshot()
+                let recentMatchesSnapshot = session.container.localStore.recentMatchesSnapshot()
+                let trackedGroupsResult = try await loadTrackedGroups(trigger: trigger, rawSnapshot: trackedGroupsSnapshot)
+                let currentMatchResult = try await loadCurrentMatch(trigger: trigger, rawSnapshot: recentMatchesSnapshot)
+                let posts = try await loadRecruitingPostsForHome(isAuthenticated: true, trigger: trigger)
+                debugHomeLoad("requestSource trigger=\(trigger) endpoint=/riot-accounts source=HomeViewModel.refreshRiotAccountsViewState")
                 let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
                 if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
                     throw error
                 }
                 let power: PowerProfile?
                 if riotAccountsViewState.hasLinkedAccounts {
+                    debugHomeLoad("requestSource trigger=\(trigger) endpoint=/users/\(userID)/power-profile source=HomeViewModel.load")
                     power = try? await session.container.profileRepository.powerProfile(userID: userID)
                 } else {
                     power = nil
                 }
+                debugHomeLoad("requestSource trigger=\(trigger) endpoint=/users/\(userID)/inhouse-history source=HomeViewModel.load")
                 let history = try await session.container.profileRepository.history(userID: userID, limit: 1)
                 let snapshot = HomeSnapshot(
                     profile: profile,
                     riotAccountsViewState: riotAccountsViewState,
                     power: power,
-                    groups: groups,
-                    currentMatch: currentMatch,
+                    homeSummaryState: .loaded,
+                    trackedGroupsState: trackedGroupsResult.state,
+                    currentMatchState: currentMatchResult.state,
+                    groups: trackedGroupsResult.groups,
+                    currentMatch: currentMatchResult.match,
                     latestHistory: history.first,
                     recruitingPosts: Array(posts.prefix(4))
                 )
+                homeSummaryLoaded = true
+                trackedGroupsCount = snapshot.groups.count
+                currentMatchID = snapshot.currentMatch?.id
 
-                if groups.isEmpty && currentMatch == nil && snapshot.latestHistory == nil && posts.isEmpty {
+                if snapshot.groups.isEmpty && snapshot.currentMatch == nil && snapshot.latestHistory == nil && posts.isEmpty {
                     state = .empty("홈 집계에 사용할 데이터가 아직 없습니다.\n그룹을 만들거나 모집글을 확인해 흐름을 시작해주세요.")
                 } else {
                     state = .content(.authenticated(snapshot))
@@ -811,8 +1228,9 @@ final class HomeViewModel: ObservableObject {
             return
         }
 
+        debugHomeLoad("requestSource trigger=\(trigger) endpoint=/groups source=HomeViewModel.load guest=true")
         let groups = ((try? await session.container.groupRepository.listPublic()) ?? []).filterPubliclyVisible()
-        let posts = (try? await loadRecruitingPostsForHome(isAuthenticated: false)) ?? []
+        let posts = (try? await loadRecruitingPostsForHome(isAuthenticated: false, trigger: trigger)) ?? []
         let guestSnapshot = GuestHomeSnapshot(
             groups: Array(groups.prefix(4)),
             currentMatch: nil,
@@ -842,41 +1260,158 @@ final class HomeViewModel: ObservableObject {
         initialLoadTracker.reset()
     }
 
-    private func loadTrackedGroups() async throws -> [GroupSummary] {
-        let knownMemberGroupIDs = Set(session.container.localStore.storedGroupIDs)
-        var groups: [GroupSummary] = []
+    private func loadTrackedGroups(
+        trigger: String,
+        rawSnapshot: LocalStoreSnapshot<[String]>
+    ) async throws -> TrackedGroupsLoadResult {
+        debugHomeSource(
+            "action=loadTrackedGroups source=\(rawSnapshot.source.rawValue) rawIds=\(rawSnapshot.value)"
+        )
+
+        var hadPartialFailure = false
+        for id in rawSnapshot.value where id.isInvalidHomeSeedIdentifier {
+            session.container.localStore.removeGroup(id: id)
+            debugHomeSource("action=dropInvalidTrackedGroup groupId=\(id) reason=test_seed")
+            hadPartialFailure = true
+        }
+
+        var trackedGroupIDs: [String] = []
         for id in session.container.localStore.storedGroupIDs {
             if session.isDeletedGroupContext(id) {
                 session.markGroupContextDeleted(id)
                 debugSkipDeletedGroupReload(groupID: id)
                 continue
             }
+            trackedGroupIDs.append(id)
+        }
+
+        guard !trackedGroupIDs.isEmpty else {
+            if hadPartialFailure {
+                debugHomeLoadDetail("action=partial_failure section=trackedGroups code=INVALID_HOME_TEST_ID fatal=false")
+            }
+            return TrackedGroupsLoadResult(groups: [], state: hadPartialFailure ? .partial : .missing)
+        }
+
+        do {
+            debugHomeLoad("requestSource trigger=\(trigger) endpoint=/groups source=HomeViewModel.loadTrackedGroups")
+            let liveGroups = try await session.container.groupRepository.list()
+            let liveGroupsByID = Dictionary(uniqueKeysWithValues: liveGroups.map { ($0.id, $0) })
+            var resolvedGroups: [GroupSummary] = []
+
+            for id in trackedGroupIDs {
+                guard let group = liveGroupsByID[id] else {
+                    session.container.localStore.removeGroup(id: id)
+                    debugHomeSource("action=dropInvalidTrackedGroup groupId=\(id) reason=forbidden_or_missing")
+                    hadPartialFailure = true
+                    continue
+                }
+                resolvedGroups.append(group)
+            }
+
+            if hadPartialFailure {
+                debugHomeLoadDetail("action=partial_failure section=trackedGroups code=GROUP_ACCESS_FORBIDDEN fatal=false")
+            }
+
+            let state: HomeTrackedGroupsLoadState
+            if resolvedGroups.isEmpty {
+                state = hadPartialFailure ? .partial : .missing
+            } else {
+                state = hadPartialFailure ? .partial : .loaded
+            }
+
+            return TrackedGroupsLoadResult(groups: resolvedGroups, state: state)
+        } catch let error as UserFacingError {
+            if error.requiresAuthentication {
+                throw error
+            }
+            debugHomeLoadDetail("action=partial_failure section=trackedGroups code=\(debugCode(for: error)) fatal=false")
+            return TrackedGroupsLoadResult(groups: [], state: .partial)
+        } catch {
+            debugHomeLoadDetail("action=partial_failure section=trackedGroups code=UNKNOWN fatal=false")
+            return TrackedGroupsLoadResult(groups: [], state: .partial)
+        }
+    }
+
+    private func loadCurrentMatch(
+        trigger: String,
+        rawSnapshot: LocalStoreSnapshot<[RecentMatchContext]>
+    ) async throws -> CurrentMatchLoadResult {
+        debugHomeSource(
+            "action=loadCurrentMatch source=\(rawSnapshot.source.rawValue) rawMatchId=\(rawSnapshot.value.first?.matchID ?? "nil")"
+        )
+
+        var hadPartialFailure = false
+        let currentContexts = session.container.localStore.recentMatches
+        let retainedMatchIDs = Set(currentContexts.map(\.matchID))
+
+        for context in rawSnapshot.value where !retainedMatchIDs.contains(context.matchID) {
+            let reason = (context.matchID.isInvalidHomeSeedIdentifier || context.groupID.isInvalidHomeSeedIdentifier)
+                ? "test_seed"
+                : "group_cleanup"
+            debugHomeSource("action=clearInvalidCurrentMatch matchId=\(context.matchID) reason=\(reason)")
+            hadPartialFailure = true
+        }
+
+        guard !currentContexts.isEmpty else {
+            if hadPartialFailure {
+                debugHomeLoadDetail("action=partial_failure section=currentMatch code=CONTEXT_CLEARED fatal=false")
+            }
+            return CurrentMatchLoadResult(match: nil, state: hadPartialFailure ? .partial : .missing)
+        }
+
+        for context in currentContexts {
+            if context.matchID.isInvalidHomeSeedIdentifier || context.groupID.isInvalidHomeSeedIdentifier {
+                session.container.localStore.clearRecentMatch(matchID: context.matchID)
+                debugHomeSource("action=clearInvalidCurrentMatch matchId=\(context.matchID) reason=test_seed")
+                hadPartialFailure = true
+                continue
+            }
+
+            if session.isDeletedGroupContext(context.groupID) {
+                session.container.localStore.clearRecentMatch(matchID: context.matchID)
+                debugHomeSource("action=clearInvalidCurrentMatch matchId=\(context.matchID) reason=deleted_group_context")
+                hadPartialFailure = true
+                continue
+            }
+
+            debugHomeLoad("requestSource trigger=\(trigger) endpoint=/matches/\(context.matchID) source=HomeViewModel.loadCurrentMatch")
             do {
-                let group = try await session.container.groupRepository.detail(groupID: id)
-                groups.append(group)
+                let match = try await session.container.matchRepository.detail(matchID: context.matchID)
+                return CurrentMatchLoadResult(match: match, state: hadPartialFailure ? .partial : .loaded)
             } catch let error as UserFacingError {
                 if error.requiresAuthentication {
                     throw error
                 }
-                if error.isGroupNotFoundResource {
-                    session.markGroupContextDeleted(id)
-                    debugSkipDeletedGroupReload(groupID: id)
+
+                if error.isMatchNotFoundResource || error.statusCode == 403 {
+                    session.container.localStore.clearRecentMatch(matchID: context.matchID)
+                    let reason = error.isMatchNotFoundResource ? "not_found" : "forbidden"
+                    debugHomeSource("action=clearInvalidCurrentMatch matchId=\(context.matchID) reason=\(reason)")
+                    debugHomeLoadDetail(
+                        "action=partial_failure section=currentMatch code=\(debugCode(for: error)) fatal=false"
+                    )
+                    hadPartialFailure = true
+                    continue
                 }
+
+                debugHomeLoadDetail("action=partial_failure section=currentMatch code=\(debugCode(for: error)) fatal=false")
+                return CurrentMatchLoadResult(match: nil, state: .partial)
+            } catch {
+                debugHomeLoadDetail("action=partial_failure section=currentMatch code=UNKNOWN fatal=false")
+                return CurrentMatchLoadResult(match: nil, state: .partial)
             }
         }
-        return groups.filterAccessible(knownMemberGroupIDs: knownMemberGroupIDs)
+
+        return CurrentMatchLoadResult(match: nil, state: hadPartialFailure ? .partial : .missing)
     }
 
-    private func loadCurrentMatch() async throws -> Match? {
-        guard let context = session.container.localStore.recentMatches.first else { return nil }
-        return try await session.container.matchRepository.detail(matchID: context.matchID)
-    }
-
-    private func loadRecruitingPostsForHome(isAuthenticated: Bool) async throws -> [RecruitPost] {
+    private func loadRecruitingPostsForHome(isAuthenticated: Bool, trigger: String) async throws -> [RecruitPost] {
         do {
             if isAuthenticated {
+                debugHomeLoad("requestSource trigger=\(trigger) endpoint=/recruiting-posts source=HomeViewModel.loadRecruitingPostsForHome authenticated=true")
                 return try await session.container.recruitingRepository.list(status: .open)
             }
+            debugHomeLoad("requestSource trigger=\(trigger) endpoint=/recruiting-posts source=HomeViewModel.loadRecruitingPostsForHome authenticated=false")
             return try await session.container.recruitingRepository.listPublic(status: .open)
         } catch let error as UserFacingError {
             if isAuthenticated, error.requiresAuthentication {
@@ -896,6 +1431,44 @@ final class HomeViewModel: ObservableObject {
 #if DEBUG
         print("[HomeLoad] \(message)")
 #endif
+    }
+
+    private func debugHomeSource(_ message: String) {
+#if DEBUG
+        print("[HomeSourceDebug] \(message)")
+#endif
+    }
+
+    private func debugHomeLoadDetail(_ message: String) {
+#if DEBUG
+        print("[HomeLoadDebug] \(message)")
+#endif
+    }
+
+    private func debugCode(for error: UserFacingError) -> String {
+        if error.isMatchNotFoundResource {
+            return "MATCH_NOT_FOUND"
+        }
+        if error.isGroupAccessForbidden {
+            return "GROUP_ACCESS_FORBIDDEN"
+        }
+        if !error.normalizedCode.isEmpty {
+            return error.normalizedCode
+        }
+        if let statusCode = error.statusCode {
+            return "HTTP_\(statusCode)"
+        }
+        return "UNKNOWN"
+    }
+}
+
+private extension String {
+    var isInvalidHomeSeedIdentifier: Bool {
+        let normalized = trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: "-", with: "_")
+            .replacingOccurrences(of: " ", with: "_")
+            .uppercased()
+        return normalized.contains("UI_TEST") || normalized.contains("UITEST")
     }
 }
 
@@ -1467,36 +2040,59 @@ final class RecruitBoardViewModel: ObservableObject {
 @MainActor
 final class HistoryViewModel: ObservableObject {
     @Published private(set) var state: ScreenLoadState<HistoryContentState> = .initial
+    @Published private(set) var selectedFilter: HistoryFilter = .all
+
+    // The API loads 30 records on the history tab; 10 keeps "최근" a clear subset instead of a restyled full list.
+    static let recentItemLimit = 10
 
     private let session: AppSessionViewModel
     private let initialLoadTracker = InitialLoadTracker(screen: "history")
+    private var remoteItems: [MatchHistoryItem] = []
+    private var localItems: [LocalMatchRecord] = []
+    private var savedMatchIDs: Set<String> = []
+    private var isAuthenticatedHistory = false
 
     init(session: AppSessionViewModel) {
         self.session = session
     }
 
     func load(force: Bool = false, trigger: String = "unknown") async {
-        guard initialLoadTracker.begin(force: force, trigger: trigger) else { return }
+        let effectiveForce = force || session.shouldForceHistoryReloadAfterResultSave
+        guard initialLoadTracker.begin(force: effectiveForce, trigger: trigger) else { return }
         var didSucceed = false
         defer { initialLoadTracker.finish(success: didSucceed) }
         let localItems = session.container.localStore.localMatchRecords
+        refreshSavedMatchIDs()
 
         guard let userID = session.currentUserID else {
-            if localItems.isEmpty {
-                state = .empty("로컬에 저장된 경기 기록이 없습니다.\n경기 결과를 저장하면 이 탭에서 다시 확인할 수 있어요.")
-            } else {
-                state = .content(.guest(localItems))
-            }
+            remoteItems = []
+            self.localItems = localItems
+            isAuthenticatedHistory = false
+            applyFilterToState()
             didSucceed = true
             return
         }
 
         state = .loading
+        debugHistoryRead("action=fetch_start userId=\(userID) force=\(effectiveForce) source=\(trigger)")
+        session.markHistoryReadStarted(userID: userID, force: effectiveForce, source: trigger)
         do {
             let items = try await session.container.profileRepository.history(userID: userID, limit: 30)
-            state = items.isEmpty ? .empty("아직 기록된 내전이 없습니다.") : .content(.authenticated(items))
+            remoteItems = items
+            self.localItems = localItems
+            isAuthenticatedHistory = true
+            applyFilterToState()
             didSucceed = true
+            debugHistoryRead("action=fetch_success items=\(items.count) hasLoaded=true")
+            session.markHistoryReadCompleted(userID: userID, items: items)
+            if items.isEmpty {
+                debugHistoryRead("action=fetch_empty userId=\(userID) reason=server_returned_empty")
+                session.logHistoryEmptySyncState(userID: userID)
+            }
         } catch let error as UserFacingError {
+            debugHistoryRead(
+                "action=fetch_failure userId=\(userID) code=\(error.code ?? "nil") status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)"
+            )
             session.handleProtectedLoadError(
                 error,
                 requirement: .profileHistory,
@@ -1504,13 +2100,127 @@ final class HistoryViewModel: ObservableObject {
                 fallbackMessage: "로그인 후 기록을 다시 확인할 수 있어요."
             )
         } catch {
+            debugHistoryRead("action=fetch_failure userId=\(userID) code=nil status=nil message=\(error.localizedDescription)")
             state = .error(UserFacingError(title: "기록 로딩 실패", message: "경기 기록을 불러오지 못했습니다."))
         }
     }
 
+    func selectFilter(_ filter: HistoryFilter) {
+        guard selectedFilter != filter else { return }
+        selectedFilter = filter
+        guard state.value != nil else { return }
+        applyFilterToState()
+    }
+
+    func toggleSaved(matchID: String) {
+        savedMatchIDs = session.container.localStore.toggleHistorySaved(matchID: matchID)
+        guard state.value != nil else { return }
+        applyFilterToState()
+    }
+
     func reset() {
         state = .initial
+        selectedFilter = .all
+        remoteItems = []
+        localItems = []
+        savedMatchIDs = []
+        isAuthenticatedHistory = false
         initialLoadTracker.reset()
+    }
+
+    private func applyFilterToState() {
+        let viewState = makeViewState()
+        debugHistoryFilter(
+            "selected=\(viewState.selectedFilter.debugName) total=\(viewState.allItems.count) displayed=\(viewState.displayedItems.count)"
+        )
+        state = .content(isAuthenticatedHistory ? .authenticated(viewState) : .guest(viewState))
+    }
+
+    private func makeViewState() -> HistoryViewState {
+        let allItems = allHistoryItems()
+        let displayedItems: [HistoryListItem]
+        switch selectedFilter {
+        case .all:
+            displayedItems = allItems
+        case .recent:
+            displayedItems = Array(allItems.prefix(Self.recentItemLimit))
+        case .local:
+            displayedItems = localHistoryItems()
+        case .saved:
+            displayedItems = allItems.filter(\.isSaved)
+        }
+
+        return HistoryViewState(
+            selectedFilter: selectedFilter,
+            allItems: allItems,
+            displayedItems: displayedItems
+        )
+    }
+
+    private func allHistoryItems() -> [HistoryListItem] {
+        var seenMatchIDs = Set<String>()
+        var mergedItems: [HistoryListItem] = []
+
+        for item in remoteItems.map({ HistoryListItem(remoteItem: $0, isSaved: isHistorySaved(matchID: $0.matchID)) }) {
+            guard seenMatchIDs.insert(canonicalHistoryMatchID(item.matchID)).inserted else { continue }
+            mergedItems.append(item)
+        }
+
+        for item in localHistoryItems() {
+            guard seenMatchIDs.insert(canonicalHistoryMatchID(item.matchID)).inserted else { continue }
+            mergedItems.append(item)
+        }
+
+        return sortHistoryItems(mergedItems)
+    }
+
+    private func localHistoryItems() -> [HistoryListItem] {
+        var seenMatchIDs = Set<String>()
+        let items = localItems.compactMap { item -> HistoryListItem? in
+            guard seenMatchIDs.insert(canonicalHistoryMatchID(item.matchID)).inserted else { return nil }
+            return HistoryListItem(localItem: item, isSaved: isHistorySaved(matchID: item.matchID))
+        }
+        return sortHistoryItems(items)
+    }
+
+    private func sortHistoryItems(_ items: [HistoryListItem]) -> [HistoryListItem] {
+        items.sorted { lhs, rhs in
+            if lhs.sortDate == rhs.sortDate {
+                return lhs.matchID < rhs.matchID
+            }
+            return lhs.sortDate > rhs.sortDate
+        }
+    }
+
+    private func isHistorySaved(matchID: String) -> Bool {
+        savedMatchIDs.contains(canonicalHistoryMatchID(matchID))
+    }
+
+    private func canonicalHistoryMatchID(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func refreshSavedMatchIDs() {
+        savedMatchIDs = session.container.localStore.savedHistoryMatchIDs
+        debugHistorySaved("action=load savedCount=\(savedMatchIDs.count)")
+    }
+
+    private func debugHistoryRead(_ message: String) {
+        #if DEBUG
+        print("[HistoryReadDebug] \(message)")
+        #endif
+    }
+
+    private func debugHistoryFilter(_ message: String) {
+        #if DEBUG
+        print("[HistoryFilterDebug] \(message)")
+        #endif
+    }
+
+    private func debugHistorySaved(_ message: String) {
+        #if DEBUG
+        print("[HistorySavedDebug] \(message)")
+        #endif
     }
 }
 
@@ -1565,6 +2275,32 @@ final class ProfileViewModel: ObservableObject {
                 power = nil
                 history = []
             }
+            let positionSummary = ProfilePositionSummaryViewState.build(profile: profile, power: power)
+            let powerSection = power.map {
+                ProfilePowerSectionViewState.build(power: $0, positionSummary: positionSummary)
+            }
+            let resolvedTopChampions = Self.resolveTopChampions(profile: profile, power: power)
+            let resolvedTopChampionAggregation = power?.topChampionAggregation ?? profile.topChampionAggregation
+            let topChampionsSection = ProfileTopChampionsSectionState.build(
+                champions: resolvedTopChampions,
+                aggregation: resolvedTopChampionAggregation,
+                riotAccountsViewState: riotAccountsViewState
+            )
+            debugProfile(
+                "action=positions_applied primary=\(positionSummary.primary?.rawValue ?? "nil") secondary=\(positionSummary.secondary?.rawValue ?? "nil") source=\(positionSummary.source.rawValue)"
+            )
+            if let power {
+                debugProfile(
+                    "action=power_breakdown_render overall=\(Int(power.overallPower.rounded())) primary=\(positionSummary.primary?.rawValue ?? "nil") secondary=\(positionSummary.secondary?.rawValue ?? "nil")"
+                )
+            }
+            debugProfile(
+                "action=top_champions_priority topChampionsCount=\(resolvedTopChampions.count) aggregationStatus=\(resolvedTopChampionAggregation?.status?.debugValue ?? "nil") reason=\(resolvedTopChampionAggregation?.normalizedReason?.lowercased() ?? "nil") resolvedState=\(topChampionsSection.debugState.rawValue)"
+            )
+            debugProfile("action=top_champions_state state=\(topChampionsSection.debugState.rawValue)")
+            topChampionsSection.renderedChampions.forEach { item in
+                debugProfile("action=top_champion_render rank=\(item.rank) championKey=\(item.championKey)")
+            }
 
             state = .content(
                 .authenticated(
@@ -1572,7 +2308,10 @@ final class ProfileViewModel: ObservableObject {
                         profile: profile,
                         riotAccountsViewState: riotAccountsViewState,
                         power: power,
-                        history: history
+                        positionSummary: positionSummary,
+                        powerSection: powerSection,
+                        history: history,
+                        topChampionsSection: topChampionsSection
                     )
                 )
             )
@@ -1592,6 +2331,24 @@ final class ProfileViewModel: ObservableObject {
     func reset() {
         state = .initial
         initialLoadTracker.reset()
+    }
+
+    private static func resolveTopChampions(profile: UserProfile, power: PowerProfile?) -> [ProfileTopChampion] {
+        if let powerChampions = power?.topChampions, !powerChampions.isEmpty {
+            return powerChampions
+        }
+
+        if !profile.topChampions.isEmpty {
+            return profile.topChampions
+        }
+
+        return power?.topChampions ?? profile.topChampions
+    }
+
+    private func debugProfile(_ message: String) {
+#if DEBUG
+        print("[ProfileDebug] \(message)")
+#endif
     }
 }
 
@@ -2729,6 +3486,7 @@ final class GroupDetailViewModel: ObservableObject {
     private let session: AppSessionViewModel
     private var activeLoadToken = 0
     private var isGroupContextActive = true
+    private var hasLoggedTestMemberCleanup = false
     let groupID: String
 
     var isEditVisible: Bool {
@@ -2808,6 +3566,7 @@ final class GroupDetailViewModel: ObservableObject {
                 session.container.localStore.removeGroup(id: groupID)
             }
             logManagementVisibility(for: snapshot)
+            logRealMemberSnapshot(memberCount: members.count, source: "live", context: trigger.rawValue)
             #if DEBUG
             print("[RouteFetch] fetch success screen=group_detail groupID=\(groupID) source=live members=\(members.count)")
             #endif
@@ -3191,6 +3950,8 @@ final class GroupDetailViewModel: ObservableObject {
         state = .content(updatedSnapshot)
         session.container.localStore.trackGroup(id: updatedGroup.id, name: updatedGroup.name)
         logManagementVisibility(for: updatedSnapshot)
+        logRealMemberSnapshot(memberCount: members.count, source: "live", context: GroupDetailLoadTrigger.memberInvited.rawValue)
+        debugGroupDetail("group members refreshed count=\(members.count)")
     }
 
     private func canUseGroupContextForRequests(trigger: GroupDetailLoadTrigger) -> Bool {
@@ -3241,6 +4002,22 @@ final class GroupDetailViewModel: ObservableObject {
             }
         }
         return profiles
+    }
+
+    private func logRealMemberSnapshot(memberCount: Int, source: String, context: String) {
+        logTestMemberCleanupIfNeeded()
+        debugGroupDetail("live member snapshot updated memberCount=\(memberCount) source=\(source) context=\(context)")
+#if DEBUG
+        print("[GroupDetailDebug] action=real_member_snapshot_updated memberCount=\(memberCount) source=\(source) context=\(context)")
+#endif
+    }
+
+    private func logTestMemberCleanupIfNeeded() {
+        guard !hasLoggedTestMemberCleanup else { return }
+        hasLoggedTestMemberCleanup = true
+#if DEBUG
+        print("[DebugCleanup] feature=test_members removed=true screen=group_detail")
+#endif
     }
 
     private func debugGroupDetail(_ message: String) {
@@ -3300,23 +4077,38 @@ final class GroupMemberInviteViewModel: ObservableObject, Identifiable {
         return availability(for: selectedUser).isSelectable && !isSubmitting
     }
 
+    var selectedCount: Int {
+        selectedUser == nil ? 0 : 1
+    }
+
+    func handleSheetAppear() {
+        debugInviteSheet("invite sheet onAppear")
+        refreshRecentSearchKeywords()
+        logCurrentState()
+        logSelectedUserID(selectedUserID)
+    }
+
     func refreshRecentSearchKeywords() {
         recentSearchKeywords = session.container.localStore.recentSearchKeywords
+        debugInviteSheet("recent search count=\(recentSearchKeywords.count)")
     }
 
     func updateQuery(_ rawQuery: String) {
         let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         searchTask?.cancel()
+        searchTask = nil
 
         guard !trimmedQuery.isEmpty else {
-            state = .idle
-            selectedUserID = nil
+            setState(.idle)
+            setSelectedUserID(nil)
             submissionErrorMessage = nil
             refreshRecentSearchKeywords()
             return
         }
 
-        state = .searching
+        setSelectedUserID(nil)
+        submissionErrorMessage = nil
+        setState(.searching)
         searchTask = Task {
             try? await Task.sleep(nanoseconds: 350_000_000)
             guard !Task.isCancelled else { return }
@@ -3327,13 +4119,17 @@ final class GroupMemberInviteViewModel: ObservableObject, Identifiable {
     func submitSearch(_ rawQuery: String) {
         let trimmedQuery = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmedQuery.isEmpty else {
-            state = .idle
+            setState(.idle)
+            setSelectedUserID(nil)
             return
         }
 
         recordRecentSearchKeyword(trimmedQuery)
         searchTask?.cancel()
-        state = .searching
+        searchTask = nil
+        setSelectedUserID(nil)
+        submissionErrorMessage = nil
+        setState(.searching)
         searchTask = Task {
             await performSearch(trimmedQuery)
         }
@@ -3356,21 +4152,22 @@ final class GroupMemberInviteViewModel: ObservableObject, Identifiable {
 
     func cancelPendingSearch() {
         searchTask?.cancel()
+        searchTask = nil
     }
 
     func select(_ user: GroupMemberInviteUser) {
         guard !isSubmitting else { return }
         guard availability(for: user).isSelectable else { return }
-        selectedUserID = user.id
+        setSelectedUserID(user.id)
         submissionErrorMessage = nil
     }
 
     func availability(for user: GroupMemberInviteUser) -> GroupMemberInviteRowAvailability {
-        if existingMemberUserIDs.contains(user.id) {
-            return .alreadyMember
-        }
         if user.id == currentUserID {
             return .selfUser
+        }
+        if existingMemberUserIDs.contains(user.id) {
+            return .alreadyMember
         }
         if !permission.isEnabled {
             return .disabledByPermission
@@ -3393,10 +4190,10 @@ final class GroupMemberInviteViewModel: ObservableObject, Identifiable {
         submissionErrorMessage = nil
         existingMemberUserIDs.insert(userID)
         if selectedUserID == userID {
-            selectedUserID = nil
+            setSelectedUserID(nil)
         }
         if case let .results(items) = state {
-            state = .results(items)
+            setState(.results(items))
         }
     }
 
@@ -3404,24 +4201,66 @@ final class GroupMemberInviteViewModel: ObservableObject, Identifiable {
         do {
             let users = try await session.container.profileRepository.searchInviteUsers(query: query)
             guard !Task.isCancelled else { return }
+            searchTask = nil
 
             if users.isEmpty {
-                state = .empty("검색 결과가 없어요.")
+                setState(.empty("검색 결과가 없어요."))
             } else {
-                state = .results(users)
+                setState(.results(users))
             }
         } catch let error as UserFacingError {
             guard !Task.isCancelled else { return }
-            state = .error(error)
+            searchTask = nil
+            setState(.error(error))
         } catch {
             guard !Task.isCancelled else { return }
-            state = .error(
-                UserFacingError(
-                    title: "사용자 검색 실패",
-                    message: "사용자를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
+            searchTask = nil
+            setState(
+                .error(
+                    UserFacingError(
+                        title: "사용자 검색 실패",
+                        message: "사용자를 검색하지 못했어요. 잠시 후 다시 시도해 주세요."
+                    )
                 )
             )
         }
+    }
+
+    private func setState(_ nextState: ViewState) {
+        state = nextState
+        logCurrentState()
+    }
+
+    private func setSelectedUserID(_ userID: String?) {
+        selectedUserID = userID
+        logSelectedUserID(userID)
+    }
+
+    private func logCurrentState() {
+        let stateDescription: String
+        switch state {
+        case .idle:
+            stateDescription = "idle"
+        case .searching:
+            stateDescription = "searching"
+        case let .results(users):
+            stateDescription = "results count=\(users.count)"
+        case let .empty(message):
+            stateDescription = "empty message=\(message)"
+        case let .error(error):
+            stateDescription = "error title=\(error.title) code=\(error.code ?? "nil")"
+        }
+        debugInviteSheet("current invite state=\(stateDescription)")
+    }
+
+    private func logSelectedUserID(_ userID: String?) {
+        debugInviteSheet("selected user id=\(userID ?? "nil")")
+    }
+
+    private func debugInviteSheet(_ message: String) {
+        #if DEBUG
+        print("[GroupInvite] \(message)")
+        #endif
     }
 }
 
@@ -3649,11 +4488,40 @@ final class MatchDetailViewModel: ObservableObject {
 final class RiotAccountsViewModel: ObservableObject {
     @Published var state: ScreenLoadState<RiotAccountSnapshot> = .initial
     @Published var actionState: AsyncActionState = .idle
-    @Published var syncInProgressIDs: Set<String> = []
-    @Published var unlinkInProgressIDs: Set<String> = []
+    @Published private(set) var syncInProgressIDs: Set<String> = []
+    @Published private(set) var unlinkInProgressIDs: Set<String> = []
     @Published var isConnecting = false
 
+    private enum RiotAccountPatchResult {
+        case missing
+        case noChange(current: RiotAccount)
+        case updated(previous: RiotAccount, current: RiotAccount)
+
+        var currentAccount: RiotAccount? {
+            switch self {
+            case .missing:
+                return nil
+            case let .noChange(current), let .updated(_, current):
+                return current
+            }
+        }
+
+        var changed: Bool {
+            switch self {
+            case .updated:
+                return true
+            case .missing, .noChange:
+                return false
+            }
+        }
+    }
+
     private let session: AppSessionViewModel
+    private var pollingTasks: [String: Task<Void, Never>] = [:]
+    private var completionBannerAccountIDs: Set<String> = []
+    private var isViewVisible = false
+    private var isSceneActive = true
+    private var isFetchInFlight = false
 
     init(session: AppSessionViewModel) {
         self.session = session
@@ -3661,6 +4529,135 @@ final class RiotAccountsViewModel: ObservableObject {
 
     private var currentAccounts: [RiotAccount] {
         state.value?.accounts ?? []
+    }
+
+    private var isPollingPermitted: Bool {
+        isViewVisible && isSceneActive && session.isAuthenticated
+    }
+
+    private func debugRiotPolling(_ message: String) {
+        #if DEBUG
+        print("[RiotPollingDebug] \(message)")
+        #endif
+    }
+
+    var emptyAccountsDescription: String {
+        "연결된 Riot ID가 없어요."
+    }
+
+    private func errorSignature(_ error: UserFacingError) -> String {
+        [
+            riotAccountsEndpoint(error.endpoint),
+            error.requestMethod?.uppercased() ?? "GET",
+            error.statusCode.map(String.init) ?? "nil",
+            error.code ?? "nil",
+            error.message,
+        ].joined(separator: "|")
+    }
+
+    private var currentErrorSignature: String? {
+        guard case let .error(error) = state else { return nil }
+        return errorSignature(error)
+    }
+
+    private func stateDebugName(_ state: ScreenLoadState<RiotAccountSnapshot>) -> String {
+        switch state {
+        case .initial:
+            return "initial"
+        case .loading:
+            return "loading"
+        case .refreshing:
+            return "refreshing"
+        case .content:
+            return "loaded"
+        case .empty:
+            return "empty"
+        case .error:
+            return "error"
+        }
+    }
+
+    private func riotAccountsErrorType(for error: UserFacingError) -> RiotAccountsDisplayErrorType {
+        if error.requiresAuthentication || error.statusCode == 401 || error.statusCode == 403 {
+            return .authError
+        }
+        if let statusCode = error.statusCode, statusCode >= 500 {
+            return .serverError
+        }
+        if error.normalizedCode.hasPrefix("NETWORK_") {
+            return .networkError
+        }
+        return .genericError
+    }
+
+    private func mappedRiotAccountsError(_ error: UserFacingError) -> (type: RiotAccountsDisplayErrorType, error: UserFacingError) {
+        let type = riotAccountsErrorType(for: error)
+
+        switch type {
+        case .authError:
+            return (type, error)
+        case .networkError:
+            return (
+                type,
+                riotAccountsPresentedError(
+                    from: error,
+                    title: "네트워크 연결을 확인해 주세요.",
+                    message: "인터넷 연결 상태를 확인한 뒤 다시 시도해 주세요."
+                )
+            )
+        case .serverError:
+            return (
+                type,
+                riotAccountsPresentedError(
+                    from: error,
+                    title: "Riot ID 목록을 불러오는 중 문제가 발생했어요.",
+                    message: "서버 설정 또는 동기화 상태에 문제가 있을 수 있어요. 잠시 후 다시 시도해 주세요."
+                )
+            )
+        case .genericError:
+            return (
+                type,
+                riotAccountsPresentedError(
+                    from: error,
+                    title: "Riot ID 목록을 불러오는 중 문제가 발생했어요.",
+                    message: "잠시 후 다시 시도해 주세요."
+                )
+            )
+        }
+    }
+
+    private func reusableSessionState() -> RiotLinkedAccountsViewState? {
+        switch session.riotAccountsViewState {
+        case .loading:
+            return nil
+        case .noLinkedAccounts, .loaded, .error:
+            return session.riotAccountsViewState
+        }
+    }
+
+    private func setDisplayedState(_ nextState: ScreenLoadState<RiotAccountSnapshot>) {
+        guard state != nextState else { return }
+        state = nextState
+    }
+
+    private func setSyncInProgress(_ isActive: Bool, for accountID: String) {
+        var nextIDs = syncInProgressIDs
+        if isActive {
+            guard nextIDs.insert(accountID).inserted else { return }
+        } else {
+            guard nextIDs.remove(accountID) != nil else { return }
+        }
+        syncInProgressIDs = nextIDs
+    }
+
+    private func setUnlinkInProgress(_ isActive: Bool, for accountID: String) {
+        var nextIDs = unlinkInProgressIDs
+        if isActive {
+            guard nextIDs.insert(accountID).inserted else { return }
+        } else {
+            guard nextIDs.remove(accountID) != nil else { return }
+        }
+        unlinkInProgressIDs = nextIDs
     }
 
     private func setAccounts(
@@ -3671,30 +4668,79 @@ final class RiotAccountsViewModel: ObservableObject {
         if syncSession {
             session.applyRiotAccounts(accounts, invalidateDependents: invalidateDependents)
         }
-        let snapshot = RiotAccountSnapshot(accounts: accounts, syncInProgressIDs: syncInProgressIDs)
-        state = accounts.isEmpty ? .empty("추가한 Riot ID가 없습니다.") : .content(snapshot)
+        let nextState: ScreenLoadState<RiotAccountSnapshot> = accounts.isEmpty
+            ? .empty(emptyAccountsDescription)
+            : .content(RiotAccountSnapshot(accounts: accounts))
+        setDisplayedState(nextState)
     }
 
-    private func applyRiotAccountsViewState(_ riotAccountsViewState: RiotLinkedAccountsViewState) {
+    private func applyRiotAccountsViewState(
+        _ riotAccountsViewState: RiotLinkedAccountsViewState,
+        source: String,
+        logFetchResult: Bool = true
+    ) {
         switch riotAccountsViewState {
         case .loading:
-            state = .loading
+            setDisplayedState(.loading)
         case .noLinkedAccounts:
+            cancelAllPolling(reason: "no_linked_accounts")
             setAccounts([], syncSession: false)
+            if logFetchResult {
+                debugRiotAccounts("action=fetch_success source=\(source) count=0 ui_state=empty")
+            }
         case let .loaded(accounts):
             setAccounts(accounts, syncSession: false)
-            observeSyncStatusesIfNeeded(for: accounts)
+            reconcilePollingTargets(with: accounts, source: "loaded_accounts")
+            if logFetchResult {
+                debugRiotAccounts("action=fetch_success source=\(source) count=\(accounts.count) ui_state=loaded")
+            }
         case let .error(error):
-            state = .error(error)
+            cancelAllPolling(reason: "error_state")
+            let mappedError = mappedRiotAccountsError(error)
+            let endpoint = riotAccountsEndpoint(mappedError.error.endpoint)
+            let signature = errorSignature(mappedError.error)
+            if logFetchResult {
+                debugRiotAccounts(
+                    "action=fetch_failure source=\(source) endpoint=\(endpoint) status=\(mappedError.error.statusCode.map(String.init) ?? "nil") code=\(mappedError.error.code ?? "nil")"
+                )
+                debugRiotAccounts(
+                    "action=map_error_state source=\(source) type=\(mappedError.type.rawValue) ui_state=\(mappedError.type.rawValue)"
+                )
+            }
+            if currentErrorSignature == signature {
+                debugRiotAccounts("action=drop_ui_reapply reason=same_error_signature source=\(source)")
+                return
+            }
+            setDisplayedState(.error(mappedError.error))
         }
     }
 
-    private func updateAccount(id: String, transform: (RiotAccount) -> RiotAccount) {
-        let updatedAccounts = currentAccounts.map { account in
-            account.id == id ? transform(account) : account
+    @discardableResult
+    private func patchAccount(
+        id: String,
+        syncSession: Bool = true,
+        invalidateDependents: Bool = false,
+        transform: (RiotAccount) -> RiotAccount
+    ) -> RiotAccountPatchResult {
+        let accounts = currentAccounts
+        guard let index = accounts.firstIndex(where: { $0.id == id }) else {
+            return .missing
         }
-        guard updatedAccounts != currentAccounts else { return }
-        setAccounts(updatedAccounts)
+
+        let previousAccount = accounts[index]
+        let updatedAccount = transform(previousAccount)
+        guard updatedAccount != previousAccount else {
+            return .noChange(current: previousAccount)
+        }
+
+        var updatedAccounts = accounts
+        updatedAccounts[index] = updatedAccount
+        setAccounts(
+            updatedAccounts,
+            syncSession: syncSession,
+            invalidateDependents: invalidateDependents
+        )
+        return .updated(previous: previousAccount, current: updatedAccount)
     }
 
     private func accountsAfterAdding(_ addedAccount: RiotAccount) -> [RiotAccount] {
@@ -3706,71 +4752,249 @@ final class RiotAccountsViewModel: ObservableObject {
         return preservedAccounts + [addedAccount]
     }
 
-    private func observeSyncStatusesIfNeeded(for accounts: [RiotAccount]) {
-        for account in accounts where account.syncStatus.isInFlight && !syncInProgressIDs.contains(account.id) {
-            syncInProgressIDs.insert(account.id)
-            Task { [weak self] in
-                await self?.pollSyncStatus(for: account.id, showCompletionBanner: false)
-            }
+    private func reconcilePollingTargets(with accounts: [RiotAccount], source: String) {
+        let desiredIDs = Set(accounts.filter { $0.syncStatus.isInFlight }.map(\.id))
+        let activeIDs = Set(pollingTasks.keys)
+
+        for accountID in activeIDs.subtracting(desiredIDs) {
+            cancelPolling(for: accountID, reason: "account_no_longer_inflight")
+        }
+
+        guard isPollingPermitted else { return }
+
+        for accountID in desiredIDs {
+            startPollingIfNeeded(for: accountID, source: source, showCompletionBanner: false)
         }
     }
 
-    private func pollSyncStatus(for accountID: String, showCompletionBanner: Bool) async {
-        defer { syncInProgressIDs.remove(accountID) }
+    private func startPollingIfNeeded(for accountID: String, source: String, showCompletionBanner: Bool) {
+        if showCompletionBanner {
+            completionBannerAccountIDs.insert(accountID)
+        }
 
-        for attempt in 0..<6 {
-            if attempt > 0 {
-                try? await Task.sleep(nanoseconds: 1_500_000_000)
+        guard let account = currentAccounts.first(where: { $0.id == accountID }) else {
+            debugRiotPolling("action=skip_start reason=account_missing riotAccountId=\(accountID) source=\(source)")
+            return
+        }
+        guard isPollingPermitted else {
+            debugRiotPolling("action=skip_start reason=polling_not_permitted riotAccountId=\(accountID) source=\(source)")
+            return
+        }
+        guard account.syncStatus.isInFlight || syncInProgressIDs.contains(accountID) else {
+            debugRiotPolling("action=skip_start reason=not_inflight riotAccountId=\(accountID) source=\(source)")
+            return
+        }
+        guard pollingTasks[accountID] == nil else {
+            debugRiotPolling("action=skip_start reason=already_polling riotAccountId=\(accountID) source=\(source)")
+            return
+        }
+
+        setSyncInProgress(true, for: accountID)
+        debugRiotPolling("action=start riotAccountId=\(accountID) source=\(source)")
+
+        pollingTasks[accountID] = Task { [weak self] in
+            await self?.runPollingLoop(for: accountID)
+        }
+    }
+
+    private func cancelPolling(for accountID: String, reason: String) {
+        guard let task = pollingTasks.removeValue(forKey: accountID) else { return }
+        debugRiotPolling("action=stop riotAccountId=\(accountID) reason=\(reason)")
+        task.cancel()
+        setSyncInProgress(false, for: accountID)
+    }
+
+    private func cancelAllPolling(reason: String) {
+        for accountID in Array(pollingTasks.keys) {
+            cancelPolling(for: accountID, reason: reason)
+        }
+    }
+
+    private func pollingIntervalSeconds(after attempt: Int, startedAt: Date) -> Double {
+        let elapsed = Date().timeIntervalSince(startedAt)
+        switch elapsed {
+        case ..<8:
+            return attempt < 2 ? 1.25 : 1.5
+        case ..<20:
+            return 3
+        default:
+            return 5
+        }
+    }
+
+    private func runPollingLoop(for accountID: String) async {
+        let startedAt = Date()
+        var attempt = 0
+
+        defer {
+            pollingTasks[accountID] = nil
+            setSyncInProgress(false, for: accountID)
+        }
+
+        while !Task.isCancelled {
+            guard isPollingPermitted else { return }
+            guard let account = currentAccounts.first(where: { $0.id == accountID }) else {
+                debugRiotPolling("action=stop riotAccountId=\(accountID) reason=account_missing")
+                return
             }
-
-            guard session.isAuthenticated else { return }
+            guard account.syncStatus.isInFlight || syncInProgressIDs.contains(accountID) else {
+                debugRiotPolling("action=stop riotAccountId=\(accountID) reason=local_state_terminal")
+                return
+            }
 
             do {
                 let syncState = try await session.container.riotRepository.syncStatus(accountID: accountID)
-                var updatedAccount: RiotAccount?
-                updateAccount(id: accountID) { account in
-                    let nextAccount = account.withSyncStatus(syncState)
-                    updatedAccount = nextAccount
-                    return nextAccount
+                let shouldInvalidateDependents = !syncState.syncStatus.isInFlight
+                    && (syncState.syncStatus == .partial || syncState.syncStatus == .succeeded)
+                let patchResult = patchAccount(
+                    id: accountID,
+                    syncSession: !syncState.syncStatus.isInFlight,
+                    invalidateDependents: shouldInvalidateDependents
+                ) { account in
+                    account.withSyncStatus(syncState)
                 }
 
-                guard let updatedAccount else { return }
-                if !syncState.syncStatus.isInFlight {
-                    if showCompletionBanner {
-                        if updatedAccount.syncUIState.isFailure {
-                            actionState = .failure(updatedAccount.syncStatusSummary)
-                        } else {
-                            actionState = .success("동기화가 완료되었습니다")
-                        }
-                    }
+                debugRiotPolling(
+                    "action=response riotAccountId=\(accountID) syncStatus=\(syncState.syncStatus.rawValue) changed=\(patchResult.changed)"
+                )
+
+                switch patchResult {
+                case .missing:
+                    debugRiotPolling("action=stop riotAccountId=\(accountID) reason=account_missing_after_response")
                     return
+                case let .noChange(current):
+                    debugRiotPolling("action=drop_ui_update reason=no_meaningful_change riotAccountId=\(accountID)")
+                    if !syncState.syncStatus.isInFlight {
+                        handleTerminalTransition(for: accountID, account: current, refreshDependents: false)
+                        return
+                    }
+                case let .updated(previous, current):
+                    debugRiotPolling(
+                        "action=patch_row riotAccountId=\(accountID) from=\(previous.syncStatus.rawValue) to=\(current.syncStatus.rawValue)"
+                    )
+                    if !syncState.syncStatus.isInFlight {
+                        handleTerminalTransition(
+                            for: accountID,
+                            account: current,
+                            refreshDependents: shouldInvalidateDependents
+                        )
+                        return
+                    }
                 }
             } catch let error as UserFacingError {
-                if showCompletionBanner {
+                debugRiotPolling("action=stop riotAccountId=\(accountID) reason=sync_status_error message=\(error.message)")
+                if completionBannerAccountIDs.remove(accountID) != nil {
                     actionState = .failure(error.message)
                 }
                 return
             } catch {
-                if showCompletionBanner {
+                debugRiotPolling("action=stop riotAccountId=\(accountID) reason=sync_status_error message=\(error.localizedDescription)")
+                if completionBannerAccountIDs.remove(accountID) != nil {
                     actionState = .failure("동기화 상태를 확인하지 못했습니다")
                 }
                 return
             }
-        }
 
-        if showCompletionBanner {
-            actionState = .success("동기화 요청이 접수되었습니다. 잠시 후 상태를 다시 확인해 주세요.")
+            let interval = pollingIntervalSeconds(after: attempt, startedAt: startedAt)
+            debugRiotPolling("action=reschedule riotAccountId=\(accountID) interval=\(interval)")
+            attempt += 1
+
+            do {
+                try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
+            } catch {
+                return
+            }
         }
     }
 
-    func load(force: Bool = false) async {
+    private func handleTerminalTransition(for accountID: String, account: RiotAccount, refreshDependents: Bool) {
+        if refreshDependents {
+            debugRiotPolling("action=refresh_related_data riotAccountId=\(accountID) target=power_profile")
+        }
+        debugRiotPolling("action=stop riotAccountId=\(accountID) reason=terminal_state")
+        if completionBannerAccountIDs.remove(accountID) != nil {
+            if account.syncUIState.isFailure {
+                actionState = .failure(account.syncStatusSummary)
+            } else {
+                actionState = .success("동기화가 완료되었습니다")
+            }
+        }
+    }
+
+    func handleViewAppear() {
+        isViewVisible = true
+        reconcilePollingTargets(with: currentAccounts, source: "onAppear")
+    }
+
+    func handleViewDisappear() {
+        guard isViewVisible else { return }
+        isViewVisible = false
+        cancelAllPolling(reason: "view_disappear")
+    }
+
+    func handleScenePhaseChange(_ scenePhase: ScenePhase) {
+        let isActive = scenePhase == .active
+        guard isSceneActive != isActive else { return }
+        isSceneActive = isActive
+
+        if isActive {
+            reconcilePollingTargets(with: currentAccounts, source: "scene_active")
+        } else {
+            cancelAllPolling(reason: "app_background")
+        }
+    }
+
+    func retry() {
+        debugRiotAccounts("action=retry_tap")
+        Task { await load(force: true, source: "retry") }
+    }
+
+    func load(force: Bool = false, source: String = "unknown") async {
         guard session.isAuthenticated else {
-            state = .empty("로그인하면 Riot ID 추가와 동기화를 사용할 수 있어요.")
+            cancelAllPolling(reason: "unauthenticated")
+            setDisplayedState(.empty("로그인하면 Riot ID 추가와 동기화를 사용할 수 있어요."))
             return
         }
-        if !force, case .content = state { return }
-        let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
+
+        if isFetchInFlight {
+            debugRiotAccounts("action=drop_fetch reason=in_flight source=\(source)")
+            return
+        }
+
+        if !force {
+            switch state {
+            case .content, .empty, .error:
+                debugRiotAccounts(
+                    "action=drop_fetch reason=already_resolved source=\(source) ui_state=\(stateDebugName(state))"
+                )
+                return
+            case .initial, .loading, .refreshing:
+                break
+            }
+
+            if let sessionState = reusableSessionState() {
+                debugRiotAccounts("action=drop_fetch reason=session_state_reused source=\(source)")
+                applyRiotAccountsViewState(sessionState, source: "\(source)_cached", logFetchResult: false)
+                return
+            }
+        }
+
+        isFetchInFlight = true
+        debugRiotAccounts("action=fetch_start source=\(source) force=\(force) ui_state=\(stateDebugName(state))")
+        if case .initial = state {
+            setDisplayedState(.loading)
+        }
+        let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force, source: source)
+        isFetchInFlight = false
+
         if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
+            let endpoint = riotAccountsEndpoint(error.endpoint)
+            debugRiotAccounts(
+                "action=fetch_failure source=\(source) endpoint=\(endpoint) status=\(error.statusCode.map(String.init) ?? "nil") code=\(error.code ?? "nil")"
+            )
+            debugRiotAccounts(
+                "action=map_error_state source=\(source) type=\(RiotAccountsDisplayErrorType.authError.rawValue) ui_state=\(RiotAccountsDisplayErrorType.authError.rawValue)"
+            )
             session.handleProtectedLoadError(
                 error,
                 requirement: .riotAccount,
@@ -3779,7 +5003,7 @@ final class RiotAccountsViewModel: ObservableObject {
             )
             return
         }
-        applyRiotAccountsViewState(riotAccountsViewState)
+        applyRiotAccountsViewState(riotAccountsViewState, source: source)
     }
 
     func connect(gameName: String, tagLine: String, region: String, isPrimary: Bool) async -> Bool {
@@ -3795,6 +5019,7 @@ final class RiotAccountsViewModel: ObservableObject {
 
         actionState = .inProgress("Riot ID를 추가하는 중입니다")
         do {
+            let shouldInvalidateDependents = currentAccounts.isEmpty
             let addedAccount = try await session.container.riotRepository.connect(
                 gameName: normalizedGameName,
                 tagLine: normalizedTagLine,
@@ -3803,19 +5028,23 @@ final class RiotAccountsViewModel: ObservableObject {
             )
 
             let optimisticAccounts = accountsAfterAdding(addedAccount)
-            setAccounts(optimisticAccounts, invalidateDependents: true)
+            setAccounts(optimisticAccounts, invalidateDependents: false)
+            reconcilePollingTargets(with: optimisticAccounts, source: "connect_optimistic")
 
             let riotAccountsViewState = await session.refreshRiotAccountsViewState(
                 force: true,
-                invalidateDependents: true
+                invalidateDependents: shouldInvalidateDependents,
+                source: "connect"
             )
             switch riotAccountsViewState {
             case .loading:
-                setAccounts(optimisticAccounts, invalidateDependents: true)
+                setAccounts(optimisticAccounts, invalidateDependents: shouldInvalidateDependents)
+                reconcilePollingTargets(with: optimisticAccounts, source: "connect_loading_fallback")
             case .noLinkedAccounts, .loaded:
-                applyRiotAccountsViewState(riotAccountsViewState)
+                applyRiotAccountsViewState(riotAccountsViewState, source: "connect")
             case .error:
-                setAccounts(optimisticAccounts, invalidateDependents: true)
+                setAccounts(optimisticAccounts, invalidateDependents: shouldInvalidateDependents)
+                reconcilePollingTargets(with: optimisticAccounts, source: "connect_error_fallback")
             }
             actionState = .success("Riot ID를 추가했습니다")
             return true
@@ -3823,9 +5052,10 @@ final class RiotAccountsViewModel: ObservableObject {
             if error.serverContractCode == .riotAccountAlreadyAddedByThisUser {
                 let riotAccountsViewState = await session.refreshRiotAccountsViewState(
                     force: true,
-                    invalidateDependents: true
+                    invalidateDependents: true,
+                    source: "connect_conflict_refresh"
                 )
-                applyRiotAccountsViewState(riotAccountsViewState)
+                applyRiotAccountsViewState(riotAccountsViewState, source: "connect_conflict_refresh")
             }
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
             return false
@@ -3840,23 +5070,41 @@ final class RiotAccountsViewModel: ObservableObject {
             actionState = .failure("로그인 후 Riot ID 동기화를 사용할 수 있어요.")
             return
         }
-        syncInProgressIDs.insert(id)
+        setSyncInProgress(true, for: id)
+        completionBannerAccountIDs.insert(id)
         actionState = .inProgress("동기화를 요청하는 중입니다")
         do {
             let requestedAt = Date()
             let accepted = try await session.container.riotRepository.sync(accountID: id)
-            updateAccount(id: id) { account in
+            let shouldInvalidateDependents = accepted.syncStatus == .partial || accepted.syncStatus == .succeeded
+            let patchResult = patchAccount(
+                id: id,
+                invalidateDependents: shouldInvalidateDependents
+            ) { account in
                 account.withSyncAccepted(accepted, requestedAt: requestedAt)
             }
             session.container.localStore.appendNotification(title: "Riot 동기화 요청", body: "Riot ID 동기화가 큐에 등록되었습니다.", symbol: "arrow.clockwise")
-            actionState = .success("동기화 요청을 보냈습니다")
-            await pollSyncStatus(for: id, showCompletionBanner: true)
+
+            if accepted.syncStatus.isInFlight {
+                actionState = .success("동기화 요청을 보냈습니다")
+                startPollingIfNeeded(for: id, source: "manual_sync", showCompletionBanner: true)
+            } else if let currentAccount = patchResult.currentAccount {
+                handleTerminalTransition(
+                    for: id,
+                    account: currentAccount,
+                    refreshDependents: shouldInvalidateDependents
+                )
+            } else {
+                setSyncInProgress(false, for: id)
+            }
         } catch let error as UserFacingError {
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
-            syncInProgressIDs.remove(id)
+            completionBannerAccountIDs.remove(id)
+            setSyncInProgress(false, for: id)
         } catch {
             actionState = .failure("동기화 요청에 실패했습니다")
-            syncInProgressIDs.remove(id)
+            completionBannerAccountIDs.remove(id)
+            setSyncInProgress(false, for: id)
         }
     }
 
@@ -3868,8 +5116,10 @@ final class RiotAccountsViewModel: ObservableObject {
         guard !unlinkInProgressIDs.contains(account.id) else { return }
 
         let previousAccounts = currentAccounts
-        unlinkInProgressIDs.insert(account.id)
-        syncInProgressIDs.remove(account.id)
+        setUnlinkInProgress(true, for: account.id)
+        completionBannerAccountIDs.remove(account.id)
+        cancelPolling(for: account.id, reason: "unlink_started")
+        setSyncInProgress(false, for: account.id)
         setAccounts(
             previousAccounts.filter { $0.id != account.id },
             invalidateDependents: true
@@ -3881,9 +5131,10 @@ final class RiotAccountsViewModel: ObservableObject {
             actionState = .success("Riot ID를 목록에서 제거했습니다")
             let riotAccountsViewState = await session.refreshRiotAccountsViewState(
                 force: true,
-                invalidateDependents: true
+                invalidateDependents: true,
+                source: "unlink"
             )
-            applyRiotAccountsViewState(riotAccountsViewState)
+            applyRiotAccountsViewState(riotAccountsViewState, source: "unlink")
         } catch let error as UserFacingError {
             setAccounts(previousAccounts, invalidateDependents: true)
             session.handleProtectedActionError(error, requirement: .riotAccount, actionState: &actionState)
@@ -3892,7 +5143,7 @@ final class RiotAccountsViewModel: ObservableObject {
             actionState = .failure("Riot ID 제거에 실패했습니다")
         }
 
-        unlinkInProgressIDs.remove(account.id)
+        setUnlinkInProgress(false, for: account.id)
     }
 }
 
@@ -4052,6 +5303,11 @@ final class RecruitDetailViewModel: ObservableObject {
             if session.container.recruitingRepository.isCapabilityUnavailable(error) {
                 applyCapability = .unavailable("지금은 참가 신청을 진행할 수 없어요.")
                 actionState = .idle
+                return nil
+            }
+            if error.isRecruitingApplyClosedOrFull {
+                applyCapability = .unavailable("모집이 마감되어 참가 신청할 수 없어요.")
+                actionState = .failure("모집이 마감되어 참가 신청할 수 없어요.")
                 return nil
             }
             if error.isRecruitingClosed {
@@ -4408,19 +5664,52 @@ struct AppShellView: View {
                 .sheet(item: $session.authPrompt) { prompt in
                     AuthGateSheet(session: session, prompt: prompt)
                 }
+                .onAppear {
+                    LifecycleDebug.log(screen: "AppShellView", event: "onAppear", detail: "selectedTab=\(session.selectedTab.rawValue) scope=\(session.dataScopeKey)")
+                    debugAppShell("source=AppShell action=appear selectedTab=\(session.selectedTab.rawValue) scope=\(session.dataScopeKey)")
+                }
+                .onChange(of: session.selectedTab) { oldTab, newTab in
+                    debugAppShell("source=AppShell action=selectTab from=\(oldTab.rawValue) to=\(newTab.rawValue) scope=\(session.dataScopeKey)")
+                    guard newTab == .history else { return }
+                    Task {
+                        let force = session.shouldForceHistoryReloadAfterResultSave
+                        debugAppShell("source=AppShell action=loadSelectedTab trigger=\(AppShellLoadTrigger.tabSelected.rawValue) selectedTab=\(newTab.rawValue) force=\(force)")
+                        await historyViewModel.load(force: force, trigger: AppShellLoadTrigger.tabSelected.rawValue)
+                    }
+                }
                 .task(id: session.dataScopeKey) {
-                    guard lastSessionScopeKey != session.dataScopeKey else { return }
-                    lastSessionScopeKey = session.dataScopeKey
+                    let currentScopeKey = session.dataScopeKey
+                    debugAppShell("source=AppShell action=sessionScopeTask scope=\(currentScopeKey) lastScope=\(lastSessionScopeKey ?? "nil")")
+                    guard lastSessionScopeKey != currentScopeKey else {
+                        debugAppShell("source=AppShell action=sessionScopeTaskDrop scope=\(currentScopeKey) reason=same_scope")
+                        return
+                    }
+                    lastSessionScopeKey = currentScopeKey
+                    debugAppShell("source=AppShell action=resetViewModels reason=session_scope_change scope=\(currentScopeKey)")
                     resetViewModelsForSessionChange()
+                    debugAppShell("source=AppShell action=loadSelectedTab trigger=\(AppShellLoadTrigger.sessionScopeChange.rawValue) selectedTab=\(session.selectedTab.rawValue)")
                     await loadSelectedTab(force: true, trigger: .sessionScopeChange)
                 }
                 .task(id: session.riotLinkedDataRevision) {
                     guard session.riotLinkedDataRevision > 0 else { return }
+                    debugAppShell("source=AppShell action=riotLinkedDataRevision revision=\(session.riotLinkedDataRevision) selectedTab=\(session.selectedTab.rawValue)")
                     homeViewModel.reset()
                     profileViewModel.reset()
                     if session.selectedTab == .home || session.selectedTab == .profile {
+                        debugAppShell("source=AppShell action=loadSelectedTab trigger=\(AppShellLoadTrigger.riotLinkedDataRevision.rawValue) selectedTab=\(session.selectedTab.rawValue)")
                         await loadSelectedTab(force: true, trigger: .riotLinkedDataRevision)
                     }
+                }
+                .task(id: session.historyDataRevision) {
+                    guard session.historyDataRevision > 0 else { return }
+                    let refreshTriggered = session.selectedTab == .history
+                    debugHistoryRefresh(
+                        "action=revision_received revision=\(session.historyDataRevision) selectedTab=\(session.selectedTab.rawValue) refreshTriggered=\(refreshTriggered) reason=\(refreshTriggered ? "history_tab_active" : "tab_not_history")"
+                    )
+                    guard refreshTriggered else { return }
+                    historyViewModel.reset()
+                    debugAppShell("source=AppShell action=loadSelectedTab trigger=\(AppShellLoadTrigger.historyDataRevision.rawValue) selectedTab=\(session.selectedTab.rawValue) force=true")
+                    await historyViewModel.load(force: true, trigger: AppShellLoadTrigger.historyDataRevision.rawValue)
                 }
         }
     }
@@ -4444,6 +5733,9 @@ struct AppShellView: View {
     private func destinationView(_ route: AppRoute) -> some View {
         logDestinationBuilt(route)
         return buildDestinationView(route)
+            .onAppear {
+                LifecycleDebug.log(screen: route.lifecycleScreenName, event: "onAppear", detail: "route=\(route.debugDescription)")
+            }
     }
 
     @ViewBuilder
@@ -4596,20 +5888,34 @@ struct AppShellView: View {
 
     private func logDestinationBuilt(_ route: AppRoute) {
 #if DEBUG
-        print("[Route] destination built route=\(route.debugDescription)")
+        print("[RouteDebug] source=AppShell action=destinationBuilt route=\(route.debugDescription)")
 #endif
+    }
+
+    private func debugAppShell(_ message: String) {
+        #if DEBUG
+        print("[RouteDebug] \(message)")
+        #endif
+    }
+
+    private func debugHistoryRefresh(_ message: String) {
+        #if DEBUG
+        print("[HistoryRefreshDebug] \(message)")
+        #endif
     }
 }
 
 private enum AppShellLoadTrigger: String {
     case sessionScopeChange = "session_scope_change"
     case riotLinkedDataRevision = "riot_linked_data_revision"
+    case tabSelected = "tab_selected"
+    case historyDataRevision = "history_data_revision"
 
     var recruitBoardTrigger: RecruitBoardLoadTrigger {
         switch self {
         case .sessionScopeChange:
             return .sessionScopeChange
-        case .riotLinkedDataRevision:
+        case .riotLinkedDataRevision, .tabSelected, .historyDataRevision:
             return .screenAppear
         }
     }
@@ -4627,7 +5933,10 @@ struct HomeScreen: View {
             trailingAction: searchHeaderAction
         ) {
             content
-                .task { await viewModel.load() }
+                .onAppear {
+                    LifecycleDebug.log(screen: "HomeScreen", event: "onAppear", detail: "scope=\(session.dataScopeKey)")
+                }
+                .task { await viewModel.load(trigger: "onAppear_task") }
         }
     }
 
@@ -4639,7 +5948,7 @@ struct HomeScreen: View {
 
     private var searchHeaderAction: TabHeaderAction {
         TabHeaderAction(systemName: "magnifyingglass", accessibilityLabel: "검색") {
-            router.push(.search)
+            router.push(.search, source: "HomeScreen.searchHeaderAction")
         }
     }
 
@@ -4699,14 +6008,14 @@ struct HomeScreen: View {
                             }
                             quickAction(symbol: "arrow.left.arrow.right", title: "팀 자동\n생성", tint: AppPalette.accentPurple) {
                                 if let match = currentMatch {
-                                    router.push(.teamBalance(groupID: match.groupID, matchID: match.id))
+                                    router.push(.teamBalance(groupID: match.groupID, matchID: match.id), source: "HomeScreen.quickAction.teamBalance")
                                 } else {
                                     session.selectedTab = .match
                                 }
                             }
                             quickAction(symbol: "checkmark.circle", title: "결과\n입력", tint: AppPalette.accentGreen) {
                                 if let match = currentMatch {
-                                    router.push(.matchResult(matchID: match.id))
+                                    router.push(.matchResult(matchID: match.id), source: "HomeScreen.quickAction.matchResult")
                                 } else {
                                     session.selectedTab = .match
                                 }
@@ -4721,7 +6030,7 @@ struct HomeScreen: View {
                         } content: {
                             if let match = currentMatch {
                                 Button {
-                                    router.push(.matchLobby(groupID: match.groupID, matchID: match.id))
+                                    router.push(.matchLobby(groupID: match.groupID, matchID: match.id), source: "HomeScreen.upcomingMatchCard")
                                 } label: {
                                     VStack(alignment: .leading, spacing: 8) {
                                         HStack {
@@ -4799,7 +6108,7 @@ struct HomeScreen: View {
                             } content: {
                                 if let latestHistory = snapshot.latestHistory {
                                     Button {
-                                        router.push(.matchDetail(matchID: latestHistory.matchID))
+                                        router.push(.matchDetail(matchID: latestHistory.matchID), source: "HomeScreen.latestHistoryCard")
                                     } label: {
                                         MatchCardView(
                                             title: snapshot.groups.first?.name ?? "롤내전모임",
@@ -4818,7 +6127,7 @@ struct HomeScreen: View {
                                         buttonTitle: "결과 입력하러 가기"
                                     ) {
                                         if let match = currentMatch {
-                                            router.push(.matchResult(matchID: match.id))
+                                            router.push(.matchResult(matchID: match.id), source: "HomeScreen.emptyHistoryCta")
                                         } else {
                                             session.selectedTab = .match
                                         }
@@ -4852,7 +6161,7 @@ struct HomeScreen: View {
                                     buttonTitle: "결과 입력하러 가기"
                                 ) {
                                     if let match = currentMatch {
-                                        router.push(.matchResult(matchID: match.id))
+                                        router.push(.matchResult(matchID: match.id), source: "HomeScreen.guestResultCta")
                                     } else {
                                         session.selectedTab = .match
                                     }
@@ -4891,14 +6200,14 @@ struct HomeScreen: View {
         #if DEBUG
         print("[HomeSectionMore] section=\(section) destination=\(destination)")
         #endif
-        router.push(route)
+        router.push(route, source: "HomeScreen.openHomeSection section=\(section)")
     }
 
     private func openPowerSection(for riotAccountsViewState: RiotLinkedAccountsViewState) {
         if riotAccountsViewState.hasLinkedAccounts {
             openHomeSection(.powerDetail, section: "내 파워 프로필", destination: "파워 프로필 상세 화면")
         } else {
-            router.push(.riotAccounts)
+            router.push(.riotAccounts, source: "HomeScreen.openPowerSection.noLinkedAccount")
         }
     }
 
@@ -4945,7 +6254,7 @@ struct HomeScreen: View {
                     message: "Riot ID를 추가하면 내전 전적과 파워 프로필을 확인할 수 있어요",
                     buttonTitle: "Riot ID 추가하기"
                 ) {
-                    router.push(.riotAccounts)
+                    router.push(.riotAccounts, source: "HomeScreen.powerSummary.noLinkedAccounts")
                 }
             )
         case let .error(error):
@@ -4955,7 +6264,7 @@ struct HomeScreen: View {
                     message: error.message,
                     buttonTitle: "Riot ID 관리 열기"
                 ) {
-                    router.push(.riotAccounts)
+                    router.push(.riotAccounts, source: "HomeScreen.powerSummary.error")
                 }
             )
         case .loading:
@@ -4965,7 +6274,7 @@ struct HomeScreen: View {
                     message: "추가한 Riot ID를 확인한 뒤 파워 프로필을 보여드릴게요",
                     buttonTitle: "Riot ID 관리 열기"
                 ) {
-                    router.push(.riotAccounts)
+                    router.push(.riotAccounts, source: "HomeScreen.powerSummary.loading")
                 }
             )
         case .loaded:
@@ -6518,7 +7827,6 @@ struct GroupDetailScreen: View {
     let onGroupUpdated: (GroupSummary) -> Void
     let onGroupDeleted: (String) -> Void
     @State private var inviteSheetViewModel: GroupMemberInviteViewModel?
-    @State private var isInviteSheetPresented = false
     @State private var showsPowerGuideSheet = false
     @State private var showsManagementDialog = false
     @State private var showsDeleteConfirmation = false
@@ -6584,11 +7892,7 @@ struct GroupDetailScreen: View {
                         VStack(alignment: .leading, spacing: 10) {
                             HStack(spacing: 8) {
                                 Button("내전 생성") {
-                                    Task {
-                                        if let match = await viewModel.createMatch() {
-                                            router.push(.matchLobby(groupID: viewModel.groupID, matchID: match.id))
-                                        }
-                                    }
+                                    createMatchAndNavigate()
                                 }
                                 .buttonStyle(PrimaryButtonStyle())
 
@@ -6607,6 +7911,7 @@ struct GroupDetailScreen: View {
                                         : AppPalette.accentGold
                                 )
                                 .fixedSize(horizontal: false, vertical: true)
+
                         }
 
                         VStack(alignment: .leading, spacing: 10) {
@@ -6631,9 +7936,9 @@ struct GroupDetailScreen: View {
                                 .buttonStyle(.plain)
                             }
 
-                            GroupPowerGuideCard(guide: guide)
-
                             if snapshot.members.count <= 1 {
+                                GroupPowerGuideCard(guide: guide)
+
                                 VStack(alignment: .leading, spacing: 6) {
                                     Text("팀원을 추가해 내전을 준비해보세요.")
                                         .font(AppTypography.body(13, weight: .semibold))
@@ -6648,7 +7953,7 @@ struct GroupDetailScreen: View {
                                 .appPanel(background: AppPalette.bgCard, radius: 12)
                             }
 
-                            VStack(spacing: 8) {
+                            LazyVStack(spacing: 8) {
                                 ForEach(memberRows) { row in
                                     GroupPowerMemberRow(row: row)
                                 }
@@ -6681,41 +7986,39 @@ struct GroupDetailScreen: View {
                     }
                     .padding(16)
                 }
+                .refreshable {
+                    await viewModel.load(force: true, trigger: .retry)
+                }
             }
         }
-        .sheet(
-            isPresented: $isInviteSheetPresented,
-            onDismiss: {
-                inviteSheetViewModel = nil
-            }
-        ) {
-            if let inviteSheetViewModel {
-                GroupMemberInviteSheet(
-                    viewModel: inviteSheetViewModel,
-                    onClose: {
-                        isInviteSheetPresented = false
-                    },
-                    onInvite: { selectedUser in
-                        inviteSheetViewModel.beginSubmitting()
+        .sheet(item: $inviteSheetViewModel, onDismiss: clearInviteSheet) { inviteSheetViewModel in
+            GroupMemberInviteSheet(
+                viewModel: inviteSheetViewModel,
+                onClose: {
+                    self.inviteSheetViewModel = nil
+                },
+                onInvite: { selectedUser in
+                    inviteSheetViewModel.beginSubmitting()
 
-                        let result = await viewModel.inviteMember(selectedUser)
+                    let result = await viewModel.inviteMember(selectedUser)
 
-                        switch result {
-                        case .success:
-                            inviteSheetViewModel.completeInvite(userID: selectedUser.id)
+                    switch result {
+                    case .success:
+                        inviteSheetViewModel.completeInvite(userID: selectedUser.id)
 
-                            if let updatedGroup = viewModel.state.value?.group {
-                                onGroupUpdated(updatedGroup)
-                            }
-
-                            isInviteSheetPresented = false
-
-                        case let .failure(message):
-                            inviteSheetViewModel.presentSubmissionError(message)
+                        if let updatedGroup = viewModel.state.value?.group {
+                            onGroupUpdated(updatedGroup)
                         }
+
+                        self.inviteSheetViewModel = nil
+
+                    case let .failure(message):
+                        inviteSheetViewModel.presentSubmissionError(message)
                     }
-                )
-            }
+                }
+            )
+            .presentationDetents([.large])
+            .presentationDragIndicator(.visible)
         }
         .sheet(isPresented: $showsEditorSheet, onDismiss: clearGroupEditorError) {
             GroupEditorSheet(
@@ -6772,9 +8075,10 @@ struct GroupDetailScreen: View {
     }
 
     private func presentInviteSheet() {
-        let createdViewModel = viewModel.makeInviteViewModel()
+        guard let createdViewModel = viewModel.makeInviteViewModel() else { return }
+        debugInviteSheet("invite viewModel assigned id=\(createdViewModel.id)")
         inviteSheetViewModel = createdViewModel
-        isInviteSheetPresented = createdViewModel != nil
+        debugInviteSheet("invite sheet presented")
     }
 
     private func statBlock(_ value: String, label: String) -> some View {
@@ -6839,9 +8143,27 @@ struct GroupDetailScreen: View {
         groupEditorErrorMessage = nil
     }
 
+    private func clearInviteSheet() {
+        inviteSheetViewModel = nil
+    }
+
+    private func createMatchAndNavigate() {
+        Task {
+            if let match = await viewModel.createMatch() {
+                router.push(.matchLobby(groupID: viewModel.groupID, matchID: match.id))
+            }
+        }
+    }
+
     private func dismissInvalidGroupContext() {
         onGroupDeleted(viewModel.groupID)
         router.removeRoutes(referencingGroupID: viewModel.groupID)
+    }
+
+    private func debugInviteSheet(_ message: String) {
+        #if DEBUG
+        print("[GroupInvite] \(message)")
+        #endif
     }
 }
 
@@ -6858,35 +8180,43 @@ private struct GroupMemberInviteSheet: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            VStack(spacing: 16) {
-                headerSection
-                searchField
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 18)
-            .padding(.bottom, 12)
+        ZStack {
+            AppPalette.bgPrimary
+                .ignoresSafeArea()
 
-            ScrollView(showsIndicators: false) {
+            VStack(spacing: 0) {
                 VStack(spacing: 16) {
-                    if trimmedSearchText.isEmpty {
-                        inviteIntroCard
-                        recentSearchSection
-                    } else {
-                        resultContent
-                    }
+                    headerSection
+                    searchField
                 }
                 .padding(.horizontal, 16)
-                .padding(.bottom, 24)
+                .padding(.top, 18)
+                .padding(.bottom, 12)
+
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        if trimmedSearchText.isEmpty {
+                            inviteIntroCard
+                            recentSearchSection
+                        } else {
+                            resultContent
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                    .padding(.bottom, 24)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .scrollDismissesKeyboard(.interactively)
             }
-            .scrollDismissesKeyboard(.interactively)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         }
-        .background(AppPalette.bgPrimary.ignoresSafeArea())
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomActionBar
         }
         .onAppear {
-            viewModel.refreshRecentSearchKeywords()
+            viewModel.handleSheetAppear()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                 isSearchFieldFocused = true
             }
@@ -6943,6 +8273,7 @@ private struct GroupMemberInviteSheet: View {
                         .foregroundStyle(AppPalette.textMuted)
                 }
                 .buttonStyle(.plain)
+                .accessibilityLabel("검색어 지우기")
             }
         }
         .padding(.horizontal, 16)
@@ -7269,18 +8600,24 @@ private struct GroupMemberInviteSheet: View {
                 )
             }
 
-            if let selectedUser = viewModel.selectedUser {
-                HStack {
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("선택된 팀원")
                         .font(AppTypography.body(12))
                         .foregroundStyle(AppPalette.textSecondary)
-                    Spacer()
-                    Text(selectedUser.nickname)
+                    Text(viewModel.selectedUser?.nickname ?? "선택된 팀원이 없어요.")
                         .font(AppTypography.body(13, weight: .semibold))
-                        .foregroundStyle(AppPalette.textPrimary)
+                        .foregroundStyle(viewModel.selectedUser == nil ? AppPalette.textMuted : AppPalette.textPrimary)
+                        .lineLimit(1)
                 }
-                .padding(.horizontal, 4)
+
+                Spacer()
+
+                Text("선택 \(viewModel.selectedCount)명")
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(viewModel.selectedCount == 0 ? AppPalette.textMuted : AppPalette.accentBlue)
             }
+            .padding(.horizontal, 4)
 
             Button {
                 submitInvite()
@@ -8106,46 +9443,31 @@ struct HistoryScreen: View {
 
     @ViewBuilder
     private func historyContent(_ content: HistoryContentState) -> some View {
+        switch content {
+        case let .authenticated(viewState):
+            historyList(viewState, showsGuestHint: false)
+        case let .guest(viewState):
+            historyList(viewState, showsGuestHint: true)
+        }
+    }
+
+    private func historyList(_ viewState: HistoryViewState, showsGuestHint: Bool) -> some View {
         ScrollView(showsIndicators: false) {
             VStack(spacing: 0) {
                 VStack(spacing: 16) {
-                    HStack(spacing: 8) {
-                        FilterChipView(title: "전체", tint: AppPalette.accentBlue, isSelected: true)
-                        FilterChipView(title: "최근", tint: AppPalette.textSecondary)
-                        FilterChipView(title: "로컬", tint: AppPalette.textSecondary)
-                        FilterChipView(title: "저장", tint: AppPalette.textSecondary)
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                    historyFilterRow(selectedFilter: viewState.selectedFilter)
 
-                    switch content {
-                    case let .authenticated(items):
-                        ForEach(items) { item in
-                            Button {
-                                router.push(.matchDetail(matchID: item.matchID))
-                            } label: {
-                                MatchCardView(
-                                    title: item.role.shortLabel,
-                                    dateText: item.scheduledAt.dottedDateText,
-                                    isWin: item.result == "WIN",
-                                    blueSummary: "블루 팀",
-                                    redSummary: "레드 팀",
-                                    detail: "KDA \(item.kda) · MMR \(Int(item.deltaMMR))"
-                                )
-                            }
-                            .buttonStyle(.plain)
-                        }
-                    case let .guest(items):
+                    if showsGuestHint {
                         guestHistoryHint
+                    }
 
-                        ForEach(items) { item in
-                            MatchCardView(
-                                title: item.groupName,
-                                dateText: item.savedAt.dottedDateText,
-                                isWin: item.winningTeam == .blue,
-                                blueSummary: "승리 팀 \(item.winningTeam == .blue ? "블루" : "레드")",
-                                redSummary: "밸런스 \(item.balanceRating)/5",
-                                detail: "로컬 저장 · MVP \(item.mvpUserID)"
-                            )
+                    if viewState.displayedItems.isEmpty {
+                        historyEmptyState(message: viewState.emptyMessage)
+                            .transition(.opacity)
+                    } else {
+                        ForEach(viewState.displayedItems) { item in
+                            historyCardRow(item)
+                                .transition(.opacity)
                         }
                     }
                 }
@@ -8153,6 +9475,105 @@ struct HistoryScreen: View {
                 .padding(.top, 8)
             }
         }
+        .animation(.easeInOut(duration: 0.16), value: viewState.selectedFilter)
+        .animation(.easeInOut(duration: 0.16), value: viewState.displayedItems)
+    }
+
+    private func historyFilterRow(selectedFilter: HistoryFilter) -> some View {
+        HStack(spacing: 8) {
+            ForEach(HistoryFilter.allCases) { filter in
+                Button {
+                    withAnimation(.easeInOut(duration: 0.16)) {
+                        viewModel.selectFilter(filter)
+                    }
+                } label: {
+                    FilterChipView(
+                        title: filter.title,
+                        tint: filter == selectedFilter ? AppPalette.accentBlue : AppPalette.textSecondary,
+                        isSelected: filter == selectedFilter
+                    )
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("\(filter.title) 기록 필터")
+                .accessibilityAddTraits(filter == selectedFilter ? .isSelected : [])
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func historyCardRow(_ item: HistoryListItem) -> some View {
+        Group {
+            if item.source == .remote {
+                Button {
+                    router.push(.matchDetail(matchID: item.matchID))
+                } label: {
+                    historyCard(item)
+                }
+                .buttonStyle(.plain)
+            } else {
+                historyCard(item)
+            }
+        }
+        .contextMenu {
+            Button {
+                viewModel.toggleSaved(matchID: item.matchID)
+            } label: {
+                Label(item.isSaved ? "저장 해제" : "저장", systemImage: item.isSaved ? "bookmark.slash" : "bookmark")
+            }
+        }
+    }
+
+    private func historyCard(_ item: HistoryListItem) -> some View {
+        MatchCardView(
+            title: historyCardTitle(for: item),
+            dateText: item.sortDate.dottedDateText,
+            isWin: historyCardIsWin(for: item),
+            blueSummary: historyCardBlueSummary(for: item),
+            redSummary: historyCardRedSummary(for: item),
+            detail: historyCardDetail(for: item)
+        )
+    }
+
+    private func historyCardTitle(for item: HistoryListItem) -> String {
+        if let remoteItem = item.remoteItem {
+            return remoteItem.role.shortLabel
+        }
+        return item.localItem?.groupName ?? "최근 내전"
+    }
+
+    private func historyCardIsWin(for item: HistoryListItem) -> Bool {
+        if let remoteItem = item.remoteItem {
+            return remoteItem.result == "WIN"
+        }
+        return item.localItem?.winningTeam == .blue
+    }
+
+    private func historyCardBlueSummary(for item: HistoryListItem) -> String {
+        if item.remoteItem != nil {
+            return "블루 팀"
+        }
+        guard let localItem = item.localItem else { return "블루 팀" }
+        return "승리 팀 \(localItem.winningTeam == .blue ? "블루" : "레드")"
+    }
+
+    private func historyCardRedSummary(for item: HistoryListItem) -> String {
+        if item.remoteItem != nil {
+            return "레드 팀"
+        }
+        return "밸런스 \(item.localItem?.balanceRating ?? 0)/5"
+    }
+
+    private func historyCardDetail(for item: HistoryListItem) -> String {
+        if let remoteItem = item.remoteItem {
+            return "KDA \(remoteItem.kda) · MMR \(Int(remoteItem.deltaMMR))"
+        }
+        return "로컬 저장 · MVP \(item.localItem?.mvpUserID ?? "-")"
+    }
+
+    private func historyEmptyState(message: String) -> some View {
+        EmptyStateView(title: "기록", message: message)
+            .frame(minHeight: 280)
     }
 
     private var guestHistoryHint: some View {
@@ -8964,9 +10385,12 @@ struct ProfileScreen: View {
                     .font(AppTypography.body(13))
                     .foregroundStyle(AppPalette.textSecondary)
                 HStack(spacing: 8) {
-                    tagLabel(snapshot.profile.primaryPosition?.shortLabel ?? "MID", tint: AppPalette.accentBlue)
-                    tagLabel(snapshot.profile.secondaryPosition?.shortLabel ?? "TOP", tint: AppPalette.accentPurple)
+                    profilePositionTag(prefix: "주", position: snapshot.positionSummary.primary, tint: AppPalette.accentGold)
+                    profilePositionTag(prefix: "부", position: snapshot.positionSummary.secondary, tint: AppPalette.accentBlue)
                 }
+                Text(snapshot.positionSummary.captionText)
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textMuted)
             }
             Spacer()
         }
@@ -9017,37 +10441,16 @@ struct ProfileScreen: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
 
         if snapshot.riotAccountsViewState.hasLinkedAccounts {
-            if let power = snapshot.power {
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("파워 프로필")
-                        .font(AppTypography.heading(16, weight: .bold))
-                    HStack(spacing: 16) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("\(Int(power.overallPower.rounded()))")
-                                .font(AppTypography.heading(40, weight: .heavy))
-                                .foregroundStyle(AppPalette.accentBlue)
-                            Text("종합 파워")
-                                .font(AppTypography.body(11))
-                                .foregroundStyle(AppPalette.textMuted)
-                        }
-                        VStack(alignment: .leading, spacing: 8) {
-                            profileStat("최근 폼", value: Int(power.formScore.rounded()), tint: AppPalette.textPrimary)
-                            profileStat("안정성", value: Int(power.stability.rounded()), tint: AppPalette.textSecondary)
-                            profileStat("캐리 기여", value: Int(power.carry.rounded()), tint: AppPalette.textSecondary)
-                            profileStat("팀 기여도", value: Int(power.teamContribution.rounded()), tint: AppPalette.textSecondary)
-                            profileStat("내전 MMR", value: Int(power.inhouseMMR.rounded()), tint: AppPalette.accentGold)
-                        }
-                    }
-                    Text("라인별 파워")
-                        .font(AppTypography.body(13, weight: .semibold))
-                    ForEach([Position.top, .jungle, .mid, .adc, .support], id: \.self) { role in
-                        profileLanePowerRow(role: role, lanePower: power.lanePower[role])
-                    }
-                }
-                .padding(16)
-                .background(AppPalette.bgCard)
-                .clipShape(RoundedRectangle(cornerRadius: 12))
+            if let powerSection = snapshot.powerSection {
+                profilePowerCard(powerSection)
+            } else {
+                riotProfileEmptyStateCard(
+                    title: "파워 프로필을 준비 중이에요",
+                    message: "Riot 전적과 내전 기록을 확인한 뒤 파워와 라인 정보를 보여드릴게요."
+                )
             }
+
+            profileTopChampionsSection(snapshot.topChampionsSection)
 
             VStack(alignment: .leading, spacing: 10) {
                 Text("최근 내전 성적")
@@ -9063,16 +10466,19 @@ struct ProfileScreen: View {
                 title: "Riot ID 상태를 확인하지 못했어요",
                 message: error.message
             )
+            profileTopChampionsSection(snapshot.topChampionsSection)
         } else if case .loading = snapshot.riotAccountsViewState {
             riotProfileEmptyStateCard(
                 title: "Riot ID 목록을 확인하는 중이에요",
                 message: "추가한 Riot ID를 확인한 뒤 파워 프로필을 보여드릴게요."
             )
+            profileTopChampionsSection(snapshot.topChampionsSection)
         } else {
             riotProfileEmptyStateCard(
                 title: "Riot ID를 추가하면 확인할 수 있어요",
                 message: "내전 전적과 파워 프로필이 기준 Riot ID와 참고 데이터 기준으로 표시됩니다."
             )
+            profileTopChampionsSection(snapshot.topChampionsSection)
         }
     }
 
@@ -9174,6 +10580,92 @@ struct ProfileScreen: View {
             .clipShape(Capsule())
     }
 
+    private func profilePositionTag(prefix: String, position: Position?, tint: Color) -> some View {
+        tagLabel("\(prefix) \(position?.shortLabel ?? "--")", tint: tint)
+    }
+
+    private func profilePowerCard(_ state: ProfilePowerSectionViewState) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("파워 프로필")
+                .font(AppTypography.heading(16, weight: .bold))
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(state.overallText)
+                        .font(AppTypography.heading(40, weight: .heavy))
+                        .foregroundStyle(AppPalette.accentBlue)
+                    Text("종합 파워")
+                        .font(AppTypography.body(11))
+                        .foregroundStyle(AppPalette.textMuted)
+                }
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(state.stats) { stat in
+                        profileStat(stat)
+                    }
+                }
+            }
+            profilePositionSummary(state.positionSummary)
+            Text("라인별 파워")
+                .font(AppTypography.body(13, weight: .semibold))
+            ForEach(state.laneRows) { row in
+                profileLanePowerRow(row)
+            }
+            if let hint = state.calculationHintText {
+                Text(hint)
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(16)
+        .background(AppPalette.bgCard)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private func profilePositionSummary(_ summary: ProfilePositionSummaryViewState) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                profilePositionPowerBadge(
+                    title: "주라인",
+                    position: summary.primary,
+                    scoreText: summary.primaryPowerText,
+                    tint: AppPalette.accentGold
+                )
+                profilePositionPowerBadge(
+                    title: "부라인",
+                    position: summary.secondary,
+                    scoreText: summary.secondaryPowerText,
+                    tint: AppPalette.accentBlue
+                )
+            }
+            Text(summary.captionText)
+                .font(AppTypography.body(11))
+                .foregroundStyle(AppPalette.textMuted)
+        }
+    }
+
+    private func profilePositionPowerBadge(title: String, position: Position?, scoreText: String?, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .foregroundStyle(AppPalette.textSecondary)
+            Text(position?.shortLabel ?? "--")
+                .foregroundStyle(tint)
+            if let scoreText {
+                Text(scoreText)
+                    .foregroundStyle(AppPalette.textPrimary)
+            }
+        }
+        .font(AppTypography.body(11, weight: .semibold))
+        .lineLimit(1)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(AppPalette.bgTertiary.opacity(0.78))
+        .overlay(
+            RoundedRectangle(cornerRadius: 9)
+                .stroke(tint.opacity(0.28), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 9))
+    }
+
     private func profileStat(_ label: String, value: Int, tint: Color) -> some View {
         HStack {
             Text(label)
@@ -9183,6 +10675,29 @@ struct ProfileScreen: View {
             Text("\(value)")
                 .font(AppTypography.body(12, weight: .semibold))
                 .foregroundStyle(tint)
+        }
+    }
+
+    private func profileStat(_ stat: ProfilePowerStatViewState) -> some View {
+        HStack {
+            Text(stat.label)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+            Spacer()
+            Text(stat.valueText)
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(profileStatTint(stat.emphasis))
+        }
+    }
+
+    private func profileStatTint(_ emphasis: ProfilePowerStatEmphasis) -> Color {
+        switch emphasis {
+        case .primary:
+            return AppPalette.textPrimary
+        case .secondary:
+            return AppPalette.textSecondary
+        case .gold:
+            return AppPalette.accentGold
         }
     }
 
@@ -9232,17 +10747,250 @@ struct ProfileScreen: View {
         .clipShape(RoundedRectangle(cornerRadius: 12))
     }
 
-    private func profileLanePowerRow(role: Position, lanePower: Double?) -> some View {
-        HStack(spacing: 8) {
-            Text(role.shortLabel)
-                .font(AppTypography.body(12, weight: .semibold))
-                .foregroundStyle(role == .mid ? AppPalette.accentBlue : AppPalette.textSecondary)
-                .frame(width: 32, alignment: .leading)
-            ProgressView(value: max(lanePower ?? 0, 0), total: 100)
-                .tint(laneTint(role))
-            Text(lanePower.map { "\(Int($0.rounded()))" } ?? "--")
-                .font(AppTypography.body(12, weight: .semibold))
+    @ViewBuilder
+    private func profileTopChampionsSection(_ state: ProfileTopChampionsSectionState) -> some View {
+        switch state {
+        case .hidden:
+            EmptyView()
+        case let .empty(_, title, message, _):
+            VStack(alignment: .leading, spacing: 14) {
+                profileTopChampionsHeader(subtitle: state.headerSubtitle)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(title)
+                        .font(AppTypography.body(13, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                    Text(message)
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(minHeight: 92, alignment: .leading)
+                .padding(14)
+                .background(AppPalette.bgTertiary.opacity(0.72))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(AppPalette.border, lineWidth: 1)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+            }
+            .padding(16)
+            .background(AppPalette.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+        case let .content(items, _):
+            VStack(alignment: .leading, spacing: 14) {
+                profileTopChampionsHeader(subtitle: state.headerSubtitle)
+                VStack(spacing: 10) {
+                    ForEach(items) { item in
+                        profileTopChampionRow(item)
+                    }
+                }
+                .frame(minHeight: 92, alignment: .top)
+            }
+            .padding(16)
+            .background(AppPalette.bgCard)
+            .clipShape(RoundedRectangle(cornerRadius: 12))
         }
+    }
+
+    private func profileTopChampionsHeader(subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("주 챔피언")
+                .font(AppTypography.heading(16, weight: .bold))
+            Text(subtitle)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func profileTopChampionRow(_ item: ProfileTopChampionViewState) -> some View {
+        HStack(spacing: 12) {
+            Text("\(item.rank)")
+                .font(AppTypography.body(12, weight: .bold))
+                .foregroundStyle(profileTopChampionRankTint(item.rank))
+                .frame(width: 28, height: 28)
+                .background(
+                    Circle()
+                        .fill(item.isTopRanked ? AppPalette.accentGold.opacity(0.16) : AppPalette.bgTertiary)
+                )
+
+            profileTopChampionIcon(item)
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(item.championName)
+                    .font(AppTypography.body(14, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                HStack(spacing: 6) {
+                    profileTopChampionMetricChip(item.gamesText, tint: AppPalette.textPrimary)
+                    profileTopChampionMetricChip(item.winRateText, tint: AppPalette.accentGreen)
+                    if let kdaText = item.kdaText {
+                        profileTopChampionMetricChip(kdaText, tint: AppPalette.accentBlue)
+                    }
+                }
+                if let lastPlayedText = item.lastPlayedText {
+                    Text(lastPlayedText)
+                        .font(AppTypography.body(11))
+                        .foregroundStyle(AppPalette.textMuted)
+                }
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(12)
+        .background(item.isTopRanked ? AppPalette.bgTertiary.opacity(0.92) : AppPalette.bgSecondary.opacity(0.58))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(item.isTopRanked ? AppPalette.accentGold.opacity(0.32) : AppPalette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func profileTopChampionIcon(_ item: ProfileTopChampionViewState) -> some View {
+        ZStack {
+            if let iconURL = item.championIconURL {
+                AsyncImage(
+                    url: iconURL,
+                    transaction: Transaction(animation: .easeInOut(duration: 0.15))
+                ) { phase in
+                    switch phase {
+                    case let .success(image):
+                        image
+                            .resizable()
+                            .scaledToFill()
+                    default:
+                        profileTopChampionIconFallback(name: item.championName, isTopRanked: item.isTopRanked)
+                    }
+                }
+            } else {
+                profileTopChampionIconFallback(name: item.championName, isTopRanked: item.isTopRanked)
+            }
+        }
+        .frame(width: 44, height: 44)
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(AppPalette.border, lineWidth: 1)
+        )
+    }
+
+    private func profileTopChampionIconFallback(name: String, isTopRanked: Bool) -> some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 10)
+                .fill(AppPalette.bgSecondary)
+
+            Text(String(name.prefix(1)).uppercased())
+                .font(AppTypography.body(18, weight: .bold))
+                .foregroundStyle(isTopRanked ? AppPalette.accentGold : AppPalette.accentBlue)
+        }
+    }
+
+    private func profileTopChampionMetricChip(_ text: String, tint: Color) -> some View {
+        Text(text)
+            .font(AppTypography.body(11, weight: .semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .background(AppPalette.bgTertiary)
+            .clipShape(Capsule())
+            .lineLimit(1)
+    }
+
+    private func profileTopChampionRankTint(_ rank: Int) -> Color {
+        switch rank {
+        case 1:
+            return AppPalette.accentGold
+        case 2:
+            return AppPalette.textPrimary
+        case 3:
+            return AppPalette.accentBlue
+        default:
+            return AppPalette.textSecondary
+        }
+    }
+
+    private func profileLanePowerRow(_ row: ProfileLanePowerRowViewState) -> some View {
+        HStack(spacing: 8) {
+            Text(row.position.shortLabel)
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(profileLaneLabelTint(row))
+                .frame(width: 32, alignment: .leading)
+            ProgressView(value: row.progressValue, total: 100)
+                .tint(profileLaneTint(row))
+            if let roleBadgeText = row.roleBadgeText {
+                Text(roleBadgeText)
+                    .font(AppTypography.body(10, weight: .bold))
+                    .foregroundStyle(row.isPrimary ? AppPalette.accentGold : AppPalette.accentBlue)
+                    .frame(width: 18)
+            } else {
+                Text("")
+                    .frame(width: 18)
+            }
+            if let differenceText = row.differenceText {
+                profileLaneDifferenceChip(differenceText, row: row)
+            }
+            Text(row.powerText)
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(row.isPrimary ? AppPalette.accentGold : (row.isSecondary ? AppPalette.accentBlue : AppPalette.textPrimary))
+                .frame(width: 34, alignment: .trailing)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(profileLaneRowBackground(row))
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(profileLaneRowBorder(row), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private func profileLaneLabelTint(_ row: ProfileLanePowerRowViewState) -> Color {
+        if row.isPrimary { return AppPalette.accentGold }
+        if row.isSecondary { return AppPalette.accentBlue }
+        return AppPalette.textSecondary
+    }
+
+    private func profileLaneTint(_ row: ProfileLanePowerRowViewState) -> Color {
+        if row.isPrimary { return AppPalette.accentGold }
+        if row.isSecondary { return AppPalette.accentBlue }
+        return laneTint(row.position)
+    }
+
+    private func profileLaneDifferenceChip(_ text: String, row: ProfileLanePowerRowViewState) -> some View {
+        Text(text)
+            .font(AppTypography.body(10, weight: .bold))
+            .foregroundStyle(profileLaneDifferenceTint(row))
+            .padding(.horizontal, 7)
+            .padding(.vertical, 4)
+            .background(profileLaneDifferenceBackground(row))
+            .clipShape(Capsule())
+    }
+
+    private func profileLaneDifferenceTint(_ row: ProfileLanePowerRowViewState) -> Color {
+        if row.isPrimary { return AppPalette.accentGold }
+        if row.isSecondary { return AppPalette.accentBlue }
+        return AppPalette.textSecondary
+    }
+
+    private func profileLaneDifferenceBackground(_ row: ProfileLanePowerRowViewState) -> Color {
+        if row.isPrimary { return AppPalette.accentGold.opacity(0.14) }
+        if row.isSecondary { return AppPalette.accentBlue.opacity(0.14) }
+        return AppPalette.bgTertiary
+    }
+
+    private func profileLaneRowBackground(_ row: ProfileLanePowerRowViewState) -> Color {
+        if row.isPrimary { return AppPalette.accentGold.opacity(0.08) }
+        if row.isSecondary { return AppPalette.accentBlue.opacity(0.08) }
+        return AppPalette.bgSecondary.opacity(0.42)
+    }
+
+    private func profileLaneRowBorder(_ row: ProfileLanePowerRowViewState) -> Color {
+        if row.isPrimary { return AppPalette.accentGold.opacity(0.3) }
+        if row.isSecondary { return AppPalette.accentBlue.opacity(0.24) }
+        return AppPalette.border
     }
 
     private func laneTint(_ role: Position) -> Color {
@@ -9271,6 +11019,7 @@ struct ProfileScreen: View {
 }
 
 struct RiotAccountsScreen: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject var viewModel: RiotAccountsViewModel
     @ObservedObject var session: AppSessionViewModel
     let onBack: () -> Void
@@ -9289,17 +11038,26 @@ struct RiotAccountsScreen: View {
                 switch viewModel.state {
                 case .initial, .loading:
                     LoadingStateView(title: "Riot ID를 불러오는 중입니다")
-                        .task { await viewModel.load() }
                 case let .error(error):
-                    ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
-                case .empty:
-                    formContent(accounts: [])
+                    ErrorStateView(error: error) { viewModel.retry() }
+                case let .empty(message):
+                    formContent(accounts: [], emptyTitle: message)
                 case let .content(snapshot), let .refreshing(snapshot):
-                    formContent(accounts: snapshot.accounts)
+                    formContent(accounts: snapshot.accounts, emptyTitle: viewModel.emptyAccountsDescription)
                 }
             }
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
+        .onAppear {
+            viewModel.handleViewAppear()
+            Task { await viewModel.load(source: "onAppear") }
+        }
+        .onDisappear {
+            viewModel.handleViewDisappear()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            viewModel.handleScenePhaseChange(newPhase)
+        }
         .alert(
             "이 Riot ID를 목록에서 제거할까요?",
             isPresented: Binding(
@@ -9368,7 +11126,7 @@ struct RiotAccountsScreen: View {
         }
     }
 
-    private func formContent(accounts: [RiotAccount]) -> some View {
+    private func formContent(accounts: [RiotAccount], emptyTitle: String) -> some View {
         ScrollView(showsIndicators: false) {
             VStack(spacing: 20) {
                 VStack(alignment: .leading, spacing: 10) {
@@ -9465,7 +11223,7 @@ struct RiotAccountsScreen: View {
 
                     if accounts.isEmpty {
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("추가한 Riot ID가 없습니다")
+                            Text(emptyTitle)
                                 .font(AppTypography.body(14, weight: .semibold))
                             Text("게임 이름과 태그라인을 입력해 Riot ID를 추가하면, 밸런스 계산 기준과 참고 데이터를 여기서 확인할 수 있어요.")
                                 .font(AppTypography.body(12))
@@ -9480,88 +11238,20 @@ struct RiotAccountsScreen: View {
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     } else {
-                        ForEach(accounts) { account in
-                            let isSyncing = viewModel.syncInProgressIDs.contains(account.id) || account.syncStatus.isInFlight
-                            let isUnlinking = viewModel.unlinkInProgressIDs.contains(account.id)
+                        LazyVStack(spacing: 12) {
+                            ForEach(accounts) { account in
+                                let isSyncing = viewModel.syncInProgressIDs.contains(account.id) || account.syncStatus.isInFlight
+                                let isUnlinking = viewModel.unlinkInProgressIDs.contains(account.id)
 
-                            VStack(alignment: .leading, spacing: 14) {
-                                HStack(alignment: .top, spacing: 12) {
-                                    VStack(alignment: .leading, spacing: 6) {
-                                        HStack(spacing: 8) {
-                                            Text(account.isPrimary ? "기준" : "참고")
-                                                .font(AppTypography.body(11, weight: .semibold))
-                                                .foregroundStyle(account.isPrimary ? AppPalette.bgPrimary : AppPalette.textSecondary)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 3)
-                                                .background(account.isPrimary ? AppPalette.accentGold : AppPalette.bgTertiary)
-                                                .clipShape(Capsule())
-                                            Text(account.displayName)
-                                                .font(AppTypography.body(14, weight: .semibold))
-                                                .foregroundStyle(AppPalette.textPrimary)
-                                        }
-
-                                        Text("\(account.region.uppercased()) · \(account.verificationStatus.title)")
-                                            .font(AppTypography.body(12))
-                                            .foregroundStyle(AppPalette.textSecondary)
-                                    }
-
-                                    Spacer()
-
-                                    VStack(alignment: .trailing, spacing: 8) {
-                                        Button(isSyncing ? "동기화 중" : "Sync") {
-                                            Task { await viewModel.sync(id: account.id) }
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .tint(AppPalette.accentBlue)
-                                        .disabled(isSyncing || isUnlinking)
-
-                                        Button(isUnlinking ? "제거 중" : "제거") {
-                                            pendingUnlinkAccount = account
-                                        }
-                                        .buttonStyle(.bordered)
-                                        .tint(AppPalette.accentRed)
-                                        .disabled(isSyncing || isUnlinking)
-                                    }
-                                }
-
-                                infoRow(title: "동기화 상태") {
-                                    HStack(spacing: 8) {
-                                        statusPill(for: account.syncUIState)
-                                        if isSyncing {
-                                            ProgressView()
-                                                .controlSize(.small)
-                                                .tint(statusTint(for: account.syncUIState))
-                                        }
-                                    }
-                                }
-
-                                infoRow(
-                                    title: "마지막 동기화",
-                                    value: account.lastSyncedAt?.shortDateText
-                                        ?? account.lastSyncSucceededAt?.shortDateText
-                                        ?? "없음"
+                                RiotAccountRowView(
+                                    account: account,
+                                    isSyncing: isSyncing,
+                                    isUnlinking: isUnlinking,
+                                    onSync: { Task { await viewModel.sync(id: account.id) } },
+                                    onUnlink: { pendingUnlinkAccount = account }
                                 )
-
-                                infoRow(
-                                    title: account.syncUIState.isFailure ? "마지막 실패" : "마지막 요청",
-                                    value: account.syncUIState.isFailure
-                                        ? (account.lastSyncFailedAt?.shortDateText ?? account.lastSyncRequestedAt?.shortDateText ?? "없음")
-                                        : (account.lastSyncRequestedAt?.shortDateText ?? "없음")
-                                )
-
-                                infoRow(
-                                    title: account.syncUIState.isFailure ? "실패 원인" : "상태 설명",
-                                    value: account.syncStatusSummary,
-                                    tint: account.syncUIState.isFailure ? statusTint(for: account.syncUIState) : AppPalette.textSecondary
-                                )
+                                .equatable()
                             }
-                            .padding(16)
-                            .background(AppPalette.bgCard)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(account.isPrimary ? AppPalette.accentGold : AppPalette.border, lineWidth: 1)
-                            )
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
                         }
                     }
                 }
@@ -9605,6 +11295,143 @@ struct RiotAccountsScreen: View {
             Spacer()
         }
         .frame(minHeight: 18, alignment: .leading)
+    }
+
+    private func submitConnection() {
+        hasAttemptedSubmit = true
+        focusedField = nil
+
+        guard gameNameValidationState.isValid else {
+            focusedField = .gameName
+            return
+        }
+
+        guard tagLineValidationState.isValid else {
+            focusedField = .tagLine
+            return
+        }
+
+        Task {
+            let didConnect = await viewModel.connect(
+                gameName: normalizedGameName,
+                tagLine: normalizedTagLine,
+                region: RiotAccountInputValidator.region,
+                isPrimary: isPrimary
+            )
+
+            if didConnect {
+                gameName = ""
+                tagLine = ""
+                isPrimary = false
+                hasAttemptedSubmit = false
+            }
+        }
+    }
+
+    private func unlinkConfirmationMessage(for account: RiotAccount, accounts: [RiotAccount]) -> String {
+        var parts = ["제거하면 이 Riot ID의 동기화 정보와 목록 표시가 함께 사라집니다."]
+        if account.isPrimary {
+            if accounts.count <= 1 {
+                parts.append("현재 기준 Riot ID가 이 항목뿐이라 제거 후에는 추가한 Riot ID가 없는 상태가 될 수 있습니다.")
+            } else {
+                parts.append("기준 Riot ID를 제거하면 어떤 Riot ID를 기준으로 볼지는 서버 정책에 따라 다시 정리됩니다.")
+            }
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+private struct RiotAccountRowView: View, Equatable {
+    let account: RiotAccount
+    let isSyncing: Bool
+    let isUnlinking: Bool
+    let onSync: () -> Void
+    let onUnlink: () -> Void
+
+    static func == (lhs: RiotAccountRowView, rhs: RiotAccountRowView) -> Bool {
+        lhs.account == rhs.account
+            && lhs.isSyncing == rhs.isSyncing
+            && lhs.isUnlinking == rhs.isUnlinking
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 8) {
+                        Text(account.isPrimary ? "기준" : "참고")
+                            .font(AppTypography.body(11, weight: .semibold))
+                            .foregroundStyle(account.isPrimary ? AppPalette.bgPrimary : AppPalette.textSecondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(account.isPrimary ? AppPalette.accentGold : AppPalette.bgTertiary)
+                            .clipShape(Capsule())
+                        Text(account.displayName)
+                            .font(AppTypography.body(14, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                    }
+
+                    Text("\(account.region.uppercased()) · \(account.verificationStatus.title)")
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                }
+
+                Spacer()
+
+                VStack(alignment: .trailing, spacing: 8) {
+                    Button(isSyncing ? "동기화 중" : "Sync", action: onSync)
+                        .buttonStyle(.bordered)
+                        .tint(AppPalette.accentBlue)
+                        .disabled(isSyncing || isUnlinking)
+
+                    Button(isUnlinking ? "제거 중" : "제거", action: onUnlink)
+                        .buttonStyle(.bordered)
+                        .tint(AppPalette.accentRed)
+                        .disabled(isSyncing || isUnlinking)
+                }
+            }
+
+            infoRow(title: "동기화 상태") {
+                HStack(spacing: 8) {
+                    statusPill(for: account.syncUIState)
+                    if isSyncing {
+                        ProgressView()
+                            .controlSize(.small)
+                            .tint(statusTint(for: account.syncUIState))
+                    }
+                }
+            }
+
+            infoRow(
+                title: "마지막 동기화",
+                value: account.lastSyncedAt?.shortDateText
+                    ?? account.lastSyncSucceededAt?.shortDateText
+                    ?? "없음"
+            )
+
+            infoRow(
+                title: account.syncUIState.isFailure ? "마지막 실패" : "마지막 요청",
+                value: account.syncUIState.isFailure
+                    ? (account.lastSyncFailedAt?.shortDateText ?? account.lastSyncRequestedAt?.shortDateText ?? "없음")
+                    : (account.lastSyncRequestedAt?.shortDateText ?? "없음")
+            )
+
+            infoRow(
+                title: account.syncUIState.isFailure ? "실패 원인" : "상태 설명",
+                value: account.syncStatusSummary,
+                tint: account.syncUIState.isFailure ? statusTint(for: account.syncUIState) : AppPalette.textSecondary
+            )
+        }
+        .padding(16)
+        .background(AppPalette.bgCard)
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(account.isPrimary ? AppPalette.accentGold : AppPalette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .transaction { transaction in
+            transaction.animation = nil
+        }
     }
 
     @ViewBuilder
@@ -9672,49 +11499,6 @@ struct RiotAccountsScreen: View {
             .padding(.vertical, 5)
             .background(statusBackground(for: state))
             .clipShape(Capsule())
-    }
-
-    private func submitConnection() {
-        hasAttemptedSubmit = true
-        focusedField = nil
-
-        guard gameNameValidationState.isValid else {
-            focusedField = .gameName
-            return
-        }
-
-        guard tagLineValidationState.isValid else {
-            focusedField = .tagLine
-            return
-        }
-
-        Task {
-            let didConnect = await viewModel.connect(
-                gameName: normalizedGameName,
-                tagLine: normalizedTagLine,
-                region: RiotAccountInputValidator.region,
-                isPrimary: isPrimary
-            )
-
-            if didConnect {
-                gameName = ""
-                tagLine = ""
-                isPrimary = false
-                hasAttemptedSubmit = false
-            }
-        }
-    }
-
-    private func unlinkConfirmationMessage(for account: RiotAccount, accounts: [RiotAccount]) -> String {
-        var parts = ["제거하면 이 Riot ID의 동기화 정보와 목록 표시가 함께 사라집니다."]
-        if account.isPrimary {
-            if accounts.count <= 1 {
-                parts.append("현재 기준 Riot ID가 이 항목뿐이라 제거 후에는 추가한 Riot ID가 없는 상태가 될 수 있습니다.")
-            } else {
-                parts.append("기준 Riot ID를 제거하면 어떤 Riot ID를 기준으로 볼지는 서버 정책에 따라 다시 정리됩니다.")
-            }
-        }
-        return parts.joined(separator: " ")
     }
 }
 

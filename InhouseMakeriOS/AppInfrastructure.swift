@@ -110,6 +110,7 @@ private enum LocalStoreKey {
     static let groupIDs = "local.group.ids"
     static let recentMatches = "local.recent.matches"
     static let cachedResults = "local.cached.results"
+    static let savedHistoryMatchIDs = "local.history.saved.match.ids"
     static let manualAdjustDrafts = "local.manual.adjust.drafts"
     static let notifications = "local.notifications"
     static let recentSearchKeywords = "local.recent.search.keywords"
@@ -132,6 +133,16 @@ private enum LocalPreferenceKey: String {
     case notificationsEnabled = "local.notifications.enabled"
     case profilePublic = "local.profile.public"
     case historyPublic = "local.history.public"
+}
+
+enum LocalStoreSnapshotSource: String {
+    case swiftData
+    case userDefaults
+}
+
+struct LocalStoreSnapshot<Value> {
+    let value: Value
+    let source: LocalStoreSnapshotSource
 }
 
 enum AppModelContainerFactory {
@@ -482,6 +493,16 @@ private final class LocalPersistenceStore {
                 context.insert(entity)
             }
             pruneMatchRecords(in: context)
+        }
+    }
+
+    func clearRecentMatchTracking(matchID: String) {
+        write { context in
+            guard let entity = matchRecordEntity(for: matchID, in: context) else { return }
+            entity.groupID = nil
+            if entity.savedAt == nil {
+                context.delete(entity)
+            }
         }
     }
 
@@ -853,13 +874,37 @@ final class AppLocalStore {
     }
 
     var storedGroupIDs: [String] {
-        let groupIDs = persistenceStore.storedGroupIDs()
-        return groupIDs.isEmpty ? (defaults.stringArray(forKey: LocalStoreKey.groupIDs) ?? []) : groupIDs
+        storedGroupIDsSnapshot().value
+    }
+
+    func storedGroupIDsSnapshot() -> LocalStoreSnapshot<[String]> {
+        let persistedGroupIDs = persistenceStore.storedGroupIDs()
+        if !persistedGroupIDs.isEmpty {
+            return LocalStoreSnapshot(value: persistedGroupIDs, source: .swiftData)
+        }
+
+        if let fallbackGroupIDs = defaults.stringArray(forKey: LocalStoreKey.groupIDs) {
+            return LocalStoreSnapshot(value: fallbackGroupIDs, source: .userDefaults)
+        }
+
+        return LocalStoreSnapshot(value: [], source: .swiftData)
     }
 
     var recentMatches: [RecentMatchContext] {
-        let recentMatches = persistenceStore.recentMatches()
-        return recentMatches.isEmpty ? (decode([RecentMatchContext].self, forKey: LocalStoreKey.recentMatches) ?? []) : recentMatches
+        recentMatchesSnapshot().value
+    }
+
+    func recentMatchesSnapshot() -> LocalStoreSnapshot<[RecentMatchContext]> {
+        let persistedRecentMatches = persistenceStore.recentMatches()
+        if !persistedRecentMatches.isEmpty {
+            return LocalStoreSnapshot(value: persistedRecentMatches, source: .swiftData)
+        }
+
+        if let fallbackRecentMatches = decode([RecentMatchContext].self, forKey: LocalStoreKey.recentMatches) {
+            return LocalStoreSnapshot(value: fallbackRecentMatches, source: .userDefaults)
+        }
+
+        return LocalStoreSnapshot(value: [], source: .swiftData)
     }
 
     var cachedResults: [String: CachedResultMetadata] {
@@ -925,6 +970,14 @@ final class AppLocalStore {
         return records
     }
 
+    var savedHistoryMatchIDs: Set<String> {
+        if let encodedIDs = decode([String].self, forKey: LocalStoreKey.savedHistoryMatchIDs) {
+            return Set(encodedIDs.map(Self.normalizedHistoryMatchID).filter { !$0.isEmpty })
+        }
+
+        return Set((defaults.stringArray(forKey: LocalStoreKey.savedHistoryMatchIDs) ?? []).map(Self.normalizedHistoryMatchID).filter { !$0.isEmpty })
+    }
+
     var manualAdjustDrafts: [String: ManualAdjustDraft] {
         decode([String: ManualAdjustDraft].self, forKey: LocalStoreKey.manualAdjustDrafts) ?? [:]
     }
@@ -988,11 +1041,45 @@ final class AppLocalStore {
         save(Array(current.prefix(12)), forKey: LocalStoreKey.recentMatches)
     }
 
+    func clearRecentMatch(matchID: String) {
+        persistenceStore.clearRecentMatchTracking(matchID: matchID)
+        let filteredRecentMatches = recentMatches.filter { $0.matchID != matchID }
+        save(filteredRecentMatches, forKey: LocalStoreKey.recentMatches)
+        clearManualAdjustDraft(matchID: matchID)
+    }
+
     func cacheResult(matchID: String, metadata: CachedResultMetadata) {
         persistenceStore.cacheResult(matchID: matchID, metadata: metadata)
         var current = cachedResults
         current[matchID] = metadata
         save(current, forKey: LocalStoreKey.cachedResults)
+    }
+
+    func isHistorySaved(matchID: String) -> Bool {
+        savedHistoryMatchIDs.contains(Self.normalizedHistoryMatchID(matchID))
+    }
+
+    @discardableResult
+    func setHistorySaved(matchID: String, isSaved: Bool) -> Set<String> {
+        let normalizedMatchID = Self.normalizedHistoryMatchID(matchID)
+        guard !normalizedMatchID.isEmpty else { return savedHistoryMatchIDs }
+
+        var current = savedHistoryMatchIDs
+        if isSaved {
+            current.insert(normalizedMatchID)
+        } else {
+            current.remove(normalizedMatchID)
+        }
+        save(Array(current).sorted(), forKey: LocalStoreKey.savedHistoryMatchIDs)
+        debugHistorySaved("action=toggle matchId=\(normalizedMatchID) saved=\(isSaved)")
+        return current
+    }
+
+    @discardableResult
+    func toggleHistorySaved(matchID: String) -> Set<String> {
+        let normalizedMatchID = Self.normalizedHistoryMatchID(matchID)
+        let nextValue = !savedHistoryMatchIDs.contains(normalizedMatchID)
+        return setHistorySaved(matchID: normalizedMatchID, isSaved: nextValue)
     }
 
     func manualAdjustDraft(matchID: String) -> ManualAdjustDraft? {
@@ -1176,6 +1263,7 @@ final class AppLocalStore {
             LocalStoreKey.groupIDs,
             LocalStoreKey.recentMatches,
             LocalStoreKey.cachedResults,
+            LocalStoreKey.savedHistoryMatchIDs,
             LocalStoreKey.manualAdjustDrafts,
             LocalStoreKey.notifications,
             LocalStoreKey.recentSearchKeywords,
@@ -1183,6 +1271,16 @@ final class AppLocalStore {
             LocalStoreKey.teamBalancePreviewDraft,
             LocalStoreKey.resultPreviewDraft,
         ].contains { defaults.object(forKey: $0) != nil }
+    }
+
+    private static func normalizedHistoryMatchID(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func debugHistorySaved(_ message: String) {
+        #if DEBUG
+        print("[HistorySavedDebug] \(message)")
+        #endif
     }
 }
 
@@ -1593,6 +1691,7 @@ final class APIClient {
             || path == "/users/search"
             || path == "/groups"
             || path.hasPrefix("/groups/")
+            || path.hasPrefix("/matches/")
             || path == "/recruiting-posts"
             || path.hasPrefix("/recruiting-posts/")
             || path.hasSuffix("/power-profile")
@@ -1821,6 +1920,322 @@ struct RefreshTokenRequestDTO: Encodable {
     let refreshToken: String
 }
 
+private struct LossyDecodableList<Element: Decodable>: Decodable {
+    let elements: [Element]
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var values: [Element] = []
+
+        while !container.isAtEnd {
+            if let value = try? container.decode(Element.self) {
+                values.append(value)
+            } else {
+                _ = try? container.decode(JSONValue.self)
+            }
+        }
+
+        elements = values
+    }
+}
+
+struct ProfileTopChampionDTO: Codable {
+    let championId: Int?
+    let championKey: String
+    let championName: String
+    let games: Int
+    let wins: Int
+    let losses: Int
+    let winRate: Double
+    let kills: Double
+    let deaths: Double
+    let assists: Double
+    let kda: Double?
+    let lastPlayedAt: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case championId
+        case championID
+        case championIdSnake = "champion_id"
+        case championKey
+        case key
+        case championKeySnake = "champion_key"
+        case championName
+        case name
+        case championNameSnake = "champion_name"
+        case games
+        case gamesPlayed
+        case matchCount
+        case wins
+        case losses
+        case winRate
+        case winRateSnake = "win_rate"
+        case kills
+        case deaths
+        case assists
+        case kda
+        case lastPlayedAtSnake = "last_played_at"
+        case lastPlayedAt
+    }
+
+    init(
+        championId: Int? = nil,
+        championKey: String,
+        championName: String,
+        games: Int,
+        wins: Int,
+        losses: Int,
+        winRate: Double,
+        kills: Double,
+        deaths: Double,
+        assists: Double,
+        kda: Double? = nil,
+        lastPlayedAt: Date? = nil
+    ) {
+        self.championId = championId
+        self.championKey = championKey
+        self.championName = championName
+        self.games = games
+        self.wins = wins
+        self.losses = losses
+        self.winRate = winRate
+        self.kills = kills
+        self.deaths = deaths
+        self.assists = assists
+        self.kda = kda
+        self.lastPlayedAt = lastPlayedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        championId = Self.decodeLossyInt(from: container, forKeys: [.championId, .championID, .championIdSnake])
+        championKey = Self.decodeLossyString(from: container, forKeys: [.championKey, .championKeySnake, .key]) ?? ""
+        championName = Self.decodeLossyString(from: container, forKeys: [.championName, .championNameSnake, .name]) ?? ""
+        games = max(Self.decodeLossyInt(from: container, forKeys: [.games, .gamesPlayed, .matchCount]) ?? 0, 0)
+        wins = max(Self.decodeLossyInt(from: container, forKeys: [.wins]) ?? 0, 0)
+        losses = max(Self.decodeLossyInt(from: container, forKeys: [.losses]) ?? 0, 0)
+        winRate = Self.decodeLossyDouble(from: container, forKeys: [.winRate, .winRateSnake]) ?? 0
+        kills = Self.decodeLossyDouble(from: container, forKeys: [.kills]) ?? 0
+        deaths = Self.decodeLossyDouble(from: container, forKeys: [.deaths]) ?? 0
+        assists = Self.decodeLossyDouble(from: container, forKeys: [.assists]) ?? 0
+        kda = Self.decodeLossyDouble(from: container, forKeys: [.kda])
+        lastPlayedAt = Self.decodeLossyDate(from: container, forKeys: [.lastPlayedAt, .lastPlayedAtSnake])
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(championId, forKey: .championId)
+        try container.encode(championKey, forKey: .championKey)
+        try container.encode(championName, forKey: .championName)
+        try container.encode(games, forKey: .games)
+        try container.encode(wins, forKey: .wins)
+        try container.encode(losses, forKey: .losses)
+        try container.encode(winRate, forKey: .winRate)
+        try container.encode(kills, forKey: .kills)
+        try container.encode(deaths, forKey: .deaths)
+        try container.encode(assists, forKey: .assists)
+        try container.encodeIfPresent(kda, forKey: .kda)
+        try container.encodeIfPresent(lastPlayedAt, forKey: .lastPlayedAt)
+    }
+
+    func toDomain() -> ProfileTopChampion? {
+        let normalizedKey = championKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalizedName = championName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedKey.isEmpty || !normalizedName.isEmpty else { return nil }
+
+        return ProfileTopChampion(
+            championId: championId,
+            championKey: normalizedKey,
+            championName: normalizedName,
+            games: games,
+            wins: wins,
+            losses: losses,
+            winRate: winRate,
+            kills: kills,
+            deaths: deaths,
+            assists: assists,
+            kda: kda,
+            lastPlayedAt: lastPlayedAt
+        )
+    }
+
+    private static func decodeLossyInt(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Int? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return Int(value.rounded())
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyDouble(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Double? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return Double(value)
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                return Double(value.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyString(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return String(value)
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyDate(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Date? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Date.self, forKey: key) {
+                return value
+            }
+        }
+        return nil
+    }
+}
+
+struct ProfileTopChampionAggregationDTO: Codable {
+    let status: ChampionAggregationStatus?
+    let reason: String?
+    let message: String?
+    let syncCoverageSummary: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case reason
+        case message
+        case serverMessage
+        case syncCoverageSummary
+        case coverageSummary
+        case syncStatusSummary
+    }
+
+    init(
+        status: ChampionAggregationStatus? = nil,
+        reason: String? = nil,
+        message: String? = nil,
+        syncCoverageSummary: String? = nil
+    ) {
+        self.status = status
+        self.reason = reason
+        self.message = message
+        self.syncCoverageSummary = syncCoverageSummary
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.singleValueContainer() {
+            if let value = try? container.decode(String.self) {
+                self.init(status: ChampionAggregationStatus(serverValue: value))
+                return
+            }
+            if let value = try? container.decode(Bool.self) {
+                self.init(status: value ? .ready : .connectedEmpty)
+                return
+            }
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            status: Self.decodeLossyStatus(from: container, forKeys: [.status]),
+            reason: Self.decodeLossyString(from: container, forKeys: [.reason]),
+            message: Self.decodeLossyString(from: container, forKeys: [.message, .serverMessage]),
+            syncCoverageSummary: Self.decodeLossyString(
+                from: container,
+                forKeys: [.syncCoverageSummary, .coverageSummary, .syncStatusSummary]
+            )
+        )
+    }
+
+    func encode(to encoder: Encoder) throws {
+        if hasSupplementaryMetadata {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(status, forKey: .status)
+            try container.encodeIfPresent(reason, forKey: .reason)
+            try container.encodeIfPresent(message, forKey: .message)
+            try container.encodeIfPresent(syncCoverageSummary, forKey: .syncCoverageSummary)
+            return
+        }
+
+        var container = encoder.singleValueContainer()
+        try container.encode(status?.debugValue)
+    }
+
+    var hasSupplementaryMetadata: Bool {
+        reason != nil || message != nil || syncCoverageSummary != nil
+    }
+
+    func toDomain() -> ProfileTopChampionAggregation {
+        ProfileTopChampionAggregation(
+            status: status,
+            reason: reason,
+            message: message,
+            syncCoverageSummary: syncCoverageSummary
+        )
+    }
+
+    private static func decodeLossyStatus(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> ChampionAggregationStatus? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(ChampionAggregationStatus.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                return ChampionAggregationStatus(serverValue: value)
+            }
+            if let value = try? container.decodeIfPresent(Bool.self, forKey: key) {
+                return value ? .ready : .connectedEmpty
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyString(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !normalized.isEmpty {
+                    return normalized
+                }
+            }
+        }
+        return nil
+    }
+}
+
 struct UserProfileDTO: Codable {
     let id: String
     let email: String
@@ -1831,6 +2246,96 @@ struct UserProfileDTO: Codable {
     let styleTags: [String]
     let mannerScore: Double
     let noshowCount: Int
+    let topChampions: [ProfileTopChampionDTO]?
+    let topChampionAggregation: ProfileTopChampionAggregationDTO?
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case email
+        case nickname
+        case primaryPosition
+        case mainPosition
+        case secondaryPosition
+        case isFillAvailable
+        case styleTags
+        case mannerScore
+        case noshowCount
+        case topChampions
+        case championAggregationStatus
+        case topChampionsStatus
+        case topChampionAggregationStatus
+        case championStatsStatus
+    }
+
+    var championAggregationStatus: ChampionAggregationStatus? {
+        topChampionAggregation?.status
+    }
+
+    init(
+        id: String,
+        email: String,
+        nickname: String,
+        primaryPosition: Position?,
+        secondaryPosition: Position?,
+        isFillAvailable: Bool,
+        styleTags: [String],
+        mannerScore: Double,
+        noshowCount: Int,
+        topChampions: [ProfileTopChampionDTO]? = nil,
+        championAggregationStatus: ChampionAggregationStatus? = nil,
+        topChampionAggregation: ProfileTopChampionAggregationDTO? = nil
+    ) {
+        self.id = id
+        self.email = email
+        self.nickname = nickname
+        self.primaryPosition = primaryPosition
+        self.secondaryPosition = secondaryPosition
+        self.isFillAvailable = isFillAvailable
+        self.styleTags = styleTags
+        self.mannerScore = mannerScore
+        self.noshowCount = noshowCount
+        self.topChampions = topChampions
+        self.topChampionAggregation = topChampionAggregation ?? ProfileTopChampionAggregationDTO(status: championAggregationStatus)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        email = try container.decode(String.self, forKey: .email)
+        nickname = try container.decode(String.self, forKey: .nickname)
+        primaryPosition = Self.decodeLossyPosition(from: container, forKeys: [.primaryPosition, .mainPosition])
+        secondaryPosition = Self.decodeLossyPosition(from: container, forKeys: [.secondaryPosition])
+        isFillAvailable = (try? container.decode(Bool.self, forKey: .isFillAvailable)) ?? false
+        styleTags = (try? container.decode([String].self, forKey: .styleTags)) ?? []
+        mannerScore = (try? container.decode(Double.self, forKey: .mannerScore))
+            ?? (try? container.decode(Int.self, forKey: .mannerScore)).map(Double.init)
+            ?? 0
+        noshowCount = (try? container.decode(Int.self, forKey: .noshowCount))
+            ?? (try? container.decode(Double.self, forKey: .noshowCount)).map { Int($0.rounded()) }
+            ?? 0
+        topChampions = Self.decodeLossyTopChampions(from: container)
+        topChampionAggregation = Self.decodeTopChampionAggregation(from: container)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(email, forKey: .email)
+        try container.encode(nickname, forKey: .nickname)
+        try container.encodeIfPresent(primaryPosition, forKey: .primaryPosition)
+        try container.encodeIfPresent(secondaryPosition, forKey: .secondaryPosition)
+        try container.encode(isFillAvailable, forKey: .isFillAvailable)
+        try container.encode(styleTags, forKey: .styleTags)
+        try container.encode(mannerScore, forKey: .mannerScore)
+        try container.encode(noshowCount, forKey: .noshowCount)
+        try container.encodeIfPresent(topChampions, forKey: .topChampions)
+        if let topChampionAggregation {
+            try container.encodeIfPresent(topChampionAggregation.status, forKey: .championAggregationStatus)
+            if topChampionAggregation.hasSupplementaryMetadata {
+                try container.encode(topChampionAggregation, forKey: .topChampionAggregationStatus)
+            }
+        }
+    }
 
     func toDomain() -> UserProfile {
         UserProfile(
@@ -1842,8 +2347,57 @@ struct UserProfileDTO: Codable {
             isFillAvailable: isFillAvailable,
             styleTags: styleTags,
             mannerScore: mannerScore,
-            noshowCount: noshowCount
+            noshowCount: noshowCount,
+            topChampions: (topChampions ?? []).compactMap { $0.toDomain() },
+            topChampionAggregation: topChampionAggregation?.toDomain()
         )
+    }
+
+    private static func decodeLossyPosition(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Position? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Position.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                let normalized = value
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "-", with: "_")
+                    .replacingOccurrences(of: " ", with: "_")
+                    .uppercased()
+                if let position = Position(rawValue: normalized) {
+                    return position
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyTopChampions(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> [ProfileTopChampionDTO]? {
+        if let list = try? container.decodeIfPresent(LossyDecodableList<ProfileTopChampionDTO>.self, forKey: .topChampions) {
+            return list.elements
+        }
+        return nil
+    }
+
+    private static func decodeTopChampionAggregation(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> ProfileTopChampionAggregationDTO? {
+        for key in [
+            CodingKeys.topChampionAggregationStatus,
+            CodingKeys.championAggregationStatus,
+            CodingKeys.topChampionsStatus,
+            CodingKeys.championStatsStatus,
+        ] {
+            if let aggregation = try? container.decodeIfPresent(ProfileTopChampionAggregationDTO.self, forKey: key) {
+                return aggregation
+            }
+        }
+        return nil
     }
 }
 
@@ -1944,42 +2498,407 @@ struct UpdateProfileRequestDTO: Encodable {
 
 struct PowerProfileDTO: Codable {
     struct StyleDTO: Codable {
-        let stability: Double
-        let carry: Double
-        let teamContribution: Double
-        let laneInfluence: Double
+        let stability: Double?
+        let carry: Double?
+        let teamContribution: Double?
+        let laneInfluence: Double?
+
+        private enum CodingKeys: String, CodingKey {
+            case stability
+            case carry
+            case teamContribution
+            case laneInfluence
+        }
+
+        init(
+            stability: Double? = nil,
+            carry: Double? = nil,
+            teamContribution: Double? = nil,
+            laneInfluence: Double? = nil
+        ) {
+            self.stability = stability
+            self.carry = carry
+            self.teamContribution = teamContribution
+            self.laneInfluence = laneInfluence
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            stability = PowerProfileDTO.decodeLossyDouble(from: container, forKey: .stability)
+            carry = PowerProfileDTO.decodeLossyDouble(from: container, forKey: .carry)
+            teamContribution = PowerProfileDTO.decodeLossyDouble(from: container, forKey: .teamContribution)
+            laneInfluence = PowerProfileDTO.decodeLossyDouble(from: container, forKey: .laneInfluence)
+        }
     }
 
     let userId: String
     let overallPower: Double
     let lanePower: [String: Double]
-    let style: StyleDTO
-    let basePower: Double
-    let formScore: Double
-    let inhouseMmr: Double
-    let inhouseConfidence: Double
-    let version: String
-    let calculatedAt: Date
+    let primaryPosition: Position?
+    let secondaryPosition: Position?
+    let style: StyleDTO?
+    let basePower: Double?
+    let formScore: Double?
+    let inhouseMmr: Double?
+    let inhouseConfidence: Double?
+    let version: String?
+    let calculatedAt: Date?
+    let laneScoreBreakdown: [String: Double]?
+    let autoAssignmentBasis: String?
+    let historicalContributionSummary: String?
+    let topChampions: [ProfileTopChampionDTO]?
+    let topChampionAggregation: ProfileTopChampionAggregationDTO?
 
-    func toDomain() -> PowerProfile {
-        PowerProfile(
-            userID: userId,
+    private enum CodingKeys: String, CodingKey {
+        case userId
+        case userID
+        case overallPower
+        case lanePower
+        case topChampions
+        case championAggregationStatus
+        case topChampionAggregationStatus
+        case topChampionsStatus
+        case championStatsStatus
+        case primaryPosition
+        case mainPosition
+        case secondaryPosition
+        case style
+        case basePower
+        case formScore
+        case inhouseMmr
+        case inhouseMMR
+        case inhouseConfidence
+        case version
+        case calculatedAt
+        case laneScoreBreakdown
+        case laneScores
+        case autoAssignmentBasis
+        case laneAutoAssignmentBasis
+        case positionAssignmentBasis
+        case assignmentBasis
+        case historicalContributionSummary
+        case historicalContributionText
+        case historicalContribution
+        case previousSeasonContribution
+    }
+
+    init(
+        userId: String,
+        overallPower: Double,
+        lanePower: [String: Double],
+        primaryPosition: Position? = nil,
+        secondaryPosition: Position? = nil,
+        style: StyleDTO? = nil,
+        basePower: Double? = nil,
+        formScore: Double? = nil,
+        inhouseMmr: Double? = nil,
+        inhouseConfidence: Double? = nil,
+        version: String? = nil,
+        calculatedAt: Date? = nil,
+        laneScoreBreakdown: [String: Double]? = nil,
+        autoAssignmentBasis: String? = nil,
+        historicalContributionSummary: String? = nil,
+        topChampions: [ProfileTopChampionDTO]? = nil,
+        topChampionAggregation: ProfileTopChampionAggregationDTO? = nil
+    ) {
+        self.userId = userId
+        self.overallPower = overallPower
+        self.lanePower = lanePower
+        self.primaryPosition = primaryPosition
+        self.secondaryPosition = secondaryPosition
+        self.style = style
+        self.basePower = basePower
+        self.formScore = formScore
+        self.inhouseMmr = inhouseMmr
+        self.inhouseConfidence = inhouseConfidence
+        self.version = version
+        self.calculatedAt = calculatedAt
+        self.laneScoreBreakdown = laneScoreBreakdown
+        self.autoAssignmentBasis = autoAssignmentBasis
+        self.historicalContributionSummary = historicalContributionSummary
+        self.topChampions = topChampions
+        self.topChampionAggregation = topChampionAggregation
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let decodedLanePower = Self.decodeLossyDoubleDictionary(from: container, forKey: .lanePower) ?? [:]
+        let decodedLaneScoreBreakdown = Self.decodeLossyDoubleDictionary(from: container, forKey: .laneScoreBreakdown)
+            ?? Self.decodeLossyDoubleDictionary(from: container, forKey: .laneScores)
+        let resolvedOverallPower = Self.decodeLossyDouble(from: container, forKey: .overallPower)
+            ?? decodedLanePower.values.max()
+            ?? decodedLaneScoreBreakdown?.values.max()
+            ?? 0
+
+        userId = Self.decodeLossyString(from: container, forKeys: [.userId, .userID]) ?? ""
+        overallPower = resolvedOverallPower
+        lanePower = decodedLanePower.isEmpty ? (decodedLaneScoreBreakdown ?? [:]) : decodedLanePower
+        primaryPosition = Self.decodeLossyPosition(from: container, forKeys: [.primaryPosition, .mainPosition])
+        secondaryPosition = Self.decodeLossyPosition(from: container, forKeys: [.secondaryPosition])
+        style = try? container.decodeIfPresent(StyleDTO.self, forKey: .style)
+        basePower = Self.decodeLossyDouble(from: container, forKey: .basePower)
+        formScore = Self.decodeLossyDouble(from: container, forKey: .formScore)
+        inhouseMmr = Self.decodeLossyDouble(from: container, forKey: .inhouseMmr)
+            ?? Self.decodeLossyDouble(from: container, forKey: .inhouseMMR)
+        inhouseConfidence = Self.decodeLossyDouble(from: container, forKey: .inhouseConfidence)
+        version = try? container.decodeIfPresent(String.self, forKey: .version)
+        calculatedAt = try? container.decodeIfPresent(Date.self, forKey: .calculatedAt)
+        laneScoreBreakdown = decodedLaneScoreBreakdown
+        topChampions = Self.decodeLossyTopChampions(from: container)
+        topChampionAggregation = Self.decodeTopChampionAggregation(from: container)
+        autoAssignmentBasis = Self.decodeLossyString(from: container, forKeys: [
+            .autoAssignmentBasis,
+            .laneAutoAssignmentBasis,
+            .positionAssignmentBasis,
+            .assignmentBasis,
+        ])
+        historicalContributionSummary = Self.decodeHistoricalContributionSummary(from: container)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(userId, forKey: .userId)
+        try container.encode(overallPower, forKey: .overallPower)
+        try container.encode(lanePower, forKey: .lanePower)
+        try container.encodeIfPresent(primaryPosition, forKey: .primaryPosition)
+        try container.encodeIfPresent(secondaryPosition, forKey: .secondaryPosition)
+        try container.encodeIfPresent(style, forKey: .style)
+        try container.encodeIfPresent(basePower, forKey: .basePower)
+        try container.encodeIfPresent(formScore, forKey: .formScore)
+        try container.encodeIfPresent(inhouseMmr, forKey: .inhouseMmr)
+        try container.encodeIfPresent(inhouseConfidence, forKey: .inhouseConfidence)
+        try container.encodeIfPresent(version, forKey: .version)
+        try container.encodeIfPresent(calculatedAt, forKey: .calculatedAt)
+        try container.encodeIfPresent(laneScoreBreakdown, forKey: .laneScoreBreakdown)
+        try container.encodeIfPresent(autoAssignmentBasis, forKey: .autoAssignmentBasis)
+        try container.encodeIfPresent(historicalContributionSummary, forKey: .historicalContributionSummary)
+        try container.encodeIfPresent(topChampions, forKey: .topChampions)
+        if let topChampionAggregation {
+            try container.encodeIfPresent(topChampionAggregation.status, forKey: .championAggregationStatus)
+            if topChampionAggregation.hasSupplementaryMetadata {
+                try container.encode(topChampionAggregation, forKey: .topChampionAggregationStatus)
+            }
+        }
+    }
+
+    var missingFieldPaths: [String] {
+        var fields: [String] = []
+        if style?.stability == nil { fields.append("style.stability") }
+        if style?.carry == nil { fields.append("style.carry") }
+        if style?.teamContribution == nil { fields.append("style.teamContribution") }
+        if style?.laneInfluence == nil { fields.append("style.laneInfluence") }
+        if basePower == nil { fields.append("basePower") }
+        if formScore == nil { fields.append("formScore") }
+        if inhouseMmr == nil { fields.append("inhouseMmr") }
+        if inhouseConfidence == nil { fields.append("inhouseConfidence") }
+        if version == nil { fields.append("version") }
+        if calculatedAt == nil { fields.append("calculatedAt") }
+        return fields
+    }
+
+    var resolvedPreferredPositions: [Position] {
+        var ordered: [Position] = []
+
+        func appendIfNeeded(_ position: Position?) {
+            guard let position, !ordered.contains(position) else { return }
+            ordered.append(position)
+        }
+
+        appendIfNeeded(primaryPosition)
+        appendIfNeeded(secondaryPosition)
+
+        let laneOrdered = lanePower
+            .compactMap { key, value -> (Position, Double)? in
+                guard let position = Position(rawValue: key) else { return nil }
+                return (position, value)
+            }
+            .sorted { lhs, rhs in
+                if lhs.1 == rhs.1 {
+                    return lhs.0.rawValue < rhs.0.rawValue
+                }
+                return lhs.1 > rhs.1
+            }
+            .map(\.0)
+
+        laneOrdered.forEach { appendIfNeeded($0) }
+        return ordered
+    }
+
+    var usesFallbackMapping: Bool {
+        !missingFieldPaths.isEmpty || primaryPosition == nil || secondaryPosition == nil
+    }
+
+    func toDomain(requestedUserID: String? = nil) -> PowerProfile {
+        let resolvedStyleFallback = overallPower > 0 ? overallPower : (lanePower.values.max() ?? 0)
+
+        return PowerProfile(
+            userID: userId.isEmpty ? (requestedUserID ?? "") : userId,
             overallPower: overallPower,
             lanePower: Dictionary(uniqueKeysWithValues: lanePower.compactMap { key, value in
                 guard let position = Position(rawValue: key) else { return nil }
                 return (position, value)
             }),
-            stability: style.stability,
-            carry: style.carry,
-            teamContribution: style.teamContribution,
-            laneInfluence: style.laneInfluence,
-            basePower: basePower,
-            formScore: formScore,
-            inhouseMMR: inhouseMmr,
-            inhouseConfidence: inhouseConfidence,
-            version: version,
-            calculatedAt: calculatedAt
+            primaryPosition: primaryPosition,
+            secondaryPosition: secondaryPosition,
+            stability: style?.stability ?? resolvedStyleFallback,
+            carry: style?.carry ?? resolvedStyleFallback,
+            teamContribution: style?.teamContribution ?? resolvedStyleFallback,
+            laneInfluence: style?.laneInfluence ?? resolvedStyleFallback,
+            basePower: basePower ?? overallPower,
+            formScore: formScore ?? overallPower,
+            inhouseMMR: inhouseMmr ?? overallPower,
+            inhouseConfidence: inhouseConfidence ?? 0,
+            version: version ?? "seeded-fallback",
+            calculatedAt: calculatedAt ?? .distantPast,
+            laneScoreBreakdown: Self.mapLaneScores(laneScoreBreakdown),
+            autoAssignmentBasis: autoAssignmentBasis,
+            historicalContributionSummary: historicalContributionSummary,
+            topChampions: topChampions?.compactMap { $0.toDomain() },
+            topChampionAggregation: topChampionAggregation?.toDomain()
         )
+    }
+
+    private static func decodeLossyDouble<Key: CodingKey>(
+        from container: KeyedDecodingContainer<Key>,
+        forKey key: Key
+    ) -> Double? {
+        if let value = try? container.decode(Double.self, forKey: key) {
+            return value
+        }
+        if let value = try? container.decode(Int.self, forKey: key) {
+            return Double(value)
+        }
+        if let value = try? container.decode(String.self, forKey: key) {
+            return Double(value)
+        }
+        return nil
+    }
+
+    private static func decodeLossyString(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !normalized.isEmpty { return normalized }
+            }
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return String(value)
+            }
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return String(value)
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyPosition(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Position? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Position.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                let normalized = value
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "-", with: "_")
+                    .replacingOccurrences(of: " ", with: "_")
+                    .uppercased()
+                if let position = Position(rawValue: normalized) {
+                    return position
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyTopChampions(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> [ProfileTopChampionDTO]? {
+        if let list = try? container.decodeIfPresent(LossyDecodableList<ProfileTopChampionDTO>.self, forKey: .topChampions) {
+            return list.elements
+        }
+        return nil
+    }
+
+    private static func decodeTopChampionAggregation(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> ProfileTopChampionAggregationDTO? {
+        for key in [
+            CodingKeys.topChampionAggregationStatus,
+            CodingKeys.championAggregationStatus,
+            CodingKeys.topChampionsStatus,
+            CodingKeys.championStatsStatus,
+        ] {
+            if let aggregation = try? container.decodeIfPresent(ProfileTopChampionAggregationDTO.self, forKey: key) {
+                return aggregation
+            }
+        }
+        return nil
+    }
+
+    private struct DynamicCodingKey: CodingKey {
+        let stringValue: String
+        let intValue: Int?
+
+        init?(stringValue: String) {
+            self.stringValue = stringValue
+            intValue = nil
+        }
+
+        init?(intValue: Int) {
+            stringValue = String(intValue)
+            self.intValue = intValue
+        }
+    }
+
+    private static func decodeLossyDoubleDictionary(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKey key: CodingKeys
+    ) -> [String: Double]? {
+        guard let nestedContainer = try? container.nestedContainer(keyedBy: DynamicCodingKey.self, forKey: key) else {
+            return nil
+        }
+
+        var values: [String: Double] = [:]
+        for dynamicKey in nestedContainer.allKeys {
+            if let value = decodeLossyDouble(from: nestedContainer, forKey: dynamicKey) {
+                values[dynamicKey.stringValue] = value
+            }
+        }
+        return values
+    }
+
+    private static func decodeHistoricalContributionSummary(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> String? {
+        if let text = decodeLossyString(from: container, forKeys: [.historicalContributionSummary, .historicalContributionText]) {
+            return text
+        }
+
+        let historicalContribution = decodeLossyDouble(from: container, forKey: .historicalContribution)
+        let previousSeasonContribution = decodeLossyDouble(from: container, forKey: .previousSeasonContribution)
+        let contribution = historicalContribution ?? previousSeasonContribution
+        guard let contribution, contribution.isFinite else { return nil }
+        return "이전 시즌 기여 \(Int(contribution.rounded())) 반영"
+    }
+
+    private static func mapLaneScores(_ scores: [String: Double]?) -> [Position: Double]? {
+        guard let scores else { return nil }
+        let pairs: [(Position, Double)] = scores.compactMap { key, value in
+            let normalized = key
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .replacingOccurrences(of: "-", with: "_")
+                .replacingOccurrences(of: " ", with: "_")
+                .uppercased()
+            guard let position = Position(rawValue: normalized) else { return nil }
+            return (position, value)
+        }
+        let mapped = Dictionary(uniqueKeysWithValues: pairs)
+        return mapped.isEmpty ? nil : mapped
     }
 }
 
@@ -2159,6 +3078,36 @@ struct GroupMemberDTO: Codable {
 
 struct GroupMemberListDTO: Codable {
     let items: [GroupMemberDTO]
+
+    private enum CodingKeys: String, CodingKey {
+        case items
+        case members
+    }
+
+    init(items: [GroupMemberDTO]) {
+        self.items = items
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            if let items = try? container.decode([GroupMemberDTO].self, forKey: .items) {
+                self.items = items
+                return
+            }
+            if let members = try? container.decode([GroupMemberDTO].self, forKey: .members) {
+                items = members
+                return
+            }
+        }
+
+        let singleValueContainer = try decoder.singleValueContainer()
+        items = try singleValueContainer.decode([GroupMemberDTO].self)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(items, forKey: .items)
+    }
 }
 
 struct AddGroupMemberRequestDTO: Encodable {
@@ -2706,8 +3655,17 @@ final class AuthRepository {
 }
 
 final class ProfileRepository {
+    private struct CachedPowerProfile {
+        let profile: PowerProfile
+        let fetchedAt: Date
+    }
+
     private let apiClient: APIClient
     private let inviteSearchEndpointCandidates = ["/users/search", "/users"]
+    private let powerProfileCacheTTL: TimeInterval = 10
+    private let powerProfileLock = NSLock()
+    private var cachedPowerProfiles: [String: CachedPowerProfile] = [:]
+    private var inFlightPowerProfileRequests: [String: Task<PowerProfile, Error>] = [:]
 
     init(apiClient: APIClient) {
         self.apiClient = apiClient
@@ -2732,12 +3690,36 @@ final class ProfileRepository {
                 )
             )
         )
-        return response.toDomain()
+        let updatedProfile = response.toDomain()
+        clearCachedPowerProfile(for: updatedProfile.id)
+        return updatedProfile
     }
 
     func powerProfile(userID: String) async throws -> PowerProfile {
-        let response: PowerProfileDTO = try await apiClient.sendWithoutBody(path: "/users/\(userID)/power-profile")
-        return response.toDomain()
+        if let cachedProfile = cachedPowerProfile(for: userID) {
+            debugPowerProfile("userId=\(userID) action=cache_hit reason=recent_success")
+            return cachedProfile
+        }
+
+        if let inFlightRequest = inFlightPowerProfileRequest(for: userID) {
+            debugPowerProfile("userId=\(userID) action=deduplicated reason=in_flight")
+            return try await inFlightRequest.value
+        }
+
+        debugPowerProfile("userId=\(userID) action=fetch_start source=live")
+        let task = Task { try await self.fetchPowerProfile(userID: userID) }
+        storeInFlightPowerProfileRequest(task, for: userID)
+
+        do {
+            let profile = try await task.value
+            clearInFlightPowerProfileRequest(for: userID)
+            storeCachedPowerProfile(profile, for: userID)
+            debugPowerProfile("userId=\(userID) action=fetch_success source=live")
+            return profile
+        } catch {
+            clearInFlightPowerProfileRequest(for: userID)
+            throw error
+        }
     }
 
     func history(userID: String, groupID: String? = nil, limit: Int = 20) async throws -> [MatchHistoryItem] {
@@ -2814,6 +3796,81 @@ final class ProfileRepository {
                 profileImageURL: item.profileImageURL
             )
         }
+    }
+
+    private func fetchPowerProfile(userID: String) async throws -> PowerProfile {
+        do {
+            let response: PowerProfileDTO = try await apiClient.sendWithoutBody(path: "/users/\(userID)/power-profile")
+            let profile = response.toDomain(requestedUserID: userID)
+#if DEBUG
+            if !response.missingFieldPaths.isEmpty {
+                print(
+                    "[ProfileRepository] power profile partial userID=\(userID) missingFields=\(response.missingFieldPaths.joined(separator: ",")) primary=\(profile.primaryPosition?.rawValue ?? "nil") secondary=\(profile.secondaryPosition?.rawValue ?? "nil") power=\(Int(profile.overallPower.rounded()))"
+                )
+            }
+#endif
+            return profile
+        } catch let error as UserFacingError {
+#if DEBUG
+            print(
+                "[ProfileRepository] power profile request failed userID=\(userID) status=\(error.statusCode.map(String.init) ?? "nil") code=\(error.code ?? "nil") message=\(error.message)"
+            )
+#endif
+            throw error
+        } catch {
+#if DEBUG
+            print("[ProfileRepository] power profile decode failed userID=\(userID) error=\(error)")
+#endif
+            throw error
+        }
+    }
+
+    private func cachedPowerProfile(for userID: String) -> PowerProfile? {
+        powerProfileLock.lock()
+        defer { powerProfileLock.unlock() }
+
+        guard let cached = cachedPowerProfiles[userID] else { return nil }
+        guard Date().timeIntervalSince(cached.fetchedAt) <= powerProfileCacheTTL else {
+            cachedPowerProfiles[userID] = nil
+            return nil
+        }
+        return cached.profile
+    }
+
+    private func inFlightPowerProfileRequest(for userID: String) -> Task<PowerProfile, Error>? {
+        powerProfileLock.lock()
+        defer { powerProfileLock.unlock() }
+        return inFlightPowerProfileRequests[userID]
+    }
+
+    private func storeInFlightPowerProfileRequest(_ task: Task<PowerProfile, Error>, for userID: String) {
+        powerProfileLock.lock()
+        inFlightPowerProfileRequests[userID] = task
+        powerProfileLock.unlock()
+    }
+
+    private func clearInFlightPowerProfileRequest(for userID: String) {
+        powerProfileLock.lock()
+        inFlightPowerProfileRequests[userID] = nil
+        powerProfileLock.unlock()
+    }
+
+    private func storeCachedPowerProfile(_ profile: PowerProfile, for userID: String) {
+        powerProfileLock.lock()
+        cachedPowerProfiles[userID] = CachedPowerProfile(profile: profile, fetchedAt: Date())
+        powerProfileLock.unlock()
+    }
+
+    private func clearCachedPowerProfile(for userID: String) {
+        powerProfileLock.lock()
+        cachedPowerProfiles[userID] = nil
+        powerProfileLock.unlock()
+    }
+
+    private func debugPowerProfile(_ message: String) {
+#if DEBUG
+        print("[ProfileDebug] \(message)")
+#endif
     }
 }
 

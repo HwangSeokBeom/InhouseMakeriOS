@@ -20,6 +20,8 @@ struct TeamBalanceFeature {
         var preferredPositions: [String: [Position]] = [:]
         var shouldNavigateToMatchResult = false
         var pendingProtectedAction: PendingProtectedAction?
+        var emptyReasonMessage: String?
+        var activeRequestKey: String?
 
         enum BalancePhase: Equatable {
             case noCandidates
@@ -123,48 +125,57 @@ struct TeamBalanceFeature {
         Reduce { state, action in
             switch action {
             case let .load(force):
+                let requestKey = Self.requestKey(groupID: state.groupID, matchID: state.matchID)
+                if state.activeRequestKey == requestKey {
+                    Self.debugLog("action=fetch_drop reason=duplicate_request matchId=\(state.matchID) source=live requestKey=\(requestKey)")
+                    return .none
+                }
                 if !force, case .content = state.loadState { return .none }
+                state.activeRequestKey = requestKey
                 state.loadState = .loading
                 let groupID = state.groupID
                 let matchID = state.matchID
                 let container = appContainer
                 return .run { send in
-#if DEBUG
-                    print("[RouteFetch] fetch started screen=team_balance groupID=\(groupID) matchID=\(matchID)")
-#endif
+                    Self.debugLog("action=fetch_start matchId=\(matchID) groupId=\(groupID) source=live requestKey=\(requestKey)")
                     do {
                         let resolvedContainer = await container()
                         let payload = try await Self.loadPayload(container: resolvedContainer, groupID: groupID, matchID: matchID)
-#if DEBUG
-                        print("[RouteFetch] fetch success screen=team_balance groupID=\(groupID) matchID=\(matchID) source=live candidates=\(payload.snapshot.candidates.count)")
-#endif
+                        Self.debugLog("action=fetch_success matchId=\(matchID) groupId=\(groupID) source=live requestKey=\(requestKey) candidates=\(payload.snapshot.candidates.count)")
                         await send(.loadResponse(.success(payload)))
                     } catch let error as UserFacingError {
-#if DEBUG
-                        print("[RouteFetch] fetch failure screen=team_balance groupID=\(groupID) matchID=\(matchID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
-#endif
+                        Self.debugLog(
+                            "action=fetch_failure matchId=\(matchID) groupId=\(groupID) source=live requestKey=\(requestKey) status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)"
+                        )
                         await send(.loadResponse(.failure(error)))
                     } catch {
-#if DEBUG
-                        print("[RouteFetch] fetch failure screen=team_balance groupID=\(groupID) matchID=\(matchID) source=live status=nil message=\(error.localizedDescription)")
-#endif
+                        Self.debugLog(
+                            "action=fetch_failure matchId=\(matchID) groupId=\(groupID) source=live requestKey=\(requestKey) status=nil message=\(error.localizedDescription)"
+                        )
                         await send(.loadResponse(.failure(.unexpected("팀 밸런스 로딩 실패", message: "추천 조합을 불러오지 못했습니다."))))
                     }
                 }
 
             case let .loadResponse(.success(payload)):
+                state.activeRequestKey = nil
                 let preferredMode = state.selectedMode
                 state.groupName = payload.groupName
                 state.preferredPositions = payload.preferredPositions
+                let emptyReason = Self.emptyReason(for: payload.snapshot.match)
+                state.emptyReasonMessage = payload.snapshot.match.candidates.isEmpty ? emptyReason : nil
                 state.loadState = payload.snapshot.match.candidates.isEmpty
-                    ? .empty("추천 조합이 없습니다.\n로비에서 자동 팀 생성을 다시 실행해주세요.")
+                    ? .empty(emptyReason)
                     : .content(payload.snapshot)
                 state.selectedMode = payload.snapshot.match.candidates.contains(where: { $0.type == preferredMode })
                     ? preferredMode
                     : (payload.snapshot.match.candidates.first?.type ?? .balanced)
+#if DEBUG
+                print("[TeamBalance] auto balance response count=\(payload.snapshot.match.candidates.count) emptyReason=\(payload.snapshot.match.candidates.isEmpty ? emptyReason : "nil")")
+#endif
                 return .none
 
             case let .loadResponse(.failure(error)):
+                state.activeRequestKey = nil
                 if error.requiresAuthentication {
                     state.loadState = .empty("로그인 후 팀 밸런스를 다시 확인할 수 있어요.")
                     state.pendingProtectedAction = .reload
@@ -210,13 +221,18 @@ struct TeamBalanceFeature {
             case let .rerollResponse(.success(payload)):
                 state.groupName = payload.groupName
                 state.preferredPositions = payload.preferredPositions
+                let emptyReason = Self.emptyReason(for: payload.snapshot.match)
+                state.emptyReasonMessage = payload.snapshot.match.candidates.isEmpty ? emptyReason : nil
                 state.loadState = payload.snapshot.match.candidates.isEmpty
-                    ? .empty("추천 조합이 없습니다.\n로비에서 자동 팀 생성을 다시 실행해주세요.")
+                    ? .empty(emptyReason)
                     : .content(payload.snapshot)
                 if !payload.snapshot.match.candidates.contains(where: { $0.type == state.selectedMode }) {
                     state.selectedMode = payload.snapshot.match.candidates.first?.type ?? state.selectedMode
                 }
                 state.actionState = .success("새 조합이 생성되었습니다")
+#if DEBUG
+                print("[TeamBalance] auto balance response count=\(payload.snapshot.match.candidates.count) emptyReason=\(payload.snapshot.match.candidates.isEmpty ? emptyReason : "nil")")
+#endif
                 return .none
 
             case let .rerollResponse(.failure(error)):
@@ -316,7 +332,7 @@ struct TeamBalanceFeature {
             scheduledAt: matchValue.scheduledAt,
             balanceMode: matchValue.balanceMode,
             selectedCandidateNo: matchValue.selectedCandidateNo,
-            players: matchValue.players,
+            players: applyPreferredPositions(players: matchValue.players, preferredPositions: preferred, logContext: "TeamBalance"),
             candidates: candidates
         )
         return LoadPayload(
@@ -362,14 +378,46 @@ struct TeamBalanceFeature {
     private static func inferPreferredPositions(container: AppContainer, userIDs: [String]) async -> [String: [Position]] {
         var map: [String: [Position]] = [:]
         for userID in userIDs {
-            if let power = try? await container.profileRepository.powerProfile(userID: userID) {
-                let preferred = power.lanePower
-                    .sorted { $0.value > $1.value }
-                    .map(\.key)
-                map[userID] = Array(preferred.prefix(2))
+            do {
+                let power = try await container.profileRepository.powerProfile(userID: userID)
+                let preferred = Array(power.preferredPositions.prefix(2))
+                if !preferred.isEmpty {
+                    map[userID] = preferred
+                }
+            } catch {
+#if DEBUG
+                print("[TeamBalance] preferred positions unavailable userID=\(userID) error=\(error)")
+#endif
             }
         }
         return map
+    }
+
+    private static func applyPreferredPositions(
+        players: [MatchPlayer],
+        preferredPositions: [String: [Position]],
+        logContext: String? = nil
+    ) -> [MatchPlayer] {
+        players.map { player in
+            guard player.assignedRole == nil,
+                  let fallbackRole = preferredPositions[player.userID]?.first else {
+                return player
+            }
+#if DEBUG
+            if let logContext {
+                print("[\(logContext)] participant fallback mapping applied userID=\(player.userID) role=\(fallbackRole.rawValue)")
+            }
+#endif
+            return MatchPlayer(
+                id: player.id,
+                userID: player.userID,
+                nickname: player.nickname,
+                teamSide: player.teamSide,
+                assignedRole: fallbackRole,
+                participationStatus: player.participationStatus,
+                isCaptain: player.isCaptain
+            )
+        }
     }
 
     private static func mergeCandidates(match: Match, manualDraft: ManualAdjustDraft?) -> [MatchCandidate] {
@@ -436,12 +484,41 @@ struct TeamBalanceFeature {
             .joined(separator: "|")
         return "\(candidate.type.rawValue)#blue[\(blueSignature)]#red[\(redSignature)]"
     }
+
+    private static func emptyReason(for match: Match) -> String {
+        let targetCount = 10
+        let acceptedPlayers = match.players.filter {
+            $0.participationStatus == .accepted || $0.participationStatus == .lockedIn
+        }
+        if acceptedPlayers.count < targetCount {
+            return "추천 조합이 없습니다.\n자동 팀 생성에는 참가자 \(targetCount)명이 필요해요. 로비에서 참가자를 추가해 주세요."
+        }
+        let missingPositionCount = acceptedPlayers.prefix(targetCount).filter { $0.assignedRole == nil }.count
+        if missingPositionCount > 0 {
+            return "추천 조합이 없습니다.\n포지션 정보가 없는 참가자 \(missingPositionCount)명이 있어요. 로비에서 참가자 정보를 확인해 주세요."
+        }
+        if match.status != .balanced && match.status != .locked {
+            return "추천 조합이 없습니다.\n로비에서 자동 팀 생성을 먼저 실행해 주세요."
+        }
+        return "추천 조합이 없습니다.\n서버가 추천 조합을 반환하지 않았어요. 다시 시도하거나 로비에서 참가자 구성을 확인해 주세요."
+    }
+
+    private static func requestKey(groupID: String, matchID: String) -> String {
+        "\(groupID):\(matchID)"
+    }
+
+    private static func debugLog(_ message: String) {
+#if DEBUG
+        print("[TeamBalanceDebug] \(message)")
+#endif
+    }
 }
 
 struct TeamBalanceFeatureView: View {
     @Bindable var store: StoreOf<TeamBalanceFeature>
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
+    @State private var hasAppearedOnce = false
 
     var body: some View {
         screenScaffold(title: "팀 밸런스 결과", onBack: router.pop) {
@@ -452,7 +529,7 @@ struct TeamBalanceFeatureView: View {
             case let .error(error):
                 ErrorStateView(error: error) { store.send(.load(force: true)) }
             case let .empty(message):
-                EmptyStateView(title: "팀 밸런스 결과", message: message)
+                emptyBalanceContent(message: message)
             case .content, .refreshing:
                 let blueRows = store.state.rows(for: .blue)
                 let redRows = store.state.rows(for: .red)
@@ -508,6 +585,10 @@ struct TeamBalanceFeatureView: View {
         }
         .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
         .onAppear {
+            guard hasAppearedOnce else {
+                hasAppearedOnce = true
+                return
+            }
             guard store.loadState.value != nil else { return }
             store.send(.load(force: true))
         }
@@ -612,6 +693,52 @@ struct TeamBalanceFeatureView: View {
             return true
         }
         return false
+    }
+
+    private func emptyBalanceContent(message: String) -> some View {
+        ScrollView(showsIndicators: false) {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(AppPalette.accentGold)
+                        Text("추천 조합을 만들지 못했어요")
+                            .font(AppTypography.heading(16, weight: .bold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                    }
+
+                    Text(message)
+                        .font(AppTypography.body(13))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(16)
+                .appPanel(background: AppPalette.bgCard, radius: 14, stroke: AppPalette.accentGold.opacity(0.6))
+                .accessibilityIdentifier("teamBalance.emptyReasonCard")
+
+                HStack(spacing: 8) {
+                    Button("다시 시도") {
+                        store.send(.load(force: true))
+                    }
+                    .buttonStyle(SecondaryButtonStyle())
+                    .disabled(isActionInFlight)
+
+                    Button("로비로 돌아가기") {
+                        router.pop()
+                    }
+                    .buttonStyle(PrimaryButtonStyle())
+                    .disabled(isActionInFlight)
+                }
+
+                Button("참가자 추가하러 가기") {
+                    router.pop()
+                }
+                .font(AppTypography.body(13, weight: .semibold))
+                .foregroundStyle(AppPalette.textSecondary)
+                .frame(maxWidth: .infinity)
+            }
+            .padding(16)
+        }
     }
 
     private func modeTabs() -> some View {
