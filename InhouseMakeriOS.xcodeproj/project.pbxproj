@@ -12,8 +12,9 @@
 		8BB375032E0945C100D35084 /* AppInfrastructure.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374032E0945C100D35084 /* AppInfrastructure.swift */; };
 		8BB375042E0945C100D35084 /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374042E0945C100D35084 /* DesignSystem.swift */; };
 		8BB375052E0945C100D35084 /* AppScreens.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374052E0945C100D35084 /* AppScreens.swift */; };
-		C10000000000000000000023 /* UIKitHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000000000000000000024 /* UIKitHelpers.swift */; };
-		8BB375152E0A45C100D35084 /* AuthFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374162E0A45C100D35084 /* AuthFlow.swift */; };
+		8BB375072E0945C400D35084 /* InhouseMakeriOSTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374092E0945C400D35084 /* InhouseMakeriOSTests.swift */; };
+		8BB375082E0945C400D35084 /* InhouseMakeriOSUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740A2E0945C400D35084 /* InhouseMakeriOSUITests.swift */; };
+		8BB375092E0945C400D35084 /* InhouseMakeriOSUITestsLaunchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740B2E0945C400D35084 /* InhouseMakeriOSUITestsLaunchTests.swift */; };
 		8BB3750A2E0945C100D35084 /* CoreDependencies.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740C2E0945C100D35084 /* CoreDependencies.swift */; };
 		8BB3750B2E0945C100D35084 /* AppFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740D2E0945C100D35084 /* AppFeature.swift */; };
 		8BB3750C2E0945C100D35084 /* MatchLobbyFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740E2E0945C100D35084 /* MatchLobbyFeature.swift */; };
@@ -21,13 +22,12 @@
 		8BB3750E2E0945C100D35084 /* ManualAdjustFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374102E0945C100D35084 /* ManualAdjustFeature.swift */; };
 		8BB3750F2E0945C100D35084 /* MatchResultFeature.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374112E0945C100D35084 /* MatchResultFeature.swift */; };
 		8BB375102E0945C100D35084 /* ComposableArchitecture in Frameworks */ = {isa = PBXBuildFile; productRef = 8BB376022E0945C100D35084 /* ComposableArchitecture */; };
-		8BB375142E0945C100D35084 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = 8BB376042E0945C100D35084 /* GoogleSignIn */; };
 		8BB375112E0945C100D35084 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8BB374132E0945C100D35084 /* AppIntents.framework */; };
 		8BB375122E0945C100D35084 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8BB374132E0945C100D35084 /* AppIntents.framework */; };
 		8BB375132E0945C100D35084 /* AppIntents.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 8BB374132E0945C100D35084 /* AppIntents.framework */; };
-		8BB375072E0945C400D35084 /* InhouseMakeriOSTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374092E0945C400D35084 /* InhouseMakeriOSTests.swift */; };
-		8BB375082E0945C400D35084 /* InhouseMakeriOSUITests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740A2E0945C400D35084 /* InhouseMakeriOSUITests.swift */; };
-		8BB375092E0945C400D35084 /* InhouseMakeriOSUITestsLaunchTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB3740B2E0945C400D35084 /* InhouseMakeriOSUITestsLaunchTests.swift */; };
+		8BB375142E0945C100D35084 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = 8BB376042E0945C100D35084 /* GoogleSignIn */; };
+		8BB375152E0A45C100D35084 /* AuthFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374162E0A45C100D35084 /* AuthFlow.swift */; };
+		C10000000000000000000023 /* UIKitHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000000000000000000024 /* UIKitHelpers.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -56,8 +56,6 @@
 		8BB374032E0945C100D35084 /* AppInfrastructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInfrastructure.swift; sourceTree = "<group>"; };
 		8BB374042E0945C100D35084 /* DesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignSystem.swift; sourceTree = "<group>"; };
 		8BB374052E0945C100D35084 /* AppScreens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppScreens.swift; sourceTree = "<group>"; };
-		C10000000000000000000024 /* UIKitHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIKitHelpers.swift; sourceTree = "<group>"; };
-		8BB374162E0A45C100D35084 /* AuthFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlow.swift; sourceTree = "<group>"; };
 		8BB374062E0945C100D35084 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		8BB374082E0945C100D35084 /* Preview Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Preview Assets.xcassets"; sourceTree = "<group>"; };
 		8BB374092E0945C400D35084 /* InhouseMakeriOSTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InhouseMakeriOSTests.swift; sourceTree = "<group>"; };
@@ -72,6 +70,7 @@
 		8BB374132E0945C100D35084 /* AppIntents.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AppIntents.framework; path = System/Library/Frameworks/AppIntents.framework; sourceTree = SDKROOT; };
 		8BB374142E0945C100D35084 /* InhouseMakeriOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = InhouseMakeriOS.entitlements; sourceTree = "<group>"; };
 		8BB374152E0945C100D35084 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		8BB374162E0A45C100D35084 /* AuthFlow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlow.swift; sourceTree = "<group>"; };
 		C10000000000000000000001 /* App.Base.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = App.Base.xcconfig; sourceTree = "<group>"; };
 		C10000000000000000000002 /* App.Shared.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = App.Shared.xcconfig; sourceTree = "<group>"; };
 		C10000000000000000000003 /* App.Dev.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = App.Dev.xcconfig; sourceTree = "<group>"; };
@@ -83,6 +82,7 @@
 		C1000000000000000000000B /* UITests.Dev.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = UITests.Dev.xcconfig; sourceTree = "<group>"; };
 		C1000000000000000000000D /* UITests.Production.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = UITests.Production.xcconfig; sourceTree = "<group>"; };
 		C1000000000000000000000E /* Environment.secrets.template.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; path = Environment.secrets.template.xcconfig; sourceTree = "<group>"; };
+		C10000000000000000000024 /* UIKitHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIKitHelpers.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -400,39 +400,25 @@
 		};
 /* End PBXTargetDependency section */
 
-/* Begin XCRemoteSwiftPackageReference section */
-				8BB376012E0945C100D35084 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */ = {
-					isa = XCRemoteSwiftPackageReference;
-					repositoryURL = "https://github.com/pointfreeco/swift-composable-architecture.git";
-					requirement = {
-						kind = exactVersion;
-						version = 1.25.5;
-					};
-				};
-		8BB376032E0945C100D35084 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */ = {
-			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/google/GoogleSignIn-iOS.git";
-			requirement = {
-				branch = main;
-				kind = branch;
-			};
-		};
-/* End XCRemoteSwiftPackageReference section */
-
-/* Begin XCSwiftPackageProductDependency section */
-		8BB376022E0945C100D35084 /* ComposableArchitecture */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 8BB376012E0945C100D35084 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */;
-			productName = ComposableArchitecture;
-		};
-		8BB376042E0945C100D35084 /* GoogleSignIn */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = 8BB376032E0945C100D35084 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */;
-			productName = GoogleSignIn;
-		};
-/* End XCSwiftPackageProductDependency section */
-
 /* Begin XCBuildConfiguration section */
+		8B7271522F96793B007FD186 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COPY_PHASE_STRIP = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				PRODUCT_NAME = InhouseMakeriOSTests;
+			};
+			name = Release;
+		};
+		8B7271532F96793B007FD186 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				COPY_PHASE_STRIP = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				PRODUCT_NAME = InhouseMakeriOSUITests;
+			};
+			name = Release;
+		};
 		8BB3735C2E0945C400D35084 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -557,6 +543,11 @@
 			baseConfigurationReference = C10000000000000000000003 /* App.Dev.xcconfig */;
 			buildSettings = {
 				ENABLE_PREVIEWS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Debug;
 		};
@@ -565,6 +556,11 @@
 			baseConfigurationReference = C10000000000000000000005 /* App.Production.xcconfig */;
 			buildSettings = {
 				ENABLE_PREVIEWS = YES;
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				TARGETED_DEVICE_FAMILY = 1;
 			};
 			name = Release;
 		};
@@ -607,6 +603,7 @@
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				8BB373622E0945C400D35084 /* Debug */,
+				8B7271522F96793B007FD186 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
@@ -615,11 +612,44 @@
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				8BB373652E0945C400D35084 /* Debug */,
+				8B7271532F96793B007FD186 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		8BB376012E0945C100D35084 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/pointfreeco/swift-composable-architecture.git";
+			requirement = {
+				kind = exactVersion;
+				version = 1.25.5;
+			};
+		};
+		8BB376032E0945C100D35084 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/google/GoogleSignIn-iOS.git";
+			requirement = {
+				branch = main;
+				kind = branch;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		8BB376022E0945C100D35084 /* ComposableArchitecture */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8BB376012E0945C100D35084 /* XCRemoteSwiftPackageReference "swift-composable-architecture" */;
+			productName = ComposableArchitecture;
+		};
+		8BB376042E0945C100D35084 /* GoogleSignIn */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 8BB376032E0945C100D35084 /* XCRemoteSwiftPackageReference "GoogleSignIn-iOS" */;
+			productName = GoogleSignIn;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 8BB373322E0945C100D35084 /* Project object */;
 }

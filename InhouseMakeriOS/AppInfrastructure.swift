@@ -202,6 +202,23 @@ enum HTTPMethod: String {
     case delete = "DELETE"
 }
 
+enum AuthAPI {
+    enum Endpoint {
+        static let signUp = "/auth/signup"
+        static let loginEmail = "/auth/login/email"
+        static let loginApple = "/auth/login/apple"
+        static let loginGoogle = "/auth/login/google"
+        static let logout = "/auth/logout"
+        static let refresh = "/auth/refresh"
+    }
+
+    enum Availability {
+        static let supportedLoginMethodsDescription = "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
+        static let authRequiredMessage = "이 기능은 로그인 후 사용할 수 있어요. 이메일, Apple 또는 Google로 로그인해 주세요."
+        static let reauthenticationMessage = "세션이 만료되어 다시 로그인이 필요해요. 이메일, Apple 또는 Google로 다시 로그인해 주세요."
+    }
+}
+
 private enum LocalStoreKey {
     static let groupIDs = "local.group.ids"
     static let recentMatches = "local.recent.matches"
@@ -1792,7 +1809,7 @@ final class APIClient {
         }
         do {
             let response: AuthTokensDTO = try await send(
-                path: "/auth/refresh",
+                path: AuthAPI.Endpoint.refresh,
                 method: .post,
                 body: try encodedBody(RefreshTokenRequestDTO(refreshToken: refreshToken)),
                 requiresAuth: false,
@@ -1908,8 +1925,10 @@ final class APIClient {
     }
 
     private func shouldDebugLog(path: String) -> Bool {
-        path == "/auth/signup/email"
-            || path == "/auth/login/email"
+        path == AuthAPI.Endpoint.signUp
+            || path == AuthAPI.Endpoint.loginEmail
+            || path == AuthAPI.Endpoint.loginApple
+            || path == AuthAPI.Endpoint.loginGoogle
             || path == "/me"
             || path == "/me/profile-image"
             || path == "/users"
@@ -2117,14 +2136,10 @@ struct AuthTokensDTO: Codable {
 
 struct AppleLoginRequestDTO: Encodable {
     let identityToken: String
-    let nickname: String?
 }
 
 struct GoogleLoginRequestDTO: Encodable {
-    let idToken: String
-    let accessToken: String?
-    let email: String?
-    let name: String?
+    let identityToken: String
 }
 
 struct EmailSignUpRequestDTO: Encodable {
@@ -2133,7 +2148,7 @@ struct EmailSignUpRequestDTO: Encodable {
     let nickname: String
     let agreedToTerms: Bool
     let agreedToPrivacy: Bool
-    let agreedToMarketing: Bool
+    let agreedToMarketing: Bool?
 }
 
 struct EmailLoginRequestDTO: Encodable {
@@ -3872,14 +3887,9 @@ final class AuthRepository {
     func loginWithApple(authorization: AppleLoginAuthorization) async throws -> AuthTokens {
         do {
             let response: AuthTokensDTO = try await apiClient.send(
-                path: "/auth/login/apple",
+                path: AuthAPI.Endpoint.loginApple,
                 method: .post,
-                body: try apiClient.encodedBody(
-                    AppleLoginRequestDTO(
-                        identityToken: authorization.identityToken,
-                        nickname: authorization.nickname
-                    )
-                ),
+                body: try apiClient.encodedBody(AppleLoginRequestDTO(identityToken: authorization.identityToken)),
                 requiresAuth: false
             )
             let tokens = response.toDomain()
@@ -3891,25 +3901,22 @@ final class AuthRepository {
     }
 
     func loginWithGoogle(authorization: GoogleLoginAuthorization) async throws -> AuthTokens {
+        debugLogGoogleBackendLoginStarted(endpoint: AuthAPI.Endpoint.loginGoogle)
         do {
             let response: AuthTokensDTO = try await apiClient.send(
-                path: "/auth/login/google",
+                path: AuthAPI.Endpoint.loginGoogle,
                 method: .post,
-                body: try apiClient.encodedBody(
-                    GoogleLoginRequestDTO(
-                        idToken: authorization.idToken,
-                        accessToken: authorization.accessToken,
-                        email: authorization.email,
-                        name: authorization.name
-                    )
-                ),
+                body: try apiClient.encodedBody(GoogleLoginRequestDTO(identityToken: authorization.idToken)),
                 requiresAuth: false
             )
             let tokens = response.toDomain()
             await tokenStore.save(tokens: tokens)
+            debugLogGoogleBackendLoginSucceeded(tokens)
             return tokens
         } catch {
-            throw AuthErrorMapper.map(error)
+            let mappedError = AuthErrorMapper.map(error)
+            debugLogGoogleBackendLoginFailed(mappedError)
+            throw mappedError
         }
     }
 
@@ -3919,11 +3926,11 @@ final class AuthRepository {
         nickname: String,
         agreedToTerms: Bool,
         agreedToPrivacy: Bool,
-        agreedToMarketing: Bool
+        agreedToMarketing: Bool?
     ) async throws -> AuthTokens {
         do {
             let response: AuthTokensDTO = try await apiClient.send(
-                path: "/auth/signup/email",
+                path: AuthAPI.Endpoint.signUp,
                 method: .post,
                 body: try apiClient.encodedBody(
                     EmailSignUpRequestDTO(
@@ -3952,7 +3959,7 @@ final class AuthRepository {
         debugLogEmailLoginRequest(email: email, password: password)
         do {
             let response: AuthTokensDTO = try await apiClient.send(
-                path: "/auth/login/email",
+                path: AuthAPI.Endpoint.loginEmail,
                 method: .post,
                 body: try apiClient.encodedBody(
                     EmailLoginRequestDTO(
@@ -3976,7 +3983,7 @@ final class AuthRepository {
     func signOut() async {
         if let refreshToken = await tokenStore.loadTokens()?.refreshToken {
             let response: EmptyResponse? = try? await apiClient.send(
-                path: "/auth/logout",
+                path: AuthAPI.Endpoint.logout,
                 method: .post,
                 body: try? apiClient.encodedBody(LogoutRequestDTO(refreshToken: refreshToken)),
                 requiresAuth: false
@@ -4048,6 +4055,26 @@ final class AuthRepository {
     private func debugLogEmailLoginFailure(_ error: AuthError) {
 #if DEBUG
         print("[AuthRepository] loginWithEmail mappedError=\(String(describing: error))")
+#endif
+    }
+
+    private func debugLogGoogleBackendLoginStarted(endpoint: String) {
+#if DEBUG
+        print("[GoogleAuth] backendLoginStarted endpoint=\(endpoint)")
+#endif
+    }
+
+    private func debugLogGoogleBackendLoginSucceeded(_ tokens: AuthTokens) {
+#if DEBUG
+        print(
+            "[GoogleAuth] backendLoginSucceeded userId=\(tokens.user.id) provider=\(tokens.user.provider?.rawValue ?? "nil") status=\(tokens.user.status?.rawValue ?? "nil")"
+        )
+#endif
+    }
+
+    private func debugLogGoogleBackendLoginFailed(_ error: AuthError) {
+#if DEBUG
+        print("[GoogleAuth] backendLoginFailed mappedError=\(String(describing: error))")
 #endif
     }
 }

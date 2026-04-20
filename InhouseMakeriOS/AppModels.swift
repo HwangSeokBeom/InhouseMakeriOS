@@ -270,7 +270,7 @@ enum ServerContractErrorCode: Equatable {
             return .weakPassword
         case contains("REQUIRED_TERMS_NOT_AGREED"):
             return .requiredTermsNotAgreed
-        case contains("INVALID_PAYLOAD"):
+        case contains("INVALID_PAYLOAD"), contains("VALIDATION_ERROR"):
             return .invalidPayload
         case contains("INTERNAL_SERVER_ERROR"):
             return .internalServerError
@@ -436,7 +436,7 @@ extension UserFacingError {
         ErrorMapper.map(self)
     }
 
-    static func authRequiredFallback(message: String = "세션이 만료되어 다시 로그인이 필요해요. 이메일, Apple 또는 Google로 다시 로그인해 주세요.") -> UserFacingError {
+    static func authRequiredFallback(message: String = AuthAPI.Availability.reauthenticationMessage) -> UserFacingError {
         UserFacingError(
             title: "로그인이 필요해요",
             message: message,
@@ -495,9 +495,9 @@ extension UserFacingError {
 
     fileprivate var errorMappingContext: ErrorMappingContext {
         switch (normalizedRequestMethod, normalizedEndpoint) {
-        case ("POST", "/auth/signup/email"):
+        case ("POST", AuthAPI.Endpoint.signUp):
             return .authSignup
-        case ("POST", "/auth/login/email"):
+        case ("POST", AuthAPI.Endpoint.loginEmail):
             return .authLogin
         case ("GET", "/recruiting-posts"), ("GET", "/recruiting-posts/public"):
             return .recruitingList
@@ -564,7 +564,7 @@ enum ErrorMapper {
         case .authRequired:
             return error.withPresentation(
                 title: "로그인이 필요해요",
-                message: "이 기능은 로그인 후 사용할 수 있어요. 이메일, Apple 또는 Google로 로그인해 주세요."
+                message: AuthAPI.Availability.authRequiredMessage
             )
         case .forbiddenFeature:
             return error.withPresentation(
@@ -614,7 +614,7 @@ enum ErrorMapper {
         case .unsupportedProvider:
             return error.withPresentation(
                 title: "지원하지 않는 로그인 방식이에요",
-                message: "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
+                message: AuthAPI.Availability.supportedLoginMethodsDescription
             )
         case .emailAlreadyExists:
             return error.withPresentation(

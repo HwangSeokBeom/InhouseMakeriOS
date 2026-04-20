@@ -75,7 +75,7 @@ struct InhouseMakeriOSApp: App {
                 #endif
             }
             .onOpenURL { url in
-                _ = GIDSignIn.sharedInstance.handle(url)
+                _ = GoogleAuthCallbackHandler.handle(url)
             }
         }
     }
@@ -163,6 +163,31 @@ private enum AppRootKind: String, Equatable {
     case splash
     case onboarding
     case home
+}
+
+@MainActor
+enum GoogleAuthCallbackHandler {
+#if DEBUG
+    static var handleURL: (URL) -> Bool = { url in
+        GIDSignIn.sharedInstance.handle(url)
+    }
+#endif
+
+    static func handle(_ url: URL) -> Bool {
+#if DEBUG
+        let handled = handleURL(url)
+#else
+        let handled = GIDSignIn.sharedInstance.handle(url)
+#endif
+        debugLog("callbackReceived scheme=\(url.scheme ?? "nil") handled=\(handled)")
+        return handled
+    }
+
+    private static func debugLog(_ message: String) {
+#if DEBUG
+        print("[GoogleAuth] \(message)")
+#endif
+    }
 }
 
 private struct SplashView: View {

@@ -9,16 +9,18 @@ private extension UIApplication {
     }
 
     var preferredKeyWindow: UIWindow? {
-        for scene in preferredWindowScenes {
-            if let keyWindow = scene.windows.first(where: \.isKeyWindow) {
-                return keyWindow
-            }
+        let candidateWindows = preferredWindowScenes.flatMap(\.windows)
+
+        if let keyWindow = candidateWindows.first(where: { $0.isKeyWindow && !$0.isHidden }) {
+            return keyWindow
         }
 
-        for scene in preferredWindowScenes {
-            if let visibleWindow = scene.windows.first(where: { !$0.isHidden }) {
-                return visibleWindow
-            }
+        if let normalVisibleWindow = candidateWindows.first(where: { !$0.isHidden && $0.windowLevel == .normal }) {
+            return normalVisibleWindow
+        }
+
+        if let visibleWindow = candidateWindows.first(where: { !$0.isHidden }) {
+            return visibleWindow
         }
 
         return nil

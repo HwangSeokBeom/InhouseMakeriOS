@@ -234,13 +234,10 @@ enum AuthError: Error, Equatable {
             return PresentationError(title: "로그인 방법 안내", message: "이 계정은 다른 로그인 방식으로 연결되어 있어요. 올바른 로그인 방식으로 다시 시도해 주세요.")
         case .accountNotFound:
             return PresentationError(title: "존재하지 않는 계정이에요", message: "가입한 이메일인지 다시 확인해 주세요.")
-        case let .unsupportedProvider(_, availableProviders):
-            let supportedCopy = availableProviders.isEmpty
-                ? "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
-                : "이 앱에서는 \(availableProviders.map(\.title).joined(separator: ", ")) 로그인을 사용할 수 있어요."
-            return PresentationError(title: "지원하지 않는 로그인 방식이에요", message: supportedCopy)
+        case .unsupportedProvider:
+            return PresentationError(title: "지원하지 않는 로그인 방식이에요", message: AuthAPI.Availability.supportedLoginMethodsDescription)
         case .authRequired:
-            return PresentationError(title: "로그인이 필요해요", message: "로그인 후 다시 시도해 주세요.")
+            return PresentationError(title: "로그인이 필요해요", message: AuthAPI.Availability.authRequiredMessage)
         case .emailAlreadyInUse:
             return PresentationError(title: "이미 가입된 이메일이에요", message: "이메일 로그인으로 계속하거나 다른 이메일을 사용해 주세요.")
         case .nicknameAlreadyInUse:
@@ -332,10 +329,32 @@ enum AuthErrorMapper {
             )
         }
 
+        let normalizedEndpoint = userFacingError.endpoint?
+            .components(separatedBy: "?")
+            .first ?? userFacingError.endpoint ?? ""
+        let signupValidationIssues = userFacingError.signupValidationIssues
+        if userFacingError.statusCode == 400,
+           normalizedEndpoint == AuthAPI.Endpoint.signUp,
+           (
+               userFacingError.serverContractCode == .invalidPayload
+                   || userFacingError.normalizedCode.contains("VALIDATION")
+                   || rawMessage.contains("validation")
+                   || !signupValidationIssues.isEmpty
+           )
+        {
+            return .invalidPayload(
+                issues: signupValidationIssues,
+                message: userFacingError.message
+            )
+        }
+
         switch userFacingError.serverContractCode {
         case .riotAccountAlreadyAddedByThisUser,
              .riotAccountAddUnavailable,
-             .invalidPayload:
+             .userNotFound,
+             .groupAccessForbidden,
+             .groupMemberAlreadyExists,
+             .recruitingClosed:
             break
         case .accountExistsWithApple:
             return .accountExistsWithApple(email: email)
@@ -525,6 +544,14 @@ final class AuthFlowViewModel: ObservableObject {
         state.socialLoginState.submittingState.isLoading || state.successTransitionState == .bootstrappingSession
     }
 
+    var supportedAuthProviders: [AuthProvider] {
+        AuthProvider.supportedProviders
+    }
+
+    var isGoogleLoginEnabled: Bool {
+        supportedAuthProviders.contains(.google)
+    }
+
     var landingPresentationError: PresentationError? {
         state.socialLoginState.formError ?? state.entryState.formError
     }
@@ -547,6 +574,14 @@ final class AuthFlowViewModel: ObservableObject {
         state.socialLoginState.providerConflict = nil
     }
 
+    func prepareForEntryPresentation() {
+        guard !isBusy else { return }
+        clearLandingError()
+        state.socialLoginState.activeProvider = nil
+        state.socialLoginState.submittingState = .idle
+        state.successTransitionState = .idle
+    }
+
     func presentEmailSignUp() {
         clearLandingError()
         emailAuthDestination = .signUp
@@ -562,7 +597,6 @@ final class AuthFlowViewModel: ObservableObject {
     }
 
     func beginInteractiveLogin(provider: AuthProvider) {
-        guard !isBusy else { return }
         clearLandingError()
         state.socialLoginState.activeProvider = provider
         state.socialLoginState.submittingState = .loading("\(provider.title) 로그인을 준비하고 있습니다")
@@ -584,19 +618,29 @@ final class AuthFlowViewModel: ObservableObject {
     }
 
     func startGoogleLogin() {
+        debugGoogleAuth("buttonTapped supported=\(isGoogleLoginEnabled) clientIDConfigured=\(!session.container.configuration.googleClientID.isEmpty)")
         beginInteractiveLogin(provider: .google)
 
-        guard !session.container.configuration.googleClientID.isEmpty else {
-            handleGoogleFailure(AuthError.unknown)
+        let googleClientID = session.container.configuration.googleClientID
+        guard !googleClientID.isEmpty else {
+            debugGoogleAuth("configurationMissing stage=preSignIn")
+            presentInlineError(
+                PresentationError(title: "Google 로그인 설정 오류", message: "Google 로그인 설정을 확인한 뒤 다시 시도해 주세요.")
+            )
             return
         }
 
         guard let presentingViewController = topViewController() else {
-            handleGoogleFailure(AuthError.unknown)
+            debugGoogleAuth("presenterResolutionFailed stage=preSignIn")
+            presentInlineError(
+                PresentationError(title: "Google 로그인 시작 실패", message: "Google 로그인 화면을 열 수 없어요. 잠시 후 다시 시도해 주세요.")
+            )
             return
         }
 
-        GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: session.container.configuration.googleClientID)
+        debugGoogleAuth("presenterResolved type=\(String(describing: type(of: presentingViewController)))")
+        GIDSignIn.sharedInstance.configuration = GIDConfiguration(clientID: googleClientID)
+        debugGoogleAuth("signInStarted")
         GIDSignIn.sharedInstance.signIn(withPresenting: presentingViewController) { result, error in
             if let error {
                 Task { @MainActor in
@@ -607,12 +651,16 @@ final class AuthFlowViewModel: ObservableObject {
 
             guard let result else {
                 Task { @MainActor in
+                    self.debugGoogleAuth("signInResultMissing")
                     self.handleGoogleFailure(AuthError.unknown)
                 }
                 return
             }
 
             Task {
+                await MainActor.run {
+                    self.debugGoogleAuth("signInSucceeded hasIdToken=\(result.user.idToken?.tokenString.isEmpty == false)")
+                }
                 await self.handleGoogleResult(result)
             }
         }
@@ -663,12 +711,14 @@ final class AuthFlowViewModel: ObservableObject {
 
     func handleGoogleResult(_ result: GIDSignInResult) async {
         guard let idToken = result.user.idToken?.tokenString else {
+            debugGoogleAuth("idTokenMissing stage=postSignIn")
             presentInlineError(
                 PresentationError(title: "Google 로그인 실패", message: "Google 로그인 정보를 가져오지 못했어요. 다시 시도해 주세요.")
             )
             return
         }
 
+        debugGoogleAuth("idTokenResolved hasIdToken=true")
         await authenticateSocial(provider: .google) {
             try await self.session.container.authRepository.loginWithGoogle(
                 authorization: GoogleLoginAuthorization(
@@ -686,12 +736,14 @@ final class AuthFlowViewModel: ObservableObject {
            nsError.domain == kGIDSignInErrorDomain,
            nsError.code == -5
         {
+            debugGoogleAuth("signInCancelled")
             resetLoadingState()
             return
         }
 
         if let error {
             let mappedError = AuthErrorMapper.map(error)
+            debugGoogleAuth("signInFailed mappedError=\(String(describing: mappedError)) rawError=\(error)")
             if mappedError != .unknown {
                 presentInlineError(mappedError.presentationError)
                 return
@@ -718,6 +770,9 @@ final class AuthFlowViewModel: ObservableObject {
             try await finalizeAuthentication(tokens: tokens, event: .login(provider))
         } catch {
             let authError = AuthErrorMapper.map(error)
+            if provider == .google {
+                debugGoogleAuth("backendLoginFailed mappedError=\(String(describing: authError))")
+            }
             resetLoadingState()
             state.socialLoginState.formError = authError.presentationError
             state.socialLoginState.providerConflict = authError.providerConflict
@@ -728,9 +783,19 @@ final class AuthFlowViewModel: ObservableObject {
 
     private func finalizeAuthentication(tokens: AuthTokens, event: AuthSessionEvent) async throws {
         state.successTransitionState = .bootstrappingSession
-        _ = try await session.completeAuthenticatedSession(tokens: tokens, event: event)
-        resetLoadingState()
-        state.successTransitionState = .completed
+        do {
+            let profile = try await session.completeAuthenticatedSession(tokens: tokens, event: event)
+            if case .login(.google) = event {
+                debugGoogleAuth("sessionTransitionSucceeded userId=\(profile.id)")
+            }
+            resetLoadingState()
+            state.successTransitionState = .completed
+        } catch {
+            if case .login(.google) = event {
+                debugGoogleAuth("sessionTransitionFailed error=\(error)")
+            }
+            throw error
+        }
     }
 
     private func presentInlineError(_ error: PresentationError) {
@@ -743,6 +808,12 @@ final class AuthFlowViewModel: ObservableObject {
         state.socialLoginState.submittingState = .idle
         state.socialLoginState.activeProvider = nil
         state.successTransitionState = .idle
+    }
+
+    private func debugGoogleAuth(_ message: String) {
+#if DEBUG
+        print("[GoogleAuth] \(message)")
+#endif
     }
 }
 
@@ -762,11 +833,38 @@ private extension UserFacingError {
     }
 
     var signupValidationIssues: [SignupValidationIssue] {
-        details?["validationErrors"]?.objectArrayValue?.compactMap { item in
+        let detailedIssues: [SignupValidationIssue] = details?["validationErrors"]?.objectArrayValue?.compactMap { item in
             guard let field = item["field"]?.stringValue, !field.isEmpty else { return nil }
             let message = item["message"]?.stringValue ?? ""
             return SignupValidationIssue(field: field, message: message)
         } ?? []
+        if !detailedIssues.isEmpty {
+            return detailedIssues
+        }
+
+        return message
+            .split(whereSeparator: \.isNewline)
+            .compactMap { rawLine in
+                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !line.isEmpty else { return nil }
+
+                let field = line
+                    .split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+                    .first
+                    .map(String.init)?
+                    .trimmingCharacters(in: CharacterSet(charactersIn: ":")) ?? ""
+
+                guard [
+                    "email",
+                    "password",
+                    "nickname",
+                    "agreedToTerms",
+                    "agreedToPrivacy",
+                    "agreedToMarketing",
+                ].contains(field) else { return nil }
+
+                return SignupValidationIssue(field: field, message: line)
+            }
     }
 }
 
@@ -1466,7 +1564,7 @@ final class EmailLoginViewModel: ObservableObject {
         }
 
         state.submittingState = .loading("로그인 정보를 확인하고 있습니다")
-        debugLog("requestPrepared endpoint=/auth/login/email email=\(normalizedEmail) passwordLength=\(state.password.count)")
+        debugLog("requestPrepared endpoint=\(AuthAPI.Endpoint.loginEmail) email=\(normalizedEmail) passwordLength=\(state.password.count)")
         do {
             let tokens = try await session.container.authRepository.loginWithEmail(
                 email: normalizedEmail,
@@ -2054,7 +2152,10 @@ private struct AuthSocialButtonsGroup: View {
                 }
             }
             .buttonStyle(SecondaryButtonStyle())
-            .disabled(viewModel.isBusy)
+            .disabled(!viewModel.isGoogleLoginEnabled)
+        }
+        .onAppear {
+            viewModel.prepareForEntryPresentation()
         }
     }
 }
@@ -2662,7 +2763,7 @@ private struct SuggestedProviderPanel: View {
                         onGoogleTap()
                     } label: {
                         HStack(spacing: 8) {
-                            Image(systemName: "globe")
+                            Image(systemName: provider.symbolName)
                             Text(provider.loginTitle)
                         }
                     }

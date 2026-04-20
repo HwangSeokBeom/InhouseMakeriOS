@@ -1,5 +1,6 @@
 import Combine
 import ComposableArchitecture
+import GoogleSignIn
 import SwiftUI
 import XCTest
 @testable import InhouseMakeriOS
@@ -62,6 +63,72 @@ final class InhouseMakeriOSTests: XCTestCase {
     func testAuthFlowStateDoesNotExposeEmailSubflows() {
         let labels = Mirror(reflecting: AuthFlowState()).children.compactMap(\.label)
         XCTAssertEqual(labels, ["entryState", "socialLoginState", "successTransitionState"])
+    }
+
+    func testAuthProviderSupportsGoogleLogin() {
+        XCTAssertEqual(Set(AuthProvider.supportedProviders), Set([.email, .apple, .google]))
+        XCTAssertEqual(Set(AuthProvider.socialProviders), Set([.apple, .google]))
+    }
+
+    @MainActor
+    func testAuthFlowViewModelEnablesGoogleWhenSupportedProvidersIncludesGoogle() {
+        let viewModel = AuthFlowViewModel(
+            session: AppSessionViewModel(
+                container: AppContainer(configuration: makeConfiguration(), tokenStore: makeTokenStore())
+            )
+        )
+
+        XCTAssertTrue(viewModel.supportedAuthProviders.contains(.google))
+        XCTAssertTrue(viewModel.isGoogleLoginEnabled)
+    }
+
+    @MainActor
+    func testAuthFlowEntryPresentationClearsStaleGoogleFailure() {
+        let viewModel = AuthFlowViewModel(
+            session: AppSessionViewModel(
+                container: AppContainer(configuration: makeConfiguration(), tokenStore: makeTokenStore())
+            )
+        )
+
+        viewModel.handleGoogleFailure(AuthError.unknown)
+        XCTAssertEqual(viewModel.landingPresentationError?.title, "Google 로그인 실패")
+
+        viewModel.prepareForEntryPresentation()
+
+        XCTAssertNil(viewModel.landingPresentationError)
+        XCTAssertFalse(viewModel.isBusy)
+    }
+
+    @MainActor
+    func testGoogleCancellationDoesNotLeaveGenericFailureBanner() {
+        let viewModel = AuthFlowViewModel(
+            session: AppSessionViewModel(
+                container: AppContainer(configuration: makeConfiguration(), tokenStore: makeTokenStore())
+            )
+        )
+
+        viewModel.beginInteractiveLogin(provider: .google)
+        viewModel.handleGoogleFailure(NSError(domain: kGIDSignInErrorDomain, code: -5))
+
+        XCTAssertNil(viewModel.landingPresentationError)
+        XCTAssertFalse(viewModel.isBusy)
+    }
+
+    @MainActor
+    func testGoogleURLCallbackHandlerInvokesConfiguredHandler() {
+        let originalHandler = GoogleAuthCallbackHandler.handleURL
+        let callbackURL = URL(string: "com.googleusercontent.apps.742162085445-gfk77jd6n7ue8i1nln6ish1kbnne00oo:/oauth2redirect?code=test")!
+        var receivedURL: URL?
+        GoogleAuthCallbackHandler.handleURL = { url in
+            receivedURL = url
+            return true
+        }
+        defer {
+            GoogleAuthCallbackHandler.handleURL = originalHandler
+        }
+
+        XCTAssertTrue(GoogleAuthCallbackHandler.handle(callbackURL))
+        XCTAssertEqual(receivedURL, callbackURL)
     }
 
     func testEmailValidationUsesServiceLevelRules() {
@@ -363,6 +430,28 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(
             AuthError.unsupportedProvider(provider: nil, availableProviders: [.email, .apple, .google]).presentationError.message,
             "이 앱에서는 이메일, Apple, Google 로그인을 사용할 수 있어요."
+        )
+    }
+
+    func testValidationErrorMappingParsesSignupConsentIssuesFromServerMessage() {
+        let error = UserFacingError(
+            title: "서버 오류",
+            message: "agreedToTerms must be a boolean value\nagreedToPrivacy must be a boolean value",
+            code: "VALIDATION_ERROR",
+            statusCode: 400,
+            endpoint: AuthAPI.Endpoint.signUp,
+            requestMethod: HTTPMethod.post.rawValue
+        )
+
+        XCTAssertEqual(
+            AuthErrorMapper.map(error),
+            .invalidPayload(
+                issues: [
+                    SignupValidationIssue(field: "agreedToTerms", message: "agreedToTerms must be a boolean value"),
+                    SignupValidationIssue(field: "agreedToPrivacy", message: "agreedToPrivacy must be a boolean value"),
+                ],
+                message: "agreedToTerms must be a boolean value\nagreedToPrivacy must be a boolean value"
+            )
         )
     }
 
@@ -1606,7 +1695,7 @@ final class InhouseMakeriOSTests: XCTestCase {
                 configuration: makeConfiguration(),
                 tokenStore: tokenStore,
                 session: makeURLSession { request in
-                    XCTAssertEqual(request.url?.path, "/auth/signup/email")
+                    XCTAssertEqual(request.url?.path, AuthAPI.Endpoint.signUp)
                     XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
 
                     let body = try XCTUnwrap(self.requestBodyData(from: request))
@@ -1617,6 +1706,7 @@ final class InhouseMakeriOSTests: XCTestCase {
                     XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
                     XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
                     XCTAssertEqual(payload["agreedToMarketing"] as? Bool, false)
+                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname", "agreedToTerms", "agreedToPrivacy", "agreedToMarketing"]))
 
                     let response = AuthTokensDTO(
                         user: AuthUserDTO(
@@ -1650,6 +1740,140 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(tokens.accessToken, "signup-access")
         let persistedTokens = await tokenStore.loadTokens()
         XCTAssertEqual(persistedTokens, tokens)
+    }
+
+    func testAppleLoginRequestUsesIdentityTokenOnlyPayload() async throws {
+        let tokenStore = makeTokenStore()
+        let repository = AuthRepository(
+            apiClient: APIClient(
+                configuration: makeConfiguration(),
+                tokenStore: tokenStore,
+                session: makeURLSession { request in
+                    XCTAssertEqual(request.url?.path, AuthAPI.Endpoint.loginApple)
+                    XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["identityToken"] as? String, "apple-identity-token")
+                    XCTAssertEqual(Set(payload.keys), Set(["identityToken"]))
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: "user@example.com",
+                            nickname: "tester",
+                            provider: "apple",
+                            status: .active
+                        ),
+                        accessToken: "apple-access",
+                        refreshToken: "apple-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                }
+            ),
+            tokenStore: tokenStore
+        )
+
+        let tokens = try await repository.loginWithApple(
+            authorization: AppleLoginAuthorization(
+                identityToken: "apple-identity-token",
+                authorizationCode: "auth-code",
+                userIdentifier: "apple-user",
+                email: "user@example.com",
+                givenName: "Seokbeom",
+                familyName: "Hwang"
+            )
+        )
+
+        XCTAssertEqual(tokens.accessToken, "apple-access")
+        XCTAssertEqual(tokens.user.provider, .apple)
+    }
+
+    func testEmailSignUpRequestOmitsMarketingWhenNotProvided() async throws {
+        let tokenStore = makeTokenStore()
+        let repository = AuthRepository(
+            apiClient: APIClient(
+                configuration: makeConfiguration(),
+                tokenStore: tokenStore,
+                session: makeURLSession { request in
+                    XCTAssertEqual(request.url?.path, AuthAPI.Endpoint.signUp)
+
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
+                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
+                    XCTAssertNil(payload["agreedToMarketing"])
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: "user@example.com",
+                            nickname: "tester",
+                            provider: "email",
+                            status: .active
+                        ),
+                        accessToken: "signup-access",
+                        refreshToken: "signup-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                }
+            ),
+            tokenStore: tokenStore
+        )
+
+        _ = try await repository.signUpWithEmail(
+            email: "user@example.com",
+            password: "Password1!",
+            nickname: "tester",
+            agreedToTerms: true,
+            agreedToPrivacy: true,
+            agreedToMarketing: nil
+        )
+    }
+
+    func testGoogleLoginRequestUsesIdentityTokenPayload() async throws {
+        let tokenStore = makeTokenStore()
+        let repository = AuthRepository(
+            apiClient: APIClient(
+                configuration: makeConfiguration(),
+                tokenStore: tokenStore,
+                session: makeURLSession { request in
+                    XCTAssertEqual(request.url?.path, AuthAPI.Endpoint.loginGoogle)
+                    XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+
+                    let body = try XCTUnwrap(self.requestBodyData(from: request))
+                    let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+                    XCTAssertEqual(payload["identityToken"] as? String, "google-id-token")
+                    XCTAssertEqual(Set(payload.keys), Set(["identityToken"]))
+
+                    let response = AuthTokensDTO(
+                        user: AuthUserDTO(
+                            id: "u1",
+                            email: "user@example.com",
+                            nickname: "tester",
+                            provider: "google",
+                            status: .active
+                        ),
+                        accessToken: "google-access",
+                        refreshToken: "google-refresh"
+                    )
+                    return (200, try JSONEncoder.app.encode(response))
+                }
+            ),
+            tokenStore: tokenStore
+        )
+
+        let tokens = try await repository.loginWithGoogle(
+            authorization: GoogleLoginAuthorization(
+                idToken: "google-id-token",
+                accessToken: "google-access-token",
+                email: "user@example.com",
+                name: "Tester"
+            )
+        )
+
+        XCTAssertEqual(tokens.accessToken, "google-access")
+        XCTAssertEqual(tokens.user.provider, .google)
     }
 
     func testEmailLoginRequestUsesExpectedEndpointAndPayload() async throws {
@@ -1788,7 +2012,7 @@ final class InhouseMakeriOSTests: XCTestCase {
             tokenStore: tokenStore,
             urlSession: makeURLSession { request in
                 switch request.url?.path {
-                case "/auth/signup/email":
+                case AuthAPI.Endpoint.signUp:
                     let body = try XCTUnwrap(self.requestBodyData(from: request))
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
                     XCTAssertEqual(payload["email"] as? String, expectedEmail)
@@ -1797,6 +2021,7 @@ final class InhouseMakeriOSTests: XCTestCase {
                     XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
                     XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
                     XCTAssertEqual(payload["agreedToMarketing"] as? Bool, false)
+                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname", "agreedToTerms", "agreedToPrivacy", "agreedToMarketing"]))
 
                     let response = AuthTokensDTO(
                         user: AuthUserDTO(
@@ -1863,12 +2088,38 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testEmailSignUpSubmitIsBlockedWithoutRequiredTerms() async {
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: makeTokenStore(),
+            urlSession: makeURLSession { request in
+                XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                return (500, Data())
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        let viewModel = EmailSignUpViewModel(session: session)
+
+        viewModel.updateEmail("user@example.com")
+        viewModel.updatePassword("Password1!")
+        viewModel.updatePasswordConfirmation("Password1!")
+        viewModel.updateNickname("tester1")
+
+        XCTAssertFalse(viewModel.state.isSubmitEnabled)
+
+        await viewModel.submit()
+
+        XCTAssertNil(session.authTokens)
+        XCTAssertTrue(viewModel.state.termsState.hasAttemptedValidation)
+    }
+
+    @MainActor
     func testEmailSignUpSubmitShowsFieldErrorForDuplicateEmail() async {
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: makeTokenStore(),
             urlSession: makeURLSession { request in
-                XCTAssertEqual(request.url?.path, "/auth/signup/email")
+                XCTAssertEqual(request.url?.path, AuthAPI.Endpoint.signUp)
                 return (
                     409,
                     self.makeServerErrorData(
