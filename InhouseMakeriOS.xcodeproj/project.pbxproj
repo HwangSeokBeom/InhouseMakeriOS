@@ -544,7 +544,6 @@
 			buildSettings = {
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "내전메이커";
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
@@ -559,7 +558,6 @@
 			buildSettings = {
 				ENABLE_PREVIEWS = YES;
 				INFOPLIST_KEY_CFBundleDisplayName = "내전메이커";
-				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.games";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
