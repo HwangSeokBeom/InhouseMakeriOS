@@ -30,7 +30,7 @@ env:
   SIMULATOR_DEVICE_NAME: iPhone 16
   SIMULATOR_DEVICE_TYPE_IDENTIFIER: com.apple.CoreSimulator.SimDeviceType.iPhone-16
   SIMULATOR_RUNTIME_NAME: iOS 26.3
-  SIMULATOR_RUNTIME_IDENTIFIER: com.apple.CoreSimulator.SimRuntime.iOS-26-3
+  SIMULATOR_RUNTIME_IDENTIFIER: com.apple.CoreSimulator.SimRuntime.iOS-26-2
 
 jobs:
   build:
