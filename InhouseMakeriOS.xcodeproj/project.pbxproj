@@ -28,6 +28,7 @@
 		8BB375142E0945C100D35084 /* GoogleSignIn in Frameworks */ = {isa = PBXBuildFile; productRef = 8BB376042E0945C100D35084 /* GoogleSignIn */; };
 		8BB375152E0A45C100D35084 /* AuthFlow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8BB374162E0A45C100D35084 /* AuthFlow.swift */; };
 		C10000000000000000000023 /* UIKitHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = C10000000000000000000024 /* UIKitHelpers.swift */; };
+		C10000000000000000000025 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 8BB374062E0945C100D35084 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -328,6 +329,7 @@
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				C10000000000000000000025 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
