@@ -692,6 +692,7 @@ final class InhouseMakeriOSTests: XCTestCase {
             _ = try await repository.previewResult(draft: .defaultValue())
             XCTFail("Expected validation failure")
         } catch let error as UserFacingError {
+            XCTAssertEqual(error.title, "결과를 다시 확인해 주세요")
             XCTAssertEqual(error.message, "MVP를 다시 선택해 주세요.")
         } catch {
             XCTFail("Unexpected error: \(error)")
@@ -846,7 +847,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         ).serverContractMapped
 
         XCTAssertEqual(mappedError.title, "모집이 마감되었어요")
-        XCTAssertEqual(mappedError.message, "모집이 종료되어 더 이상 진행할 수 없어요.")
+        XCTAssertEqual(mappedError.message, "모집이 마감되어 참가 신청할 수 없어요.")
     }
 
     func testErrorMapperMapsRecruitingApplyClosedOrFullToFriendlyMessage() {
@@ -2871,6 +2872,9 @@ final class InhouseMakeriOSTests: XCTestCase {
                 case "/recruiting-posts":
                     let payload = try JSONEncoder.app.encode(RecruitPostListDTO(items: [self.makeRecruitPostDTO(id: "auth-post", title: "계정 모집")]))
                     return (200, payload)
+                case "/groups/group-1":
+                    let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "테스트 그룹"))
+                    return (200, payload)
                 default:
                     XCTFail("Unexpected path \(request.url?.path ?? "nil")")
                     return (500, Data())
@@ -2985,6 +2989,111 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
+    func testRecruitBoardViewModelHandleCreateSuccessKeepsOverflowMenuHiddenForInsertedPost() {
+        let suiteName = "InhouseMakeriOSTests.recruit.create-success-overflow.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
+
+        let session = AppSessionViewModel(
+            container: AppContainer(
+                configuration: makeConfiguration(),
+                tokenStore: makeTokenStore(),
+                localStore: localStore
+            )
+        )
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitBoardViewModel(session: session)
+        let createdPost = RecruitPost(
+            id: "created-post",
+            groupID: "group-1",
+            postType: .memberRecruit,
+            title: "새 팀원 모집",
+            status: .open,
+            scheduledAt: nil,
+            body: "본문",
+            tags: ["빡겜"],
+            requiredPositions: ["MID"],
+            createdBy: "u1"
+        )
+
+        viewModel.handleCreateSuccess(createdPost)
+
+        XCTAssertEqual(viewModel.state.value?.items.map(\.canShowOverflowMenu), [false])
+    }
+
+    @MainActor
+    func testRecruitBoardViewModelLoadResolvesOverflowMenuVisibilityFromSnapshotItems() async {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.recruit.load-overflow.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch request.url?.path {
+                case "/recruiting-posts":
+                    let payload = try JSONEncoder.app.encode(
+                        RecruitPostListDTO(
+                            items: [
+                                RecruitPostDTO(
+                                    id: "owned-post",
+                                    groupId: "group-1",
+                                    postType: .memberRecruit,
+                                    title: "내 모집",
+                                    status: .open,
+                                    scheduledAt: nil,
+                                    body: "본문",
+                                    tags: ["빡겜"],
+                                    requiredPositions: ["MID"],
+                                    createdBy: "u1"
+                                ),
+                                RecruitPostDTO(
+                                    id: "other-post",
+                                    groupId: "group-1",
+                                    postType: .memberRecruit,
+                                    title: "남의 모집",
+                                    status: .open,
+                                    scheduledAt: nil,
+                                    body: "본문",
+                                    tags: ["즐겜"],
+                                    requiredPositions: ["SUPPORT"],
+                                    createdBy: "tester"
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case "/groups/group-1":
+                    let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "테스트 그룹"))
+                    return (200, payload)
+                default:
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = RecruitBoardViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: .screenAppear)
+
+        XCTAssertEqual(viewModel.state.value?.items.map(\.id), ["owned-post", "other-post"])
+        XCTAssertEqual(viewModel.state.value?.items.map(\.canShowOverflowMenu), [true, false])
+    }
+
+    @MainActor
     func testRecruitBoardViewModelSwitchTypeIgnoresDuplicateSelection() async {
         let requestLock = NSLock()
         var requestCount = 0
@@ -3029,11 +3138,28 @@ final class InhouseMakeriOSTests: XCTestCase {
         let releaseFirstRequest = DispatchSemaphore(value: 0)
         let requestLock = NSLock()
         var requestedPostTypes: [String] = []
+        let suiteName = "InhouseMakeriOSTests.recruit.queue.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
 
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: tokenStore,
+            localStore: localStore,
             urlSession: makeURLSession { request in
+                guard request.url?.path == "/recruiting-posts" else {
+                    if request.url?.path == "/groups/group-1" {
+                        let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "테스트 그룹"))
+                        return (200, payload)
+                    }
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+
                 let postType = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
                     .queryItems?
                     .first(where: { $0.name == "postType" })?
@@ -3129,6 +3255,7 @@ final class InhouseMakeriOSTests: XCTestCase {
             }
         )
         let session = AppSessionViewModel(container: container)
+        session.restoreGuestSession()
         let viewModel = RecruitBoardViewModel(session: session)
 
         await viewModel.applyFilters(filterState, reason: .date)
@@ -3156,6 +3283,12 @@ final class InhouseMakeriOSTests: XCTestCase {
     func testHomeViewModelRecruitingFailureKeepsContentAndOmitsUnsupportedQuery() async throws {
         let tokenStore = makeTokenStore()
         await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.recruiting-failure.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
         let requestLock = NSLock()
         var capturedRecruitingURL: URL?
         let historyDate = Date(timeIntervalSince1970: 1_776_643_200)
@@ -3163,6 +3296,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: tokenStore,
+            localStore: localStore,
             urlSession: makeURLSession { request in
                 switch (request.httpMethod, request.url?.path) {
                 case ("GET", "/recruiting-posts"):
@@ -3808,9 +3942,16 @@ final class InhouseMakeriOSTests: XCTestCase {
     func testRecruitDetailViewModelBuildsDisplayStateWithoutRawIdentifiers() async throws {
         let tokenStore = makeTokenStore()
         await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.recruit.detail-display.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: tokenStore,
+            localStore: localStore,
             urlSession: makeURLSession { request in
                 switch request.url?.path {
                 case "/recruiting-posts/post-1":
@@ -4806,6 +4947,8 @@ final class InhouseMakeriOSTests: XCTestCase {
                     return (200, payload)
                 case ("GET", "/users/u1/inhouse-history"):
                     return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                case ("GET", "/users/u1/power-profile"):
+                    return (200, try JSONEncoder.app.encode(self.makePowerProfileDTO(userId: "u1")))
                 default:
                     XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
                     return (500, Data())
@@ -4829,7 +4972,8 @@ final class InhouseMakeriOSTests: XCTestCase {
             MatchLobbyFeature()
         }
 
-        await store.send(.loadResponse(.failure(.authRequiredFallback()))) {
+        let requestID = store.state.activeLoadRequestID
+        await store.send(.loadResponse(requestID, .failure(.authRequiredFallback()))) {
             $0.loadState = .empty("로그인 후 내전 로비를 다시 열 수 있어요.")
             $0.pendingProtectedAction = .reload
         }
@@ -4882,7 +5026,8 @@ final class InhouseMakeriOSTests: XCTestCase {
             MatchLobbyFeature()
         }
 
-        await store.send(.loadResponse(.success(snapshot))) {
+        let requestID = store.state.activeLoadRequestID
+        await store.send(.loadResponse(requestID, .success(snapshot))) {
             $0.loadState = .content(snapshot)
         }
 
@@ -5976,6 +6121,262 @@ final class InhouseMakeriOSTests: XCTestCase {
         withExtendedLifetime(cancellable) {}
     }
 
+    func testGroupSummaryDTOPrefersExplicitCompletedHistoryCountFields() throws {
+        let payload = try JSONSerialization.data(
+            withJSONObject: [
+                "id": "group-1",
+                "name": "테스트 그룹",
+                "description": "설명",
+                "visibility": GroupVisibility.public.rawValue,
+                "joinPolicy": JoinPolicy.open.rawValue,
+                "tags": ["서울"],
+                "ownerUserId": "owner",
+                "memberCount": 10,
+                "recentMatches": 7,
+                "matchCount": 7,
+                "lobbyCount": 2,
+                "recentInhouseCount": 5,
+                "completedInhouseCount": 4,
+            ]
+        )
+
+        let dto = try JSONDecoder.app.decode(GroupSummaryDTO.self, from: payload)
+
+        XCTAssertEqual(dto.recentMatches, 4)
+        XCTAssertEqual(dto.recentMatchCountSource, .completedHistory)
+    }
+
+    func testGroupSummaryDTOSubtractsLobbyCountFromLegacyMatchCount() throws {
+        let payload = try JSONSerialization.data(
+            withJSONObject: [
+                "id": "group-1",
+                "name": "테스트 그룹",
+                "description": "설명",
+                "visibility": GroupVisibility.public.rawValue,
+                "joinPolicy": JoinPolicy.open.rawValue,
+                "tags": ["서울"],
+                "ownerUserId": "owner",
+                "memberCount": 10,
+                "recentMatches": 6,
+                "lobbyCount": 1,
+            ]
+        )
+
+        let dto = try JSONDecoder.app.decode(GroupSummaryDTO.self, from: payload)
+
+        XCTAssertEqual(dto.recentMatches, 5)
+        XCTAssertEqual(dto.recentMatchCountSource, .legacyAdjustedByLobbyCount)
+    }
+
+    func testGroupSummaryDTOTreatsRecentInhouseCountAsLegacyWithoutCompletedField() throws {
+        let payload = try JSONSerialization.data(
+            withJSONObject: [
+                "id": "group-1",
+                "name": "테스트 그룹",
+                "description": "설명",
+                "visibility": GroupVisibility.public.rawValue,
+                "joinPolicy": JoinPolicy.open.rawValue,
+                "tags": ["서울"],
+                "ownerUserId": "owner",
+                "memberCount": 10,
+                "recentInhouseCount": 8,
+            ]
+        )
+
+        let dto = try JSONDecoder.app.decode(GroupSummaryDTO.self, from: payload)
+
+        XCTAssertEqual(dto.recentMatches, 8)
+        XCTAssertEqual(dto.recentMatchCountSource, .legacyRecentMatches)
+    }
+
+    func testGroupCompletedInhouseDisplayFormatsConfirmedEmptyAndLegacyStates() {
+        let confirmed = GroupSummary(
+            id: "group-confirmed",
+            name: "완료 그룹",
+            description: nil,
+            visibility: .public,
+            joinPolicy: .open,
+            tags: [],
+            ownerUserID: "owner",
+            memberCount: 10,
+            recentMatches: 8,
+            recentMatchCountSource: .completedHistory
+        )
+        let empty = GroupSummary(
+            id: "group-empty",
+            name: "빈 그룹",
+            description: nil,
+            visibility: .public,
+            joinPolicy: .open,
+            tags: [],
+            ownerUserID: "owner",
+            memberCount: 10,
+            recentMatches: 0,
+            recentMatchCountSource: .completedHistory
+        )
+        let legacy = GroupSummary(
+            id: "group-legacy",
+            name: "레거시 그룹",
+            description: nil,
+            visibility: .public,
+            joinPolicy: .open,
+            tags: [],
+            ownerUserID: "owner",
+            memberCount: 10,
+            recentMatches: 8,
+            recentMatchCountSource: .legacyRecentMatches
+        )
+
+        XCTAssertEqual(confirmed.completedInhouseDisplay.recentInhouseText, "최근 내전: 8회 진행")
+        XCTAssertEqual(empty.completedInhouseDisplay.recentInhouseText, "최근 내전: 기록 없음")
+        XCTAssertEqual(legacy.completedInhouseDisplay.recentInhouseText, "최근 내전: 기록 확인 중")
+    }
+
+    @MainActor
+    func testGroupDetailViewModelCorrectsLegacyRecentMatchCountUsingTrackedPendingLobby() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.group-detail.pending-lobby-correction.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackMatch(
+            RecentMatchContext(matchID: "pending-match", groupID: "group-1", groupName: "테스트 그룹", createdAt: Date())
+        )
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    let payload = try JSONSerialization.data(
+                        withJSONObject: [
+                            "id": "group-1",
+                            "name": "테스트 그룹",
+                            "description": "설명",
+                            "visibility": GroupVisibility.private.rawValue,
+                            "joinPolicy": JoinPolicy.inviteOnly.rawValue,
+                            "tags": ["서울"],
+                            "ownerUserId": "u1",
+                            "memberCount": 10,
+                            "recentMatches": 3,
+                        ]
+                    )
+                    return (200, payload)
+                case ("GET", "/groups/group-1/members"):
+                    return (200, try JSONEncoder.app.encode(GroupMemberListDTO(items: [])))
+                case ("GET", "/matches/pending-match"):
+                    return (
+                        200,
+                        try JSONEncoder.app.encode(
+                            MatchResponseDTO(
+                                id: "pending-match",
+                                groupId: "group-1",
+                                status: .recruiting,
+                                scheduledAt: nil,
+                                balanceMode: nil,
+                                selectedCandidateNo: nil,
+                                players: [],
+                                candidates: nil
+                            )
+                        )
+                    )
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+
+        XCTAssertEqual(viewModel.state.value?.group.recentMatches, 2)
+        XCTAssertEqual(viewModel.state.value?.group.recentMatchCountSource, .legacyRecentMatches)
+    }
+
+    @MainActor
+    func testGroupDetailViewModelCreateMatchDoesNotOptimisticallyIncrementRecentMatchCount() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.group-detail.create-match-count.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/group-1"):
+                    return (
+                        200,
+                        try JSONEncoder.app.encode(
+                            GroupSummaryDTO(
+                                id: "group-1",
+                                name: "테스트 그룹",
+                                description: "설명",
+                                visibility: .private,
+                                joinPolicy: .inviteOnly,
+                                tags: ["서울"],
+                                ownerUserId: "u1",
+                                memberCount: 10,
+                                recentMatches: 2
+                            )
+                        )
+                    )
+                case ("GET", "/groups/group-1/members"):
+                    return (200, try JSONEncoder.app.encode(GroupMemberListDTO(items: [])))
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                case ("POST", "/groups/group-1/matches"):
+                    return (
+                        200,
+                        try JSONEncoder.app.encode(
+                            MatchResponseDTO(
+                                id: "created-match",
+                                groupId: "group-1",
+                                status: .recruiting,
+                                scheduledAt: nil,
+                                balanceMode: nil,
+                                selectedCandidateNo: nil,
+                                players: [],
+                                candidates: nil
+                            )
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = GroupDetailViewModel(session: session, groupID: "group-1")
+
+        await viewModel.load(trigger: .screenAppear)
+        let createdMatch = await viewModel.createMatch()
+
+        XCTAssertEqual(createdMatch?.id, "created-match")
+        XCTAssertEqual(viewModel.state.value?.group.recentMatches, 2)
+        XCTAssertEqual(localStore.recentMatches.first?.matchID, "created-match")
+    }
+
     private func makeTokens() -> AuthTokens {
         AuthTokens(
             user: AuthUser(id: "u1", email: "user@example.com", nickname: "tester"),
@@ -6163,6 +6564,18 @@ final class InhouseMakeriOSTests: XCTestCase {
             ownerUserId: "owner",
             memberCount: 10,
             recentMatches: 3
+        )
+    }
+
+    private func makePowerProfileDTO(userId: String = "u1") -> PowerProfileDTO {
+        PowerProfileDTO(
+            userId: userId,
+            overallPower: 80,
+            lanePower: ["MID": 80],
+            primaryPosition: .mid,
+            secondaryPosition: .top,
+            style: PowerProfileDTO.StyleDTO(stability: 80, carry: 80, teamContribution: 80, laneInfluence: 80),
+            version: "test"
         )
     }
 

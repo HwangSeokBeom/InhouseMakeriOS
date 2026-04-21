@@ -247,6 +247,22 @@ private struct SplashView: View {
 }
 
 #if DEBUG
+private enum DebugUITestScenarioKind {
+    case groupInviteFlow
+    case recruitManagementFlow
+
+    static func current() -> Self? {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains(DebugGroupInviteFlowScenario.launchArgument) {
+            return .groupInviteFlow
+        }
+        if arguments.contains(DebugRecruitManagementFlowScenario.launchArgument) {
+            return .recruitManagementFlow
+        }
+        return nil
+    }
+}
+
 @MainActor
 private struct DebugUITestLaunchScenario {
     let session: AppSessionViewModel
@@ -254,7 +270,7 @@ private struct DebugUITestLaunchScenario {
     let rootView: AnyView
 
     static func makeCurrent(modelContainer: ModelContainer) -> DebugUITestLaunchScenario? {
-        guard ProcessInfo.processInfo.arguments.contains(DebugGroupInviteFlowScenario.launchArgument) else {
+        guard let scenarioKind = DebugUITestScenarioKind.current() else {
             return nil
         }
 
@@ -294,13 +310,25 @@ private struct DebugUITestLaunchScenario {
                 )
             )
         )
-        session.selectedTab = .match
+        switch scenarioKind {
+        case .groupInviteFlow:
+            session.selectedTab = .match
+        case .recruitManagementFlow:
+            session.selectedTab = .recruit
+        }
 
         let router = AppRouter()
+        let rootView: AnyView
+        switch scenarioKind {
+        case .groupInviteFlow:
+            rootView = AnyView(DebugGroupInviteFlowRootView(session: session, router: router))
+        case .recruitManagementFlow:
+            rootView = AnyView(DebugRecruitManagementFlowRootView(session: session, router: router))
+        }
         return DebugUITestLaunchScenario(
             session: session,
             router: router,
-            rootView: AnyView(DebugGroupInviteFlowRootView(session: session, router: router))
+            rootView: rootView
         )
     }
 }
@@ -378,9 +406,47 @@ private struct DebugGroupInviteFlowRootView: View {
     }
 }
 
+private struct DebugRecruitManagementFlowRootView: View {
+    @ObservedObject var session: AppSessionViewModel
+    @ObservedObject var router: AppRouter
+    @StateObject private var viewModel: RecruitBoardViewModel
+
+    init(session: AppSessionViewModel, router: AppRouter) {
+        self.session = session
+        self.router = router
+        _viewModel = StateObject(wrappedValue: RecruitBoardViewModel(session: session))
+    }
+
+    var body: some View {
+        NavigationStack(path: $router.path) {
+            RecruitBoardScreen(viewModel: viewModel, session: session, router: router)
+                .navigationDestination(for: AppRoute.self) { route in
+                    switch route {
+                    case let .recruitDetail(postID):
+                        RecruitDetailScreen(
+                            viewModel: RecruitDetailViewModel(session: session, postID: postID),
+                            router: router,
+                            onUpdateSuccess: { updatedPost in
+                                viewModel.handleUpdateSuccess(updatedPost)
+                            },
+                            onDeleteSuccess: { deletedPost in
+                                viewModel.handleDeleteSuccess(deletedPost)
+                            }
+                        )
+                    default:
+                        Text("Unsupported debug route")
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .background(AppPalette.bgPrimary)
+                    }
+                }
+        }
+    }
+}
+
 private final class DebugUITestURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool {
-        ProcessInfo.processInfo.arguments.contains(DebugGroupInviteFlowScenario.launchArgument)
+        DebugUITestScenarioKind.current() != nil
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
@@ -389,7 +455,15 @@ private final class DebugUITestURLProtocol: URLProtocol {
 
     override func startLoading() {
         Task {
-            let response = await DebugGroupInviteFlowScenario.shared.response(for: request)
+            let response: DebugProtocolResponse
+            switch DebugUITestScenarioKind.current() {
+            case .groupInviteFlow:
+                response = await DebugGroupInviteFlowScenario.shared.response(for: request)
+            case .recruitManagementFlow:
+                response = await DebugRecruitManagementFlowScenario.shared.response(for: request)
+            case nil:
+                return
+            }
             guard let client else { return }
 
             let httpResponse = HTTPURLResponse(
@@ -482,6 +556,7 @@ private actor DebugGroupInviteFlowScenario {
         let method = request.httpMethod ?? "GET"
         let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
         let path = components?.path ?? url.path
+        let requestBody = requestBodyData(from: request)
 
         switch (method, path) {
         case ("GET", "/groups/\(Self.groupID)"):
@@ -505,7 +580,7 @@ private actor DebugGroupInviteFlowScenario {
 
         case ("POST", "/groups/\(Self.groupID)/members"):
             guard
-                let data = request.httpBody,
+                let data = requestBody,
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let userID = object["userId"] as? String
             else {
@@ -552,7 +627,7 @@ private actor DebugGroupInviteFlowScenario {
                 return serverError(statusCode: 404, code: "MATCH_NOT_FOUND", message: "Match not found.", path: path)
             }
             guard
-                let data = request.httpBody,
+                let data = requestBody,
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let players = object["players"] as? [[String: Any]]
             else {
@@ -675,6 +750,32 @@ private actor DebugGroupInviteFlowScenario {
         }
     }
 
+    private func requestBodyData(from request: URLRequest) -> Data? {
+        if let httpBody = request.httpBody {
+            return httpBody
+        }
+        guard let bodyStream = request.httpBodyStream else {
+            return nil
+        }
+
+        bodyStream.open()
+        defer { bodyStream.close() }
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while bodyStream.hasBytesAvailable {
+            let bytesRead = bodyStream.read(&buffer, maxLength: buffer.count)
+            if bytesRead > 0 {
+                data.append(contentsOf: buffer[..<bytesRead])
+            } else if bytesRead < 0 {
+                return nil
+            } else {
+                break
+            }
+        }
+        return data.isEmpty ? nil : data
+    }
+
     private func groupSummaryData() -> Data {
         try! JSONEncoder.app.encode(
             GroupSummaryDTO(
@@ -688,7 +789,7 @@ private actor DebugGroupInviteFlowScenario {
                 canInviteMembers: true,
                 inviteMembersBlockedReason: nil,
                 memberCount: members.count,
-                recentMatches: matchResponse == nil ? 0 : 1
+                recentMatches: matchResponse?.status.countsAsCompletedGroupHistory == true ? 1 : 0
             )
         )
     }
@@ -761,7 +862,7 @@ private actor DebugGroupInviteFlowScenario {
             userId: user.id,
             nickname: user.nickname,
             teamSide: nil,
-            assignedRole: nil,
+            assignedRole: user.primaryPosition,
             participationStatus: .accepted,
             isCaptain: user.id == Self.currentUser.id
         )
@@ -822,6 +923,191 @@ private actor DebugGroupInviteFlowScenario {
 
     private func rolePower(for userID: String) -> Double {
         (testMemberPool + [inviteOnlyUser]).first(where: { $0.id == userID })?.power ?? 70
+    }
+
+    private func success(_ data: Data) -> DebugProtocolResponse {
+        DebugProtocolResponse(statusCode: 200, data: data)
+    }
+
+    private func serverError(statusCode: Int, code: String, message: String, path: String) -> DebugProtocolResponse {
+        let payload: [String: Any] = [
+            "statusCode": statusCode,
+            "code": code,
+            "message": message,
+            "timestamp": ISO8601DateFormatter.full.string(from: Date()),
+            "path": path,
+        ]
+        let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
+        return DebugProtocolResponse(statusCode: statusCode, data: data)
+    }
+}
+
+private actor DebugRecruitManagementFlowScenario {
+    static let launchArgument = "-ui-test-recruit-management-flow"
+    static let groupID = "debug-recruit-group"
+    static let memberPostID = "debug-member-recruit-post"
+    static let opponentPostID = "debug-opponent-recruit-post"
+    static let shared = DebugRecruitManagementFlowScenario()
+
+    private struct StubPost {
+        let id: String
+        let groupID: String
+        var postType: RecruitingPostType
+        var title: String
+        var status: RecruitingPostStatus
+        var scheduledAt: Date?
+        var body: String?
+        var tags: [String]
+        var requiredPositions: [String]
+        var createdBy: String?
+    }
+
+    private var posts: [StubPost] = [
+        StubPost(
+            id: DebugRecruitManagementFlowScenario.memberPostID,
+            groupID: DebugRecruitManagementFlowScenario.groupID,
+            postType: .memberRecruit,
+            title: "팀원 모집 테스트 글",
+            status: .open,
+            scheduledAt: Date().addingTimeInterval(3600),
+            body: "UI 테스트용 팀원 모집 글입니다.",
+            tags: ["빡겜", "급구"],
+            requiredPositions: ["TOP", "JGL"],
+            createdBy: DebugGroupInviteFlowScenario.currentUser.id
+        ),
+        StubPost(
+            id: DebugRecruitManagementFlowScenario.opponentPostID,
+            groupID: DebugRecruitManagementFlowScenario.groupID,
+            postType: .opponentRecruit,
+            title: "상대팀 모집 테스트 글",
+            status: .open,
+            scheduledAt: Date().addingTimeInterval(7200),
+            body: "UI 테스트용 상대팀 모집 글입니다.",
+            tags: ["즐겜"],
+            requiredPositions: ["MID", "ADC", "SUPPORT"],
+            createdBy: DebugGroupInviteFlowScenario.currentUser.id
+        ),
+    ]
+
+    func response(for request: URLRequest) -> DebugProtocolResponse {
+        guard let url = request.url else {
+            return serverError(statusCode: 400, code: "BAD_REQUEST", message: "Missing URL.", path: "/")
+        }
+
+        let method = request.httpMethod ?? "GET"
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let path = components?.path ?? url.path
+
+        switch (method, path) {
+        case ("GET", "/groups/\(Self.groupID)"):
+            return success(groupSummaryData())
+
+        case ("GET", "/recruiting-posts"):
+            let postTypeRawValue = components?.queryItems?.first(where: { $0.name == "postType" })?.value
+            let filteredPosts = posts.filter { post in
+                guard let postTypeRawValue else { return true }
+                return post.postType.rawValue == postTypeRawValue
+            }
+            return success(try! JSONEncoder.app.encode(RecruitPostListDTO(items: filteredPosts.map(recruitPostDTO))))
+
+        case ("GET", let matchedPath) where matchedPath.hasPrefix("/recruiting-posts/"):
+            let postID = matchedPath.replacingOccurrences(of: "/recruiting-posts/", with: "")
+            guard let post = posts.first(where: { $0.id == postID }) else {
+                return serverError(statusCode: 404, code: "RESOURCE_NOT_FOUND", message: "Post not found.", path: path)
+            }
+            return success(try! JSONEncoder.app.encode(recruitPostDTO(post)))
+
+        case ("PATCH", let matchedPath) where matchedPath.hasPrefix("/recruiting-posts/"):
+            let postID = matchedPath.replacingOccurrences(of: "/recruiting-posts/", with: "")
+            guard let index = posts.firstIndex(where: { $0.id == postID }) else {
+                return serverError(statusCode: 404, code: "RESOURCE_NOT_FOUND", message: "Post not found.", path: path)
+            }
+            guard
+                let requestBody = requestBodyData(from: request),
+                let object = try? JSONSerialization.jsonObject(with: requestBody) as? [String: Any]
+            else {
+                return serverError(statusCode: 400, code: "INVALID_PAYLOAD", message: "Invalid recruit payload.", path: path)
+            }
+
+            var post = posts[index]
+            post.title = (object["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? post.title
+            post.body = object["body"] as? String
+            post.tags = object["tags"] as? [String] ?? post.tags
+            post.requiredPositions = object["requiredPositions"] as? [String] ?? post.requiredPositions
+            if let scheduledAt = object["scheduledAt"] as? String {
+                post.scheduledAt = ISO8601DateFormatter.simple.date(from: scheduledAt)
+            }
+            posts[index] = post
+
+            return success(try! JSONEncoder.app.encode(recruitPostDTO(post)))
+
+        case ("DELETE", let matchedPath) where matchedPath.hasPrefix("/recruiting-posts/"):
+            let postID = matchedPath.replacingOccurrences(of: "/recruiting-posts/", with: "")
+            posts.removeAll { $0.id == postID }
+            return DebugProtocolResponse(statusCode: 200, data: Data("{}".utf8))
+
+        default:
+            return serverError(statusCode: 404, code: "RESOURCE_NOT_FOUND", message: "Unsupported debug route.", path: path)
+        }
+    }
+
+    private func recruitPostDTO(_ post: StubPost) -> RecruitPostDTO {
+        RecruitPostDTO(
+            id: post.id,
+            groupId: post.groupID,
+            postType: post.postType,
+            title: post.title,
+            status: post.status,
+            scheduledAt: post.scheduledAt,
+            body: post.body,
+            tags: post.tags,
+            requiredPositions: post.requiredPositions,
+            createdBy: post.createdBy
+        )
+    }
+
+    private func requestBodyData(from request: URLRequest) -> Data? {
+        if let httpBody = request.httpBody {
+            return httpBody
+        }
+        guard let bodyStream = request.httpBodyStream else {
+            return nil
+        }
+
+        bodyStream.open()
+        defer { bodyStream.close() }
+
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 1024)
+        while bodyStream.hasBytesAvailable {
+            let bytesRead = bodyStream.read(&buffer, maxLength: buffer.count)
+            if bytesRead > 0 {
+                data.append(contentsOf: buffer[..<bytesRead])
+            } else if bytesRead < 0 {
+                return nil
+            } else {
+                break
+            }
+        }
+        return data.isEmpty ? nil : data
+    }
+
+    private func groupSummaryData() -> Data {
+        try! JSONEncoder.app.encode(
+            GroupSummaryDTO(
+                id: Self.groupID,
+                name: "모집 테스트 그룹",
+                description: "모집 카드 관리 액션 UI 테스트 시나리오입니다.",
+                visibility: .public,
+                joinPolicy: .approvalRequired,
+                tags: ["서울", "빡겜"],
+                ownerUserId: DebugGroupInviteFlowScenario.currentUser.id,
+                canInviteMembers: true,
+                inviteMembersBlockedReason: nil,
+                memberCount: 10,
+                recentMatches: 3
+            )
+        )
     }
 
     private func success(_ data: Data) -> DebugProtocolResponse {

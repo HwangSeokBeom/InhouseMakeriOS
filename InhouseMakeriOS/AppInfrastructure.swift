@@ -3380,6 +3380,38 @@ struct GroupSummaryDTO: Codable {
     let inviteMembersBlockedReason: String?
     let memberCount: Int
     let recentMatches: Int
+    let recentMatchCountSource: GroupMatchCountSource
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case name
+        case description
+        case visibility
+        case isMember
+        case joinPolicy
+        case tags
+        case ownerUserId
+        case ownerUserID
+        case canInviteMembers
+        case inviteMembersBlockedReason
+        case memberCount
+        case recentMatches
+        case matchCount
+        case inhouseCount
+        case recordCount
+        case latestMatchCount
+        case recentInhouseCount
+        case scrimCount
+        case completedMatchCount
+        case confirmedMatchCount
+        case closedMatchCount
+        case pastMatchCount
+        case completedInhouseCount
+        case pastInhouseCount
+        case lobbyCount
+        case activeLobbyCount
+        case pendingLobbyCount
+    }
 
     init(
         id: String,
@@ -3393,7 +3425,8 @@ struct GroupSummaryDTO: Codable {
         canInviteMembers: Bool? = nil,
         inviteMembersBlockedReason: String? = nil,
         memberCount: Int,
-        recentMatches: Int
+        recentMatches: Int,
+        recentMatchCountSource: GroupMatchCountSource = .completedHistory
     ) {
         self.id = id
         self.name = name
@@ -3407,6 +3440,43 @@ struct GroupSummaryDTO: Codable {
         self.inviteMembersBlockedReason = inviteMembersBlockedReason
         self.memberCount = memberCount
         self.recentMatches = recentMatches
+        self.recentMatchCountSource = recentMatchCountSource
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        id = Self.decodeLossyString(from: container, forKeys: [.id]) ?? ""
+        name = Self.decodeLossyString(from: container, forKeys: [.name]) ?? ""
+        description = Self.decodeLossyString(from: container, forKeys: [.description])
+        visibility = try container.decode(GroupVisibility.self, forKey: .visibility)
+        isMember = try? container.decodeIfPresent(Bool.self, forKey: .isMember)
+        joinPolicy = try container.decode(JoinPolicy.self, forKey: .joinPolicy)
+        tags = (try? container.decodeIfPresent([String].self, forKey: .tags)) ?? []
+        ownerUserId = Self.decodeLossyString(from: container, forKeys: [.ownerUserId, .ownerUserID]) ?? ""
+        canInviteMembers = try? container.decodeIfPresent(Bool.self, forKey: .canInviteMembers)
+        inviteMembersBlockedReason = Self.decodeLossyString(from: container, forKeys: [.inviteMembersBlockedReason])
+        memberCount = max(Self.decodeLossyInt(from: container, forKeys: [.memberCount]) ?? 0, 0)
+
+        let resolvedCount = Self.resolveRecentMatchCount(from: container)
+        recentMatches = resolvedCount.count
+        recentMatchCountSource = resolvedCount.source
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encodeIfPresent(description, forKey: .description)
+        try container.encode(visibility, forKey: .visibility)
+        try container.encodeIfPresent(isMember, forKey: .isMember)
+        try container.encode(joinPolicy, forKey: .joinPolicy)
+        try container.encode(tags, forKey: .tags)
+        try container.encode(ownerUserId, forKey: .ownerUserId)
+        try container.encodeIfPresent(canInviteMembers, forKey: .canInviteMembers)
+        try container.encodeIfPresent(inviteMembersBlockedReason, forKey: .inviteMembersBlockedReason)
+        try container.encode(memberCount, forKey: .memberCount)
+        try container.encode(recentMatches, forKey: .recentMatches)
     }
 
     func toDomain() -> GroupSummary {
@@ -3422,8 +3492,77 @@ struct GroupSummaryDTO: Codable {
             canInviteMembers: canInviteMembers,
             inviteMembersBlockedReason: inviteMembersBlockedReason,
             memberCount: memberCount,
-            recentMatches: recentMatches
+            recentMatches: recentMatches,
+            recentMatchCountSource: recentMatchCountSource
         )
+    }
+
+    private static func resolveRecentMatchCount(
+        from container: KeyedDecodingContainer<CodingKeys>
+    ) -> (count: Int, source: GroupMatchCountSource) {
+        let authoritativeKeys: [CodingKeys] = [
+            .completedMatchCount,
+            .confirmedMatchCount,
+            .closedMatchCount,
+            .pastMatchCount,
+            .completedInhouseCount,
+            .pastInhouseCount,
+        ]
+        if let count = decodeLossyInt(from: container, forKeys: authoritativeKeys) {
+            return (max(count, 0), .completedHistory)
+        }
+
+        // TODO: Remove the legacy fallback once the server contract is finalized around a
+        // completed-history field. These keys are kept for backward compatibility only.
+        let legacyKeys: [CodingKeys] = [
+            .recentMatches,
+            .matchCount,
+            .inhouseCount,
+            .recordCount,
+            .latestMatchCount,
+            .recentInhouseCount,
+            .scrimCount,
+        ]
+        let legacyCount = max(decodeLossyInt(from: container, forKeys: legacyKeys) ?? 0, 0)
+        let lobbyCountKeys: [CodingKeys] = [.activeLobbyCount, .pendingLobbyCount, .lobbyCount]
+        let lobbyCount = max(decodeLossyInt(from: container, forKeys: lobbyCountKeys) ?? 0, 0)
+        if lobbyCount > 0 {
+            return (max(legacyCount - lobbyCount, 0), .legacyAdjustedByLobbyCount)
+        }
+        return (legacyCount, legacyCount > 0 ? .legacyRecentMatches : .completedHistory)
+    }
+
+    private static func decodeLossyInt(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> Int? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Double.self, forKey: key) {
+                return Int(value.rounded())
+            }
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+            }
+        }
+        return nil
+    }
+
+    private static func decodeLossyString(
+        from container: KeyedDecodingContainer<CodingKeys>,
+        forKeys keys: [CodingKeys]
+    ) -> String? {
+        for key in keys {
+            if let value = try? container.decodeIfPresent(String.self, forKey: key) {
+                return value
+            }
+            if let value = try? container.decodeIfPresent(Int.self, forKey: key) {
+                return String(value)
+            }
+        }
+        return nil
     }
 }
 
@@ -5029,7 +5168,7 @@ final class SearchUseCase {
                     id: "group-\(group.id)",
                     kind: .group,
                     title: group.name,
-                    subtitle: "멤버 \(group.memberCount)명 · 최근 내전 \(group.recentMatches)회",
+                    subtitle: "멤버 \(group.memberCount)명 · \(group.completedInhouseDisplay.summaryText)",
                     tags: Array(group.tags.prefix(3)),
                     supportingText: group.description,
                     destination: .groupDetail(groupID: group.id, isAccessible: group.isAccessible())

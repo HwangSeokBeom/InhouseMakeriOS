@@ -43,3 +43,5 @@ server/dist/
 
 # Codex local state
 .codex-home/
+
+.cache/

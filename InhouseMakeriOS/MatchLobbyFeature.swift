@@ -11,15 +11,25 @@ struct MatchLobbyFeature {
             case autoBalance
         }
 
+        enum ManagementAction: Equatable {
+            case inviteMembers
+            case edit
+            case delete
+        }
+
         let groupID: String
         let matchID: String
         var loadState: ScreenLoadState<MatchLobbySnapshot> = .initial
         var actionState: AsyncActionState = .idle
         var selectedMemberIDs: Set<String> = []
-        var showsManageSheet = false
+        var showsManagementActionSheet = false
+        var showsMemberInviteSheet = false
         var shouldNavigateToTeamBalance = false
         var pendingProtectedAction: PendingProtectedAction?
         var autoBalanceFailureMessage: String?
+        var activeLoadRequestID = UUID()
+        var activeAddPlayersRequestID = UUID()
+        var activeAutoBalanceRequestID = UUID()
 
         static let targetParticipantCount = 10
 
@@ -90,28 +100,51 @@ struct MatchLobbyFeature {
 
     enum Action: Equatable {
         case load(force: Bool = false)
-        case loadResponse(Result<MatchLobbySnapshot, UserFacingError>)
-        case manageSheetPresented
-        case manageSheetDismissed
+        case loadResponse(UUID, Result<MatchLobbySnapshot, UserFacingError>)
+        case overflowTapped
+        case managementActionSheetDismissed
+        case managementActionSelected(State.ManagementAction)
+        case memberInviteSheetPresented
+        case memberInviteSheetDismissed
         case selectAllEligibleMembersTapped
         case clearSelectedMembersTapped
         case toggleMemberSelection(String)
         case addSelectedPlayersTapped
-        case addPlayersResponse(Result<MatchLobbySnapshot, UserFacingError>)
+        case addPlayersResponse(UUID, Result<MatchLobbySnapshot, UserFacingError>)
         case autoBalanceTapped
-        case autoBalanceResponse(Result<MatchLobbySnapshot, UserFacingError>)
+        case autoBalanceResponse(UUID, Result<MatchLobbySnapshot, UserFacingError>)
         case authRetryHandled
         case navigationHandled
+        case viewDisappeared
     }
 
     @Dependency(\.appContainer) var appContainer
+
+    private enum CancelID {
+        case load
+        case addPlayers
+        case autoBalance
+    }
 
     var body: some ReducerOf<Self> {
         Reduce { state, action in
             switch action {
             case let .load(force):
-                if !force, case .content = state.loadState { return .none }
-                state.loadState = .loading
+                if !force {
+                    switch state.loadState {
+                    case .content, .loading, .refreshing:
+                        return .none
+                    case .initial, .empty, .error:
+                        break
+                    }
+                }
+                let requestID = UUID()
+                state.activeLoadRequestID = requestID
+                if let current = state.loadState.value, force {
+                    state.loadState = .refreshing(current)
+                } else {
+                    state.loadState = .loading
+                }
                 let groupID = state.groupID
                 let matchID = state.matchID
                 let container = appContainer
@@ -121,34 +154,48 @@ struct MatchLobbyFeature {
 #endif
                     do {
                         let resolvedContainer = await container()
-                        let snapshot = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
+                        let snapshot = try await Self.withTimeout(
+                            nanoseconds: 15_000_000_000,
+                            fallback: UserFacingError(
+                                title: "로비 로딩 실패",
+                                message: "응답이 지연되어 내전 로비를 불러오지 못했습니다. 다시 시도해 주세요."
+                            )
+                        ) {
+                            try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
+                        }
 #if DEBUG
                         print("[RouteFetch] fetch success screen=match_lobby groupID=\(groupID) matchID=\(matchID) source=live players=\(snapshot.match.players.count)")
 #endif
-                        await send(.loadResponse(.success(snapshot)))
+                        await send(.loadResponse(requestID, .success(snapshot)))
                     } catch let error as UserFacingError {
 #if DEBUG
                         print("[RouteFetch] fetch failure screen=match_lobby groupID=\(groupID) matchID=\(matchID) source=live status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)")
 #endif
-                        await send(.loadResponse(.failure(error)))
+                        await send(.loadResponse(requestID, .failure(error)))
+                    } catch is CancellationError {
+                        return
                     } catch {
 #if DEBUG
                         print("[RouteFetch] fetch failure screen=match_lobby groupID=\(groupID) matchID=\(matchID) source=live status=nil message=\(error.localizedDescription)")
 #endif
-                        await send(.loadResponse(.failure(.unexpected("로비 로딩 실패", message: "내전 로비를 불러오지 못했습니다."))))
+                        await send(.loadResponse(requestID, .failure(.unexpected("로비 로딩 실패", message: "내전 로비를 불러오지 못했습니다."))))
                     }
                 }
+                .cancellable(id: CancelID.load, cancelInFlight: true)
 
-            case let .loadResponse(.success(snapshot)):
+            case let .loadResponse(requestID, .success(snapshot)):
+                guard requestID == state.activeLoadRequestID else { return .none }
                 state.loadState = .content(snapshot)
                 state.autoBalanceFailureMessage = nil
+                state.selectedMemberIDs.subtract(snapshot.match.players.map(\.userID))
 #if DEBUG
                 print("[MatchLobby] group members refreshed count=\(snapshot.members.count)")
                 print("[MatchLobby] lobby participants count=\(snapshot.match.players.count)")
 #endif
                 return .none
 
-            case let .loadResponse(.failure(error)):
+            case let .loadResponse(requestID, .failure(error)):
+                guard requestID == state.activeLoadRequestID else { return .none }
                 if error.requiresAuthentication {
                     state.loadState = .empty("로그인 후 내전 로비를 다시 열 수 있어요.")
                     state.pendingProtectedAction = .reload
@@ -157,12 +204,40 @@ struct MatchLobbyFeature {
                 }
                 return .none
 
-            case .manageSheetPresented:
-                state.showsManageSheet = true
+            case .overflowTapped:
+                state.showsManagementActionSheet = true
+                if case .failure = state.actionState {
+                    state.actionState = .idle
+                }
                 return .none
 
-            case .manageSheetDismissed:
-                state.showsManageSheet = false
+            case .managementActionSheetDismissed:
+                state.showsManagementActionSheet = false
+                return .none
+
+            case let .managementActionSelected(action):
+                state.showsManagementActionSheet = false
+                if case .failure = state.actionState {
+                    state.actionState = .idle
+                }
+                switch action {
+                case .inviteMembers:
+                    state.showsMemberInviteSheet = true
+                case .edit, .delete:
+                    break
+                }
+                return .none
+
+            case .memberInviteSheetPresented:
+                state.showsManagementActionSheet = false
+                state.showsMemberInviteSheet = true
+                if case .failure = state.actionState {
+                    state.actionState = .idle
+                }
+                return .none
+
+            case .memberInviteSheetDismissed:
+                state.showsMemberInviteSheet = false
                 state.selectedMemberIDs.removeAll()
                 return .none
 
@@ -174,10 +249,16 @@ struct MatchLobbyFeature {
                         .map(\.userID)
                         .filter { !currentPlayerUserIDs.contains($0) }
                 )
+                if case .failure = state.actionState {
+                    state.actionState = .idle
+                }
                 return .none
 
             case .clearSelectedMembersTapped:
                 state.selectedMemberIDs.removeAll()
+                if case .failure = state.actionState {
+                    state.actionState = .idle
+                }
                 return .none
 
             case let .toggleMemberSelection(userID):
@@ -186,49 +267,71 @@ struct MatchLobbyFeature {
                 } else {
                     state.selectedMemberIDs.insert(userID)
                 }
+                if case .failure = state.actionState {
+                    state.actionState = .idle
+                }
                 return .none
 
             case .addSelectedPlayersTapped:
-                guard !state.selectedMemberIDs.isEmpty else { return .none }
+                guard !state.selectedMemberIDs.isEmpty, let snapshot = state.loadState.value else { return .none }
                 state.actionState = .inProgress("참가자를 추가하는 중입니다")
+                let requestID = UUID()
+                state.activeAddPlayersRequestID = requestID
                 let groupID = state.groupID
                 let matchID = state.matchID
-                let userIDs = Array(state.selectedMemberIDs)
+                let userIDs = snapshot.members
+                    .map(\.userID)
+                    .filter { state.selectedMemberIDs.contains($0) }
                 let container = appContainer
-                return .run { send in
+                return .merge(
+                    .cancel(id: CancelID.load),
+                    .run { send in
 #if DEBUG
-                    print("[MatchLobby] add participants request matchID=\(matchID) count=\(userIDs.count)")
+                        print("[MatchLobby] add participants request matchID=\(matchID) count=\(userIDs.count)")
 #endif
-                    do {
-                        let resolvedContainer = await container()
-                        await MainActor.run {
-                            resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
-                        }
-                        _ = try await resolvedContainer.matchRepository.addPlayers(
-                            matchID: matchID,
-                            players: userIDs.map {
-                                MatchPlayerInputDTO(
-                                    userId: $0,
-                                    riotAccountId: nil,
-                                    participationStatus: .accepted,
-                                    sameTeamPreferenceUserIds: [],
-                                    avoidTeamPreferenceUserIds: [],
-                                    isCaptain: false
+                        do {
+                            let resolvedContainer = await container()
+                            let snapshot = try await Self.withTimeout(
+                                nanoseconds: 15_000_000_000,
+                                fallback: UserFacingError(
+                                    title: "참가자 추가 실패",
+                                    message: "응답이 지연되어 참가자 추가를 완료하지 못했습니다. 다시 시도해 주세요."
                                 )
+                            ) {
+                                await MainActor.run {
+                                    resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
+                                }
+                                _ = try await resolvedContainer.matchRepository.addPlayers(
+                                    matchID: matchID,
+                                    players: userIDs.map {
+                                        MatchPlayerInputDTO(
+                                            userId: $0,
+                                            riotAccountId: nil,
+                                            participationStatus: .accepted,
+                                            sameTeamPreferenceUserIds: [],
+                                            avoidTeamPreferenceUserIds: [],
+                                            isCaptain: false
+                                        )
+                                    }
+                                )
+                                return try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
                             }
-                        )
-                        let snapshot = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
-                        await send(.addPlayersResponse(.success(snapshot)))
-                    } catch let error as UserFacingError {
-                        await send(.addPlayersResponse(.failure(error)))
-                    } catch {
-                        await send(.addPlayersResponse(.failure(.unexpected("참가자 추가 실패", message: "참가자 추가에 실패했습니다."))))
+                            await send(.addPlayersResponse(requestID, .success(snapshot)))
+                        } catch let error as UserFacingError {
+                            await send(.addPlayersResponse(requestID, .failure(error)))
+                        } catch is CancellationError {
+                            return
+                        } catch {
+                            await send(.addPlayersResponse(requestID, .failure(.unexpected("참가자 추가 실패", message: "참가자 추가에 실패했습니다."))))
+                        }
                     }
-                }
+                    .cancellable(id: CancelID.addPlayers, cancelInFlight: true)
+                )
 
-            case let .addPlayersResponse(.success(snapshot)):
+            case let .addPlayersResponse(requestID, .success(snapshot)):
+                guard requestID == state.activeAddPlayersRequestID else { return .none }
                 state.loadState = .content(snapshot)
-                state.showsManageSheet = false
+                state.showsMemberInviteSheet = false
                 state.selectedMemberIDs.removeAll()
                 state.autoBalanceFailureMessage = nil
                 state.actionState = .success("참가자가 추가되었습니다")
@@ -237,12 +340,13 @@ struct MatchLobbyFeature {
 #endif
                 return .none
 
-            case let .addPlayersResponse(.failure(error)):
+            case let .addPlayersResponse(requestID, .failure(error)):
+                guard requestID == state.activeAddPlayersRequestID else { return .none }
                 if error.requiresAuthentication {
                     state.actionState = .idle
                     state.pendingProtectedAction = .addPlayers
                 } else {
-                    state.actionState = .failure(error.message)
+                    state.actionState = .failure(Self.addPlayersFailureMessage(for: error))
                 }
                 return .none
 
@@ -260,52 +364,71 @@ struct MatchLobbyFeature {
                 }
                 state.actionState = .inProgress("자동 팀 생성을 준비하는 중입니다")
                 state.autoBalanceFailureMessage = nil
+                let requestID = UUID()
+                state.activeAutoBalanceRequestID = requestID
                 let groupID = state.groupID
                 let matchID = state.matchID
                 let container = appContainer
-                return .run { send in
-                    do {
-                        let resolvedContainer = await container()
-                        await MainActor.run {
-                            resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
-                        }
+                return .merge(
+                    .cancel(id: CancelID.load),
+                    .run { send in
+                        do {
+                            let resolvedContainer = await container()
+                            let refreshed = try await Self.withTimeout(
+                                nanoseconds: 20_000_000_000,
+                                fallback: UserFacingError(
+                                    title: "자동 팀 생성 실패",
+                                    message: "응답이 지연되어 추천 조합 생성에 실패했습니다. 다시 시도해 주세요."
+                                )
+                            ) {
+                                await MainActor.run {
+                                    resolvedContainer.localStore.clearManualAdjustDraft(matchID: matchID)
+                                }
 #if DEBUG
-                        print(
-                            "[MatchLobby] auto balance request input matchID=\(matchID) status=\(snapshot.match.status.rawValue) participants=\(snapshot.match.acceptedCount) missingPositions=\(snapshot.match.players.filter { $0.assignedRole == nil }.count)"
-                        )
+                                print(
+                                    "[MatchLobby] auto balance request input matchID=\(matchID) status=\(snapshot.match.status.rawValue) participants=\(snapshot.match.acceptedCount) missingPositions=\(snapshot.match.players.filter { $0.assignedRole == nil }.count)"
+                                )
 #endif
-                        if snapshot.match.status != .locked && snapshot.match.status != .balanced {
-                            _ = try await resolvedContainer.matchRepository.lock(matchID: matchID)
-                        }
-                        let candidates = try await resolvedContainer.matchRepository.autoBalance(matchID: matchID)
+                                if snapshot.match.status != .locked && snapshot.match.status != .balanced {
+                                    _ = try await resolvedContainer.matchRepository.lock(matchID: matchID)
+                                }
+                                let candidates = try await resolvedContainer.matchRepository.autoBalance(matchID: matchID)
 #if DEBUG
-                        let emptyReason = candidates.isEmpty ? "server_returned_empty_candidates" : "nil"
-                        print("[MatchLobby] auto balance response count=\(candidates.count) emptyReason=\(emptyReason)")
+                                let emptyReason = candidates.isEmpty ? "server_returned_empty_candidates" : "nil"
+                                print("[MatchLobby] auto balance response count=\(candidates.count) emptyReason=\(emptyReason)")
 #endif
-                        let refreshed = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
-                        await MainActor.run {
-                            resolvedContainer.localStore.appendNotification(
-                                title: "자동 밸런스 생성",
-                                body: "추천 조합이 생성되었습니다.",
-                                symbol: "arrow.trianglehead.2.clockwise"
-                            )
+                                let refreshed = try await Self.makeSnapshot(container: resolvedContainer, groupID: groupID, matchID: matchID)
+                                await MainActor.run {
+                                    resolvedContainer.localStore.appendNotification(
+                                        title: "자동 밸런스 생성",
+                                        body: "추천 조합이 생성되었습니다.",
+                                        symbol: "arrow.trianglehead.2.clockwise"
+                                    )
+                                }
+                                return refreshed
+                            }
+                            await send(.autoBalanceResponse(requestID, .success(refreshed)))
+                        } catch let error as UserFacingError {
+                            await send(.autoBalanceResponse(requestID, .failure(error)))
+                        } catch is CancellationError {
+                            return
+                        } catch {
+                            await send(.autoBalanceResponse(requestID, .failure(.unexpected("자동 팀 생성 실패", message: "추천 조합 생성에 실패했습니다."))))
                         }
-                        await send(.autoBalanceResponse(.success(refreshed)))
-                    } catch let error as UserFacingError {
-                        await send(.autoBalanceResponse(.failure(error)))
-                    } catch {
-                        await send(.autoBalanceResponse(.failure(.unexpected("자동 팀 생성 실패", message: "추천 조합 생성에 실패했습니다."))))
                     }
-                }
+                    .cancellable(id: CancelID.autoBalance, cancelInFlight: true)
+                )
 
-            case let .autoBalanceResponse(.success(snapshot)):
+            case let .autoBalanceResponse(requestID, .success(snapshot)):
+                guard requestID == state.activeAutoBalanceRequestID else { return .none }
                 state.loadState = .content(snapshot)
                 state.actionState = .success("추천 조합이 생성되었습니다")
                 state.autoBalanceFailureMessage = nil
                 state.shouldNavigateToTeamBalance = true
                 return .none
 
-            case let .autoBalanceResponse(.failure(error)):
+            case let .autoBalanceResponse(requestID, .failure(error)):
+                guard requestID == state.activeAutoBalanceRequestID else { return .none }
                 if error.requiresAuthentication {
                     state.actionState = .idle
                     state.pendingProtectedAction = .autoBalance
@@ -323,6 +446,23 @@ struct MatchLobbyFeature {
             case .navigationHandled:
                 state.shouldNavigateToTeamBalance = false
                 return .none
+
+            case .viewDisappeared:
+                state.activeLoadRequestID = UUID()
+                state.activeAddPlayersRequestID = UUID()
+                state.activeAutoBalanceRequestID = UUID()
+                state.showsManagementActionSheet = false
+                state.showsMemberInviteSheet = false
+                state.selectedMemberIDs.removeAll()
+                state.pendingProtectedAction = nil
+                if case .inProgress = state.actionState {
+                    state.actionState = .idle
+                }
+                return .merge(
+                    .cancel(id: CancelID.load),
+                    .cancel(id: CancelID.addPlayers),
+                    .cancel(id: CancelID.autoBalance)
+                )
             }
         }
     }
@@ -386,6 +526,36 @@ struct MatchLobbyFeature {
         return error.message
     }
 
+    private static func addPlayersFailureMessage(for error: UserFacingError) -> String {
+        if error.statusCode == 409 {
+            return "이미 참가 중인 팀원이 포함되어 있어요. 참가자 목록을 확인한 뒤 다시 시도해 주세요."
+        }
+        if error.statusCode == 400 {
+            return "추가할 팀원 정보를 다시 확인해 주세요."
+        }
+        return error.message
+    }
+
+    private static func withTimeout<Value>(
+        nanoseconds: UInt64,
+        fallback: UserFacingError,
+        operation: @escaping @Sendable () async throws -> Value
+    ) async throws -> Value {
+        try await withThrowingTaskGroup(of: Value.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: nanoseconds)
+                throw fallback
+            }
+
+            let value = try await group.next()!
+            group.cancelAll()
+            return value
+        }
+    }
+
     private static func loadPowerProfiles(container: AppContainer, userIDs: [String]) async -> [String: PowerProfile] {
         var profiles: [String: PowerProfile] = [:]
         for userID in Set(userIDs) {
@@ -440,9 +610,45 @@ struct MatchLobbyFeature {
 }
 
 struct MatchLobbyFeatureView: View {
+    private enum ManagementFollowUp: Identifiable {
+        case editNotice
+        case deleteConfirmation
+
+        var id: String {
+            switch self {
+            case .editNotice:
+                return "editNotice"
+            case .deleteConfirmation:
+                return "deleteConfirmation"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .editNotice:
+                return "내전 수정은 준비 중입니다"
+            case .deleteConfirmation:
+                return "이 내전을 삭제할까요?"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .editNotice:
+                return "현재 빌드에서는 로비 수정 UI만 정리되어 있고 실제 수정 기능은 아직 연결되지 않았습니다."
+            case .deleteConfirmation:
+                return "현재 빌드에서는 로비 삭제 확인 UI만 정리되어 있고 실제 삭제 기능은 아직 연결되지 않았습니다."
+            }
+        }
+    }
+
     @Bindable var store: StoreOf<MatchLobbyFeature>
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
+    @State private var inviteSearchText = ""
+    @State private var recentInviteSearchKeywords: [RecentSearchKeyword] = []
+    @FocusState private var isInviteSearchFieldFocused: Bool
+    @State private var managementFollowUp: ManagementFollowUp?
 
     var body: some View {
         screenScaffold(
@@ -451,251 +657,250 @@ struct MatchLobbyFeatureView: View {
             rightSystemImage: "ellipsis",
             rightAccessibilityLabel: "참가자 관리 메뉴",
             rightAccessibilityIdentifier: "matchLobby.manageToolbar",
-            onRightTap: { store.send(.manageSheetPresented) }
+            onRightTap: { store.send(.overflowTapped) }
         ) {
-            switch store.loadState {
-            case .initial, .loading:
-                LoadingStateView(title: "내전 로비를 불러오는 중입니다")
-                    .task { store.send(.load()) }
-            case let .error(error):
-                ErrorStateView(error: error) { store.send(.load(force: true)) }
-            case .empty:
-                EmptyStateView(title: "내전 로비", message: "내전 로비가 없습니다.")
-            case let .content(snapshot), let .refreshing(snapshot):
-                let readiness = store.state.balanceReadiness
-                ScrollView(showsIndicators: false) {
-                    VStack(spacing: 14) {
-                        VStack(alignment: .center, spacing: 10) {
-                            HStack(alignment: .lastTextBaseline, spacing: 4) {
-                                Text("\(readiness.participantCount)")
-                                    .font(AppTypography.heading(42, weight: .heavy))
-                                    .foregroundStyle(AppPalette.accentBlue)
-                                Text("/ \(readiness.targetCount)")
-                                    .font(AppTypography.heading(22, weight: .semibold))
-                                    .foregroundStyle(AppPalette.textMuted)
-                            }
-                            Text(statusLabel(for: snapshot.match, readiness: readiness))
-                                .font(AppTypography.body(12))
-                                .foregroundStyle(AppPalette.textSecondary)
-                            ProgressView(value: Double(readiness.participantCount), total: Double(readiness.targetCount))
-                                .tint(AppPalette.accentBlue)
-                        }
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 18)
-                        .appPanel(background: AppPalette.bgCard, radius: 16)
-
-                        readinessCard(readiness: readiness)
-
-                        if let failureMessage = store.autoBalanceFailureMessage {
-                            autoBalanceFailureCard(message: failureMessage)
-                        }
-
-                        HStack(spacing: 8) {
-                            FilterChipView(title: "빡겜", tint: AppPalette.accentBlue, isSelected: true)
-                            FilterChipView(title: snapshot.group.tags.first ?? "D4+", tint: AppPalette.textSecondary)
-                            FilterChipView(title: "포지션 균형", tint: AppPalette.textSecondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        VStack(alignment: .leading, spacing: 16) {
-                            Text("참가자 목록")
-                                .font(AppTypography.heading(15, weight: .bold))
-                            ForEach(snapshot.match.players) { player in
-                                Button {
-                                    router.push(.memberProfile(userID: player.userID, nickname: player.nickname))
-                                } label: {
-                                    lobbyPlayerCard(
-                                        name: player.nickname,
-                                        subtitle: playerSubtitle(player, snapshot: snapshot),
-                                        powerScore: Int(snapshot.powerProfiles[player.userID]?.overallPower.rounded() ?? 0)
-                                    )
-                                }
-                                .buttonStyle(.plain)
-                            }
-
-                            if snapshot.match.players.count < MatchLobbyFeature.State.targetParticipantCount {
-                                Button {
-                                    store.send(.manageSheetPresented)
-                                } label: {
-                                    HStack(spacing: 10) {
-                                        Image(systemName: "person.badge.plus")
+            ZStack(alignment: .top) {
+                Color.clear
+                    .frame(width: 1, height: 1)
+                    .accessibilityElement()
+                    .accessibilityIdentifier("matchLobby.root")
+                switch store.loadState {
+                case .initial, .loading:
+                    LoadingStateView(title: "내전 로비를 불러오는 중입니다")
+                        .accessibilityIdentifier("matchLobby.loading")
+                        .task { store.send(.load()) }
+                case let .error(error):
+                    ErrorStateView(error: error) { store.send(.load(force: true)) }
+                case .empty:
+                    EmptyStateView(title: "내전 로비", message: "내전 로비가 없습니다.")
+                case let .content(snapshot), let .refreshing(snapshot):
+                    let readiness = store.state.balanceReadiness
+                    VStack(spacing: 0) {
+                        ScrollView(showsIndicators: false) {
+                            VStack(spacing: 14) {
+                                VStack(alignment: .center, spacing: 10) {
+                                    HStack(alignment: .lastTextBaseline, spacing: 4) {
+                                        Text("\(readiness.participantCount)")
+                                            .font(AppTypography.heading(42, weight: .heavy))
+                                            .foregroundStyle(AppPalette.accentBlue)
+                                        Text("/ \(readiness.targetCount)")
+                                            .font(AppTypography.heading(22, weight: .semibold))
                                             .foregroundStyle(AppPalette.textMuted)
-                                        VStack(alignment: .leading, spacing: 2) {
-                                            Text("\(MatchLobbyFeature.State.targetParticipantCount - snapshot.match.players.count)명 더 필요")
-                                                .font(AppTypography.body(13, weight: .semibold))
-                                            Text("초대 또는 모집으로 로비를 채워주세요")
-                                                .font(AppTypography.body(11))
-                                                .foregroundStyle(AppPalette.textMuted)
-                                        }
-                                        Spacer()
                                     }
-                                    .foregroundStyle(AppPalette.textPrimary)
-                                    .frame(maxWidth: .infinity)
-                                    .frame(height: 58)
-                                    .background(AppPalette.bgTertiary)
-                                    .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.border, style: StrokeStyle(lineWidth: 1, dash: [6])))
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                                }
-                                .buttonStyle(.plain)
-                                .accessibilityElement(children: .combine)
-                                .accessibilityLabel("참가자 관리")
-                                .accessibilityIdentifier("matchLobby.manageMembers")
-                            }
-                        }
-                        .frame(maxWidth: .infinity)
-                        .padding(.horizontal, 24)
-                    }
-                    .padding(.top, 12)
-                }
-
-                VStack(spacing: 8) {
-                    let canAutoBalance = readiness.canAutoBalance || snapshot.match.status == .balanced
-                    HStack(spacing: 8) {
-                        if canAutoBalance {
-                            Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {
-                                if snapshot.match.status == .balanced {
-                                    router.push(.teamBalance(groupID: store.groupID, matchID: store.matchID))
-                                } else {
-                                    store.send(.autoBalanceTapped)
-                                }
-                            }
-                            .buttonStyle(PrimaryButtonStyle())
-                        } else {
-                            Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {}
-                                .buttonStyle(SecondaryButtonStyle())
-                                .disabled(true)
-                        }
-
-                        Button("수동 배치") {
-                            router.push(.teamBalance(groupID: store.groupID, matchID: store.matchID))
-                        }
-                        .buttonStyle(SecondaryButtonStyle())
-                        .disabled(readiness.participantCount < readiness.targetCount)
-                    }
-
-                    Text(bottomNote(for: snapshot.match, readiness: readiness))
-                        .font(AppTypography.body(11))
-                        .foregroundStyle(AppPalette.textMuted)
-                }
-                .padding(.horizontal, 24)
-                .padding(.vertical, 16)
-                .background(AppPalette.bgSecondary)
-                .sheet(
-                    isPresented: Binding(
-                        get: { store.showsManageSheet },
-                        set: { isPresented in
-                            store.send(isPresented ? .manageSheetPresented : .manageSheetDismissed)
-                        }
-                    )
-                ) {
-                    let currentPlayerUserIDs = Set(snapshot.match.players.map(\.userID))
-                    let eligibleMemberCount = snapshot.members.filter { !currentPlayerUserIDs.contains($0.userID) }.count
-                    NavigationStack {
-                        VStack(spacing: 0) {
-                            ScrollView(showsIndicators: false) {
-                                VStack(alignment: .leading, spacing: 12) {
-                                    Text("참가 가능한 멤버")
-                                        .font(AppTypography.heading(18, weight: .bold))
-                                    Text("이미 참가 중인 멤버는 비활성화되며, 선택한 멤버만 로비에 추가됩니다.")
+                                    .accessibilityElement(children: .ignore)
+                                    .accessibilityLabel("\(readiness.participantCount)/\(readiness.targetCount)")
+                                    .accessibilityIdentifier("matchLobby.participantCount")
+                                    Text(statusLabel(for: snapshot.match, readiness: readiness))
                                         .font(AppTypography.body(12))
                                         .foregroundStyle(AppPalette.textSecondary)
+                                    ProgressView(value: Double(readiness.participantCount), total: Double(readiness.targetCount))
+                                        .tint(AppPalette.accentBlue)
+                                }
+                                .padding(.horizontal, 20)
+                                .padding(.vertical, 18)
+                                .appPanel(background: AppPalette.bgCard, radius: 16)
 
-                                    HStack(spacing: 8) {
-                                        Text("선택 가능 \(eligibleMemberCount)명")
-                                            .font(AppTypography.body(12, weight: .semibold))
-                                            .foregroundStyle(AppPalette.textSecondary)
+                                readinessCard(readiness: readiness)
 
-                                        Spacer()
+                                if let failureMessage = store.autoBalanceFailureMessage {
+                                    autoBalanceFailureCard(message: failureMessage)
+                                }
 
-                                        Button("선택 해제") {
-                                            store.send(.clearSelectedMembersTapped)
+                                HStack(spacing: 8) {
+                                    FilterChipView(title: "빡겜", tint: AppPalette.accentBlue, isSelected: true)
+                                    FilterChipView(title: snapshot.group.tags.first ?? "D4+", tint: AppPalette.textSecondary)
+                                    FilterChipView(title: "포지션 균형", tint: AppPalette.textSecondary)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                VStack(alignment: .leading, spacing: 16) {
+                                    Text("참가자 목록")
+                                        .font(AppTypography.heading(15, weight: .bold))
+                                    ForEach(snapshot.match.players) { player in
+                                        Button {
+                                            router.push(.memberProfile(userID: player.userID, nickname: player.nickname))
+                                        } label: {
+                                            lobbyPlayerCard(
+                                                name: player.nickname,
+                                                subtitle: playerSubtitle(player, snapshot: snapshot),
+                                                powerScore: Int(snapshot.powerProfiles[player.userID]?.overallPower.rounded() ?? 0)
+                                            )
                                         }
                                         .buttonStyle(.plain)
-                                        .font(AppTypography.body(12, weight: .semibold))
-                                        .foregroundStyle(store.selectedMemberIDs.isEmpty ? AppPalette.textMuted : AppPalette.accentRed)
-                                        .disabled(store.selectedMemberIDs.isEmpty)
-
-                                        Button("남은 멤버 전체 선택") {
-                                            store.send(.selectAllEligibleMembersTapped)
-                                        }
-                                        .buttonStyle(.plain)
-                                        .font(AppTypography.body(12, weight: .semibold))
-                                        .foregroundStyle(eligibleMemberCount == 0 ? AppPalette.textMuted : AppPalette.accentBlue)
-                                        .disabled(eligibleMemberCount == 0)
+                                        .accessibilityIdentifier("matchLobby.participantRow.\(player.userID)")
                                     }
 
-                                    ForEach(snapshot.members) { member in
-                                        let alreadyIncluded = currentPlayerUserIDs.contains(member.userID)
+                                    if snapshot.match.players.count < MatchLobbyFeature.State.targetParticipantCount {
                                         Button {
-                                            if !alreadyIncluded {
-                                                store.send(.toggleMemberSelection(member.userID))
-                                            }
+                                            store.send(.memberInviteSheetPresented)
                                         } label: {
-                                            HStack(spacing: 12) {
-                                                Circle()
-                                                    .fill(AppPalette.bgElevated)
-                                                    .frame(width: 36, height: 36)
+                                            HStack(spacing: 10) {
+                                                Image(systemName: "person.badge.plus")
+                                                    .foregroundStyle(AppPalette.textMuted)
                                                 VStack(alignment: .leading, spacing: 2) {
-                                                    Text(member.nickname)
-                                                        .font(AppTypography.body(14, weight: .semibold))
-                                                        .foregroundStyle(alreadyIncluded ? AppPalette.textMuted : AppPalette.textPrimary)
-                                                    Text(alreadyIncluded ? "이미 참가 중" : "\(member.role.rawValue) · 선택 가능")
+                                                    Text("\(MatchLobbyFeature.State.targetParticipantCount - snapshot.match.players.count)명 더 필요")
+                                                        .font(AppTypography.body(13, weight: .semibold))
+                                                    Text("팀원을 추가해 로비를 바로 채워주세요")
                                                         .font(AppTypography.body(11))
-                                                        .foregroundStyle(AppPalette.textSecondary)
+                                                        .foregroundStyle(AppPalette.textMuted)
                                                 }
                                                 Spacer()
-                                                if alreadyIncluded {
-                                                    Text("참가 중")
-                                                        .font(AppTypography.body(11, weight: .semibold))
-                                                        .foregroundStyle(AppPalette.textMuted)
-                                                } else if store.selectedMemberIDs.contains(member.userID) {
-                                                    Image(systemName: "checkmark.circle.fill")
-                                                        .font(.system(size: 18, weight: .semibold))
-                                                        .foregroundStyle(AppPalette.accentBlue)
-                                                } else {
-                                                    Image(systemName: "circle")
-                                                        .font(.system(size: 18, weight: .regular))
-                                                        .foregroundStyle(AppPalette.textMuted)
-                                                }
                                             }
-                                            .padding(14)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                            .appPanel(background: alreadyIncluded ? AppPalette.bgTertiary.opacity(0.7) : AppPalette.bgCard, radius: 12)
+                                            .foregroundStyle(AppPalette.textPrimary)
+                                            .frame(maxWidth: .infinity)
+                                            .frame(height: 58)
+                                            .background(AppPalette.bgTertiary)
+                                            .overlay(RoundedRectangle(cornerRadius: 8).stroke(AppPalette.border, style: StrokeStyle(lineWidth: 1, dash: [6])))
+                                            .clipShape(RoundedRectangle(cornerRadius: 8))
                                         }
                                         .buttonStyle(.plain)
-                                        .disabled(alreadyIncluded)
+                                        .accessibilityElement(children: .combine)
+                                        .accessibilityLabel("참가자 관리")
+                                        .accessibilityIdentifier("matchLobby.manageMembers")
                                     }
                                 }
-                                .padding(16)
+                                .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 24)
+                                .accessibilityIdentifier("matchLobby.participantList")
+                            }
+                            .padding(.top, 12)
+                        }
+
+                        VStack(spacing: 8) {
+                            let canAutoBalance = readiness.canAutoBalance || snapshot.match.status == .balanced
+                            HStack(spacing: 8) {
+                                if canAutoBalance {
+                                    Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {
+                                        if snapshot.match.status == .balanced {
+                                            router.push(.teamBalance(groupID: store.groupID, matchID: store.matchID))
+                                        } else {
+                                            store.send(.autoBalanceTapped)
+                                        }
+                                    }
+                                    .buttonStyle(PrimaryButtonStyle())
+                                    .accessibilityIdentifier("matchLobby.autoBalanceButton")
+                                } else {
+                                    Button(snapshot.match.status == .balanced ? "팀 밸런스 보기" : "자동 팀 생성") {}
+                                        .buttonStyle(SecondaryButtonStyle())
+                                        .accessibilityIdentifier("matchLobby.autoBalanceButton")
+                                        .disabled(true)
+                                }
+
+                                Button("수동 배치") {
+                                    router.push(.teamBalance(groupID: store.groupID, matchID: store.matchID))
+                                }
+                                .buttonStyle(SecondaryButtonStyle())
+                                .accessibilityIdentifier("matchLobby.manualAssignButton")
+                                .disabled(readiness.participantCount < readiness.targetCount)
                             }
 
-                            VStack(spacing: 8) {
-                                Text("선택 \(store.selectedMemberIDs.count)명")
-                                    .font(AppTypography.body(11))
-                                    .foregroundStyle(AppPalette.textMuted)
-                                Button("참가자 추가") {
-                                    store.send(.addSelectedPlayersTapped)
-                                }
-                                .buttonStyle(PrimaryButtonStyle())
-                                .disabled(store.selectedMemberIDs.isEmpty)
-                            }
-                            .padding(16)
-                            .background(AppPalette.bgSecondary)
+                            Text(bottomNote(for: snapshot.match, readiness: readiness))
+                                .font(AppTypography.body(11))
+                                .foregroundStyle(AppPalette.textMuted)
                         }
-                        .background(AppPalette.bgPrimary)
-                        .navigationTitle("참가자 추가")
-                        .toolbar {
-                            ToolbarItem(placement: .topBarLeading) {
-                                Button("닫기") {
-                                    store.send(.manageSheetDismissed)
-                                }
-                            }
-                        }
+                        .padding(.horizontal, 24)
+                        .padding(.vertical, 16)
+                        .background(AppPalette.bgSecondary)
                     }
+                    .sheet(
+                        isPresented: Binding(
+                            get: { store.showsMemberInviteSheet },
+                            set: { isPresented in
+                                store.send(isPresented ? .memberInviteSheetPresented : .memberInviteSheetDismissed)
+                            }
+                        )
+                    ) {
+                        MatchLobbyInviteSheet(
+                            members: filteredInviteMembers(from: snapshot),
+                            selectedMembers: snapshot.members.filter { store.selectedMemberIDs.contains($0.userID) },
+                            participantUserIDs: Set(snapshot.match.players.map(\.userID)),
+                            selectedUserIDs: store.selectedMemberIDs,
+                            recentSearchKeywords: recentInviteSearchKeywords,
+                            searchText: $inviteSearchText,
+                            isSubmitting: isInviteSubmitting,
+                            submissionErrorMessage: inviteSubmissionErrorMessage,
+                            onClose: { store.send(.memberInviteSheetDismissed) },
+                            onSelectAll: { store.send(.selectAllEligibleMembersTapped) },
+                            onClearSelection: { store.send(.clearSelectedMembersTapped) },
+                            onToggleMember: { userID in store.send(.toggleMemberSelection(userID)) },
+                            onTapRecentSearch: applyRecentInviteSearch,
+                            onDeleteRecentSearch: deleteRecentInviteSearch,
+                            onClearRecentSearches: clearRecentInviteSearches,
+                            onSubmitSearch: commitInviteSearch,
+                            onSubmitSelection: {
+                                commitInviteSearch()
+                                store.send(.addSelectedPlayersTapped)
+                            }
+                        )
+                        .presentationDetents([.large])
+                        .presentationDragIndicator(.visible)
+                    }
+                }
+
+                if case .refreshing = store.loadState {
+                    lobbyRefreshOverlay
+                }
+
+                if store.showsManagementActionSheet {
+                    BottomActionSheet(
+                        accessibilityIdentifier: "matchLobby.managementActionSheet",
+                        actions: [
+                            BottomActionSheetAction(
+                                id: "inviteMembers",
+                                title: "팀원 추가",
+                                accessibilityIdentifier: "matchLobby.managementActionSheet.inviteMembers"
+                            ) {
+                                store.send(.managementActionSelected(.inviteMembers))
+                            },
+                            BottomActionSheetAction(
+                                id: "edit",
+                                title: "수정",
+                                accessibilityIdentifier: "matchLobby.managementActionSheet.edit"
+                            ) {
+                                store.send(.managementActionSelected(.edit))
+                                managementFollowUp = .editNotice
+                            },
+                            BottomActionSheetAction(
+                                id: "delete",
+                                title: "삭제",
+                                role: .destructive,
+                                accessibilityIdentifier: "matchLobby.managementActionSheet.delete"
+                            ) {
+                                store.send(.managementActionSelected(.delete))
+                                managementFollowUp = .deleteConfirmation
+                            },
+                            BottomActionSheetAction(
+                                id: "cancel",
+                                title: "취소",
+                                role: .cancel,
+                                accessibilityIdentifier: "matchLobby.managementActionSheet.cancel",
+                                action: {}
+                            ),
+                        ],
+                        onDismiss: { store.send(.managementActionSheetDismissed) }
+                    )
                 }
             }
         }
-        .overlay(alignment: Alignment.bottom) { actionBanner(store.actionState) }
+        .overlay(alignment: Alignment.bottom) {
+            actionBanner(store.actionState)
+                .accessibilityIdentifier("matchLobby.toast")
+        }
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: store.showsManagementActionSheet)
+        .task { store.send(.load()) }
+        .onAppear(perform: refreshInviteSearchKeywords)
+        .onChange(of: store.showsMemberInviteSheet) { _, isPresented in
+            if isPresented {
+                inviteSearchText = ""
+                refreshInviteSearchKeywords()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    isInviteSearchFieldFocused = true
+                }
+            } else {
+                inviteSearchText = ""
+                isInviteSearchFieldFocused = false
+            }
+        }
         .onChange(of: store.pendingProtectedAction) { _, pendingAction in
             guard let pendingAction else { return }
             switch pendingAction {
@@ -719,6 +924,37 @@ struct MatchLobbyFeatureView: View {
                 router.push(.teamBalance(groupID: store.groupID, matchID: store.matchID))
                 store.send(.navigationHandled)
             }
+        }
+        .onDisappear {
+            store.send(.viewDisappeared)
+        }
+        .alert(
+            managementFollowUp?.title ?? "",
+            isPresented: Binding(
+                get: { managementFollowUp != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        managementFollowUp = nil
+                    }
+                }
+            ),
+            presenting: managementFollowUp
+        ) { followUp in
+            switch followUp {
+            case .editNotice:
+                Button("확인", role: .cancel) {
+                    managementFollowUp = nil
+                }
+            case .deleteConfirmation:
+                Button("취소", role: .cancel) {
+                    managementFollowUp = nil
+                }
+                Button("삭제", role: .destructive) {
+                    managementFollowUp = nil
+                }
+            }
+        } message: { followUp in
+            Text(followUp.message)
         }
     }
 
@@ -806,7 +1042,7 @@ struct MatchLobbyFeatureView: View {
                 .buttonStyle(SecondaryButtonStyle())
 
                 Button("참가자 추가") {
-                    store.send(.manageSheetPresented)
+                    store.send(.memberInviteSheetPresented)
                 }
                 .buttonStyle(SecondaryButtonStyle())
             }
@@ -858,6 +1094,69 @@ struct MatchLobbyFeatureView: View {
         return false
     }
 
+    private var isInviteSubmitting: Bool {
+        store.showsMemberInviteSheet && isActionInFlight
+    }
+
+    private var inviteSubmissionErrorMessage: String? {
+        guard store.showsMemberInviteSheet, case let .failure(message) = store.actionState else { return nil }
+        return message
+    }
+
+    private var lobbyRefreshOverlay: some View {
+        HStack(spacing: 8) {
+            ProgressView()
+                .tint(AppPalette.accentBlue)
+            Text("로비를 새로고침하는 중입니다")
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(AppPalette.bgPrimary.opacity(0.96))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(AppPalette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .padding(.top, 12)
+        .allowsHitTesting(false)
+        .accessibilityIdentifier("matchLobby.loadingOverlay")
+    }
+
+    private func filteredInviteMembers(from snapshot: MatchLobbySnapshot) -> [GroupMember] {
+        let trimmedQuery = inviteSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let members = snapshot.members
+        guard !trimmedQuery.isEmpty else { return members }
+        return members.filter { $0.nickname.localizedCaseInsensitiveContains(trimmedQuery) }
+    }
+
+    private func refreshInviteSearchKeywords() {
+        recentInviteSearchKeywords = session.container.localStore.recentSearchKeywords
+    }
+
+    private func commitInviteSearch() {
+        let trimmedQuery = inviteSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else { return }
+        session.container.localStore.recordRecentSearchKeyword(trimmedQuery)
+        refreshInviteSearchKeywords()
+    }
+
+    private func applyRecentInviteSearch(_ keyword: String) {
+        inviteSearchText = keyword
+        isInviteSearchFieldFocused = true
+    }
+
+    private func deleteRecentInviteSearch(_ id: String) {
+        session.container.localStore.deleteRecentSearchKeyword(id: id)
+        refreshInviteSearchKeywords()
+    }
+
+    private func clearRecentInviteSearches() {
+        session.container.localStore.clearRecentSearchKeywords()
+        refreshInviteSearchKeywords()
+    }
+
     private func lobbyPlayerCard(name: String, subtitle: String, powerScore: Int) -> some View {
         HStack(spacing: 10) {
             Circle()
@@ -886,5 +1185,379 @@ struct MatchLobbyFeatureView: View {
         .padding(.horizontal, 12)
         .frame(height: 56)
         .appPanel(background: AppPalette.bgCard, radius: 10)
+    }
+}
+
+private struct MatchLobbyInviteSheet: View {
+    let members: [GroupMember]
+    let selectedMembers: [GroupMember]
+    let participantUserIDs: Set<String>
+    let selectedUserIDs: Set<String>
+    let recentSearchKeywords: [RecentSearchKeyword]
+    @Binding var searchText: String
+    let isSubmitting: Bool
+    let submissionErrorMessage: String?
+    let onClose: () -> Void
+    let onSelectAll: () -> Void
+    let onClearSelection: () -> Void
+    let onToggleMember: (String) -> Void
+    let onTapRecentSearch: (String) -> Void
+    let onDeleteRecentSearch: (String) -> Void
+    let onClearRecentSearches: () -> Void
+    let onSubmitSearch: () -> Void
+    let onSubmitSelection: () -> Void
+    @FocusState private var isSearchFieldFocused: Bool
+
+    private var trimmedSearchText: String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var eligibleMemberCount: Int {
+        members.filter { !participantUserIDs.contains($0.userID) }.count
+    }
+
+    private var selectedSummary: String {
+        guard let first = selectedMembers.first else { return "선택된 팀원이 없어요." }
+        if selectedMembers.count == 1 {
+            return first.nickname
+        }
+        return "\(first.nickname) 외 \(selectedMembers.count - 1)명"
+    }
+
+    var body: some View {
+        ZStack {
+            AppPalette.bgPrimary
+                .ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                headerSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 20)
+                    .padding(.bottom, 14)
+
+                searchField
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
+
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 16) {
+                        if trimmedSearchText.isEmpty {
+                            quickAddSection
+                            recentSearchSection
+                        } else {
+                            searchResultSection
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                    .padding(.bottom, 24)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .scrollDismissesKeyboard(.interactively)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            bottomActionBar
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("memberInviteSheet.root")
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                isSearchFieldFocused = true
+            }
+        }
+    }
+
+    private var headerSection: some View {
+        BottomSheetHeader(
+            title: "팀원 추가",
+            titleAccessibilityIdentifier: "memberInviteSheet.title",
+            showsCloseButton: false,
+            onClose: onClose
+        )
+    }
+
+    private var searchField: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(AppPalette.textSecondary)
+
+            TextField("닉네임으로 팀원 검색", text: $searchText)
+                .font(AppTypography.body(15))
+                .foregroundStyle(AppPalette.textPrimary)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled(true)
+                .submitLabel(.search)
+                .focused($isSearchFieldFocused)
+                .onSubmit {
+                    onSubmitSearch()
+                }
+                .accessibilityIdentifier("memberInviteSheet.searchField")
+
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(AppPalette.textMuted)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("검색어 지우기")
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(height: 52)
+        .background(AppPalette.bgCard)
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(AppPalette.border, lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+    }
+
+    private var quickAddSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("바로 추가하기")
+                .font(AppTypography.heading(16, weight: .bold))
+                .foregroundStyle(AppPalette.textPrimary)
+
+            HStack(spacing: 8) {
+                Text("선택 가능 \(eligibleMemberCount)명")
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(AppPalette.textSecondary)
+
+                Spacer()
+
+                Button("선택 해제", action: onClearSelection)
+                    .buttonStyle(.plain)
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(selectedUserIDs.isEmpty ? AppPalette.textMuted : AppPalette.accentRed)
+                    .disabled(selectedUserIDs.isEmpty || isSubmitting)
+
+                Button("남은 멤버 전체 선택", action: onSelectAll)
+                    .buttonStyle(.plain)
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(eligibleMemberCount == 0 ? AppPalette.textMuted : AppPalette.accentBlue)
+                    .disabled(eligibleMemberCount == 0 || isSubmitting)
+            }
+
+            memberListSection(title: nil)
+        }
+    }
+
+    @ViewBuilder
+    private var recentSearchSection: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("최근 검색")
+                    .font(AppTypography.heading(15, weight: .bold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                Spacer()
+                if !recentSearchKeywords.isEmpty {
+                    Button("전체 삭제", action: onClearRecentSearches)
+                        .font(AppTypography.body(12, weight: .semibold))
+                        .foregroundStyle(AppPalette.accentRed)
+                }
+            }
+
+            if recentSearchKeywords.isEmpty {
+                inviteInfoCard(
+                    title: "닉네임으로 팀원을 검색해보세요.",
+                    message: "최근 검색이 없으면 바로 추가 목록에서 팀원을 골라 로비에 넣을 수 있어요."
+                )
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(recentSearchKeywords) { keyword in
+                        HStack(spacing: 12) {
+                            Button {
+                                onTapRecentSearch(keyword.keyword)
+                            } label: {
+                                HStack(spacing: 10) {
+                                    Image(systemName: "clock.arrow.circlepath")
+                                        .foregroundStyle(AppPalette.textMuted)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(keyword.keyword)
+                                            .font(AppTypography.body(13, weight: .semibold))
+                                            .foregroundStyle(AppPalette.textPrimary)
+                                        Text(keyword.searchedAt.shortDateText)
+                                            .font(AppTypography.body(10))
+                                            .foregroundStyle(AppPalette.textMuted)
+                                    }
+                                    Spacer()
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                            .buttonStyle(.plain)
+
+                            Button {
+                                onDeleteRecentSearch(keyword.id)
+                            } label: {
+                                Image(systemName: "xmark")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundStyle(AppPalette.textMuted)
+                                    .frame(width: 24, height: 24)
+                                    .background(AppPalette.bgSecondary)
+                                    .clipShape(Circle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 12)
+                        .appPanel(background: AppPalette.bgCard, radius: 12)
+                    }
+                }
+            }
+        }
+    }
+
+    private var searchResultSection: some View {
+        memberListSection(title: "검색 결과")
+    }
+
+    @ViewBuilder
+    private func memberListSection(title: String?) -> some View {
+        if let title {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title)
+                    .font(AppTypography.heading(15, weight: .bold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                memberRows
+            }
+        } else {
+            memberRows
+        }
+    }
+
+    private var memberRows: some View {
+        Group {
+            if members.isEmpty {
+                inviteInfoCard(
+                    title: "검색 결과가 없어요.",
+                    message: "다른 닉네임으로 다시 검색해보세요."
+                )
+            } else {
+                VStack(spacing: 8) {
+                    ForEach(members) { member in
+                        let alreadyIncluded = participantUserIDs.contains(member.userID)
+                        let isSelected = selectedUserIDs.contains(member.userID)
+
+                        Button {
+                            if !alreadyIncluded {
+                                onToggleMember(member.userID)
+                            }
+                        } label: {
+                            HStack(spacing: 12) {
+                                Circle()
+                                    .fill(AppPalette.bgElevated)
+                                    .frame(width: 36, height: 36)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(member.nickname)
+                                        .font(AppTypography.body(14, weight: .semibold))
+                                        .foregroundStyle(alreadyIncluded ? AppPalette.textMuted : AppPalette.textPrimary)
+                                    Text(alreadyIncluded ? "이미 참가 중" : "\(member.role.rawValue) · 선택 가능")
+                                        .font(AppTypography.body(11))
+                                        .foregroundStyle(AppPalette.textSecondary)
+                                }
+                                Spacer()
+                                if alreadyIncluded {
+                                    Text("이미 참가")
+                                        .font(AppTypography.body(11, weight: .semibold))
+                                        .foregroundStyle(AppPalette.textMuted)
+                                } else if isSelected {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .font(.system(size: 18, weight: .semibold))
+                                        .foregroundStyle(AppPalette.accentBlue)
+                                } else {
+                                    Image(systemName: "circle")
+                                        .font(.system(size: 18, weight: .regular))
+                                        .foregroundStyle(AppPalette.textMuted)
+                                }
+                            }
+                            .padding(14)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .appPanel(background: alreadyIncluded ? AppPalette.bgTertiary.opacity(0.7) : AppPalette.bgCard, radius: 12)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(alreadyIncluded || isSubmitting)
+                        .accessibilityIdentifier("matchLobby.inviteSheet.member.\(member.userID)")
+                    }
+                }
+            }
+        }
+    }
+
+    private var bottomActionBar: some View {
+        VStack(spacing: 10) {
+            if let submissionErrorMessage {
+                inviteInfoCard(
+                    title: submissionErrorMessage,
+                    message: "참가자 목록과 선택한 팀원을 확인한 뒤 다시 시도해 주세요."
+                )
+            }
+
+            HStack(alignment: .center, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("선택된 팀원")
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                    Text(selectedSummary)
+                        .font(AppTypography.body(13, weight: .semibold))
+                        .foregroundStyle(selectedMembers.isEmpty ? AppPalette.textMuted : AppPalette.textPrimary)
+                        .lineLimit(1)
+                        .accessibilityIdentifier("memberInviteSheet.selectedSummary")
+                }
+
+                Spacer()
+
+                Text("선택 \(selectedMembers.count)명")
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(selectedMembers.isEmpty ? AppPalette.textMuted : AppPalette.accentBlue)
+            }
+            .padding(.horizontal, 4)
+
+            Button(action: onSubmitSelection) {
+                if isSubmitting {
+                    ProgressView()
+                        .tint(.white)
+                } else {
+                    Text("팀원 추가")
+                }
+            }
+            .buttonStyle(
+                PrimaryButtonStyle(
+                    fill: selectedMembers.isEmpty || isSubmitting
+                        ? AppPalette.bgTertiary
+                        : AppPalette.accentBlue
+                )
+            )
+            .disabled(selectedMembers.isEmpty || isSubmitting)
+            .accessibilityIdentifier("memberInviteSheet.submitButton")
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 12)
+        .padding(.bottom, 16)
+        .background(AppPalette.bgPrimary.opacity(0.98))
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(AppPalette.border.opacity(0.8))
+                .frame(height: 1)
+        }
+    }
+
+    private func inviteInfoCard(title: String, message: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(AppTypography.body(14, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+            Text(message)
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
     }
 }

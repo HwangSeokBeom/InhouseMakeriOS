@@ -97,6 +97,249 @@ extension View {
     }
 }
 
+enum BottomActionSheetActionRole {
+    case regular
+    case destructive
+    case cancel
+}
+
+struct BottomActionSheetAction: Identifiable {
+    let id: String
+    let title: String
+    var role: BottomActionSheetActionRole = .regular
+    var accessibilityIdentifier: String? = nil
+    let action: () -> Void
+
+    init(
+        id: String,
+        title: String,
+        role: BottomActionSheetActionRole = .regular,
+        accessibilityIdentifier: String? = nil,
+        action: @escaping () -> Void
+    ) {
+        self.id = id
+        self.title = title
+        self.role = role
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.action = action
+    }
+}
+
+struct BottomSheetHeader: View {
+    let title: String
+    var titleAccessibilityIdentifier: String? = nil
+    var closeAccessibilityIdentifier: String? = nil
+    var showsCloseButton = true
+    var onClose: (() -> Void)? = nil
+
+    var body: some View {
+        ZStack {
+            Text(title)
+                .font(AppTypography.heading(18, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .accessibilityIdentifier(titleAccessibilityIdentifier ?? "")
+
+            HStack {
+                Spacer()
+                if showsCloseButton, let onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AppPalette.textMuted)
+                            .frame(width: 28, height: 28)
+                            .background(AppPalette.bgTertiary.opacity(0.92))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("시트 닫기")
+                    .accessibilityIdentifier(closeAccessibilityIdentifier ?? "")
+                }
+            }
+        }
+        .frame(height: 32)
+    }
+}
+
+struct BottomActionSheet: View {
+    let title: String?
+    let message: String?
+    let accessibilityIdentifier: String?
+    let actions: [BottomActionSheetAction]
+    let onDismiss: () -> Void
+
+    @GestureState private var dragOffset: CGFloat = 0
+
+    init(
+        title: String? = nil,
+        message: String? = nil,
+        accessibilityIdentifier: String? = nil,
+        actions: [BottomActionSheetAction],
+        onDismiss: @escaping () -> Void
+    ) {
+        self.title = title
+        self.message = message
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.actions = actions
+        self.onDismiss = onDismiss
+    }
+
+    private var primaryActions: [BottomActionSheetAction] {
+        actions.filter { $0.role != .cancel }
+    }
+
+    private var cancelAction: BottomActionSheetAction? {
+        actions.first { $0.role == .cancel }
+    }
+
+    private var showsHeader: Bool {
+        title != nil || message != nil
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .bottom) {
+                Color.black.opacity(0.62)
+                    .ignoresSafeArea()
+                    .onTapGesture(perform: dismiss)
+
+                contentStack(geometry: geometry)
+                    .offset(y: dragOffset)
+                    .gesture(
+                        DragGesture(minimumDistance: 10)
+                            .updating($dragOffset) { value, state, _ in
+                                if value.translation.height > 0 {
+                                    state = value.translation.height
+                                }
+                            }
+                            .onEnded { value in
+                                if value.translation.height > 120 {
+                                    dismiss()
+                                }
+                            }
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func contentStack(geometry: GeometryProxy) -> some View {
+        let stack = VStack(spacing: 12) {
+            primaryActionSection
+
+            if let cancelAction {
+                actionRow(cancelAction, standalone: true)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: min(geometry.size.height - 20, 420), alignment: .bottom)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 10)
+
+        if let accessibilityIdentifier {
+            stack
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier(accessibilityIdentifier)
+        } else {
+            stack
+        }
+    }
+
+    private var primaryActionSection: some View {
+        VStack(spacing: 0) {
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.18))
+                .frame(width: 38, height: 5)
+                .padding(.top, 10)
+                .padding(.bottom, showsHeader ? 14 : 12)
+
+            if showsHeader {
+                VStack(spacing: 6) {
+                    if let title {
+                        Text(title)
+                            .font(AppTypography.body(13, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                    }
+                    if let message {
+                        Text(message)
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
+            }
+
+            VStack(spacing: 0) {
+                ForEach(Array(primaryActions.enumerated()), id: \.element.id) { index, action in
+                    if index > 0 {
+                        Rectangle()
+                            .fill(AppPalette.border.opacity(0.9))
+                            .frame(height: 1)
+                            .padding(.horizontal, 18)
+                    }
+                    actionRow(action, standalone: false)
+                }
+            }
+        }
+        .background(AppPalette.bgSecondary)
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func actionRow(_ action: BottomActionSheetAction, standalone: Bool) -> some View {
+        let button = Button {
+            dismiss()
+            Task { @MainActor in
+                action.action()
+            }
+        } label: {
+            Text(action.title)
+                .font(AppTypography.body(16, weight: action.role == .cancel ? .semibold : .regular))
+                .foregroundStyle(titleColor(for: action.role))
+                .frame(maxWidth: .infinity)
+                .frame(height: 56)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if let accessibilityIdentifier = action.accessibilityIdentifier {
+            button
+                .background(standalone ? AppPalette.bgCard : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: standalone ? 18 : 0, style: .continuous))
+                .accessibilityIdentifier(accessibilityIdentifier)
+        } else {
+            button
+                .background(standalone ? AppPalette.bgCard : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: standalone ? 18 : 0, style: .continuous))
+        }
+    }
+
+    private func titleColor(for role: BottomActionSheetActionRole) -> Color {
+        switch role {
+        case .regular, .cancel:
+            return AppPalette.textPrimary
+        case .destructive:
+            return AppPalette.accentRed
+        }
+    }
+
+    private func dismiss() {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+            onDismiss()
+        }
+    }
+}
+
 struct StatusBarView: View {
     var body: some View {
         EmptyView()
@@ -419,19 +662,37 @@ struct FilterChipView: View {
     let tint: Color
     var isSelected: Bool = false
 
+    private var titleWeight: Font.Weight {
+        isSelected ? .semibold : .regular
+    }
+
+    private var titleColor: Color {
+        isSelected ? .white : tint
+    }
+
+    private var chipFillColor: Color {
+        isSelected ? tint : AppPalette.bgTertiary
+    }
+
+    private var chipBorderColor: Color {
+        isSelected ? .clear : AppPalette.border
+    }
+
     var body: some View {
         Text(title)
-            .font(AppTypography.body(11, weight: isSelected ? .semibold : .regular))
-            .foregroundStyle(isSelected ? Color.white : tint)
+            .font(AppTypography.body(11, weight: titleWeight))
+            .foregroundStyle(titleColor)
             .padding(.horizontal, 11)
             .padding(.vertical, 5)
-            .background(
-                RoundedRectangle(cornerRadius: 16)
-                    .fill(isSelected ? tint : AppPalette.bgTertiary)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 16)
-                            .stroke(isSelected ? .clear : AppPalette.border, lineWidth: 1)
-                    )
+            .background(chipBackground)
+    }
+
+    private var chipBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 16)
+        return shape
+            .fill(chipFillColor)
+            .overlay(
+                shape.stroke(chipBorderColor, lineWidth: 1)
             )
     }
 }
@@ -446,60 +707,13 @@ struct AppTabBar: View {
     var body: some View {
         HStack(spacing: 6) {
             ForEach(AppTab.allCases, id: \.self) { tab in
-                Button(action: {
-                    guard selectedTab != tab else { return }
-                    onSelect(tab)
-                }) {
-                    VStack(spacing: 2) {
-                        Image(systemName: tab.iconName)
-                            .font(.system(size: 17, weight: selectedTab == tab ? .semibold : .medium))
-                            .foregroundStyle(selectedTab == tab ? AppPalette.accentBlue : AppPalette.textMuted)
-                            .frame(height: 20)
-                        Text(tab.title)
-                            .font(AppTypography.body(10, weight: selectedTab == tab ? .semibold : .medium))
-                            .foregroundStyle(selectedTab == tab ? AppPalette.textPrimary : AppPalette.textSecondary)
-                            .lineLimit(1)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 48)
-                    .background(
-                        Capsule(style: .continuous)
-                            .fill(selectedTab == tab ? AppPalette.bgTertiary.opacity(0.9) : .clear)
-                            .overlay(
-                                Capsule(style: .continuous)
-                                    .stroke(selectedTab == tab ? Color.white.opacity(0.04) : .clear, lineWidth: 1)
-                            )
-                    )
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+                tabButton(for: tab)
             }
         }
         .padding(.horizontal, 8)
         .padding(.top, 7)
         .padding(.bottom, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(AppPalette.bgSecondary.opacity(0.94))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color.white.opacity(0.02),
-                                    Color.white.opacity(0.008)
-                                ],
-                                startPoint: .top,
-                                endPoint: .bottom
-                            )
-                        )
-                )
-                .overlay(
-                    RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .stroke(Color.white.opacity(0.045), lineWidth: 1)
-                )
-                .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 3)
-        )
+        .background(tabBarBackground)
         .padding(.horizontal, 12)
         .padding(.top, 4)
         .padding(.bottom, outerBottomPadding)
@@ -515,6 +729,99 @@ struct AppTabBar: View {
         print("[TabBarLayoutDebug] \(message)")
         #endif
     }
+
+    private func tabButton(for tab: AppTab) -> some View {
+        let isSelected = selectedTab == tab
+
+        return Button(action: {
+            guard !isSelected else { return }
+            onSelect(tab)
+        }) {
+            AppTabBarItemContent(tab: tab, isSelected: isSelected)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var tabBarBackground: some View {
+        let shape = RoundedRectangle(cornerRadius: 22, style: .continuous)
+
+        return shape
+            .fill(AppPalette.bgSecondary.opacity(0.94))
+            .overlay {
+                shape.fill(tabBarHighlightGradient)
+            }
+            .overlay {
+                shape.stroke(Color.white.opacity(0.045), lineWidth: 1)
+            }
+            .shadow(color: Color.black.opacity(0.12), radius: 8, x: 0, y: 3)
+    }
+
+    private var tabBarHighlightGradient: LinearGradient {
+        LinearGradient(
+            colors: [
+                Color.white.opacity(0.02),
+                Color.white.opacity(0.008)
+            ],
+            startPoint: .top,
+            endPoint: .bottom
+        )
+    }
+}
+
+private struct AppTabBarItemContent: View {
+    let tab: AppTab
+    let isSelected: Bool
+
+    private var iconWeight: Font.Weight {
+        isSelected ? .semibold : .medium
+    }
+
+    private var iconColor: Color {
+        isSelected ? AppPalette.accentBlue : AppPalette.textMuted
+    }
+
+    private var titleWeight: Font.Weight {
+        isSelected ? .semibold : .medium
+    }
+
+    private var titleColor: Color {
+        isSelected ? AppPalette.textPrimary : AppPalette.textSecondary
+    }
+
+    private var capsuleFill: Color {
+        isSelected ? AppPalette.bgTertiary.opacity(0.9) : .clear
+    }
+
+    private var capsuleStroke: Color {
+        isSelected ? Color.white.opacity(0.04) : .clear
+    }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Image(systemName: tab.iconName)
+                .font(.system(size: 17, weight: iconWeight))
+                .foregroundStyle(iconColor)
+                .frame(height: 20)
+
+            Text(tab.title)
+                .font(AppTypography.body(10, weight: titleWeight))
+                .foregroundStyle(titleColor)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 48)
+        .background(selectionBackground)
+        .contentShape(Rectangle())
+    }
+
+    private var selectionBackground: some View {
+        let shape = Capsule(style: .continuous)
+        return shape
+            .fill(capsuleFill)
+            .overlay(
+                shape.stroke(capsuleStroke, lineWidth: 1)
+            )
+    }
 }
 
 struct TeamColumnView: View {
@@ -525,54 +832,79 @@ struct TeamColumnView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            Text(title)
-                .font(AppTypography.heading(12, weight: .bold))
-                .foregroundStyle(Color.white)
-                .frame(maxWidth: .infinity)
-                .frame(height: 30)
-                .background(tint)
+            titleView
 
             VStack(spacing: 1) {
                 ForEach(players) { player in
-                    HStack(spacing: 6) {
-                        Text(player.roleLabel)
-                            .font(AppTypography.body(9, weight: .bold))
-                            .foregroundStyle(tint)
-                            .frame(width: 28, alignment: .leading)
-
-                        HStack(spacing: 4) {
-                            Text(player.name)
-                                .font(AppTypography.body(12, weight: .semibold))
-                                .foregroundStyle(AppPalette.textPrimary)
-                            if player.isOffRole {
-                                Text("OFF")
-                                    .font(AppTypography.body(8, weight: .bold))
-                                    .foregroundStyle(AppPalette.bgPrimary)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(AppPalette.accentOrange)
-                                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                            }
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                        Text("\(player.score)")
-                            .font(AppTypography.heading(13, weight: .bold))
-                            .foregroundStyle(tint)
-                    }
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 7)
-                    .frame(maxWidth: .infinity)
-                    .background(player.isHighlighted ? tint.opacity(0.14) : background.opacity(0.96))
+                    TeamColumnPlayerRow(player: player, tint: tint, background: background)
                 }
             }
             .background(background)
         }
-        .overlay(
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(AppPalette.border, lineWidth: 1)
-        )
+        .overlay(columnBorder)
         .clipShape(RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var titleView: some View {
+        Text(title)
+            .font(AppTypography.heading(12, weight: .bold))
+            .foregroundStyle(Color.white)
+            .frame(maxWidth: .infinity)
+            .frame(height: 30)
+            .background(tint)
+    }
+
+    private var columnBorder: some View {
+        RoundedRectangle(cornerRadius: 10)
+            .stroke(AppPalette.border, lineWidth: 1)
+    }
+}
+
+private struct TeamColumnPlayerRow: View {
+    let player: TeamBalanceRow
+    let tint: Color
+    let background: Color
+
+    private var rowBackground: Color {
+        player.isHighlighted ? tint.opacity(0.14) : background.opacity(0.96)
+    }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(player.roleLabel)
+                .font(AppTypography.body(9, weight: .bold))
+                .foregroundStyle(tint)
+                .frame(width: 28, alignment: .leading)
+
+            HStack(spacing: 4) {
+                Text(player.name)
+                    .font(AppTypography.body(12, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+
+                if player.isOffRole {
+                    offRoleBadge
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text("\(player.score)")
+                .font(AppTypography.heading(13, weight: .bold))
+                .foregroundStyle(tint)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
+        .frame(maxWidth: .infinity)
+        .background(rowBackground)
+    }
+
+    private var offRoleBadge: some View {
+        Text("OFF")
+            .font(AppTypography.body(8, weight: .bold))
+            .foregroundStyle(AppPalette.bgPrimary)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(AppPalette.accentOrange)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
     }
 }
 

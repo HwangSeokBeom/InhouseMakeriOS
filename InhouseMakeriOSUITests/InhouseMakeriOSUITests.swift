@@ -10,74 +10,159 @@ final class InhouseMakeriOSUITests: XCTestCase {
         app.launch()
     }
 
+    func testMemberInviteSheetHeaderUsesUpdatedContract() throws {
+        let app = launchGroupInviteFlowApp()
+
+        let inviteButton = app.buttons["멤버 초대"]
+        XCTAssertTrue(waitForHittable(inviteButton, timeout: 5))
+        inviteButton.tap()
+
+        assertMemberInviteSheetHeader(in: app)
+    }
+
+    func testGroupDetailOverflowShowsManagementActionSheet() throws {
+        let app = launchGroupInviteFlowApp()
+
+        let overflowButton = app.buttons["groupDetail.overflowButton"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        XCTAssertTrue(app.otherElements["groupDetail.managementActionSheet"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["groupDetail.managementActionSheet.edit"].exists)
+        XCTAssertTrue(app.buttons["groupDetail.managementActionSheet.delete"].exists)
+        XCTAssertTrue(app.buttons["groupDetail.managementActionSheet.cancel"].exists)
+    }
+
+    func testMatchLobbyOverflowShowsManagementActionSheet() throws {
+        let app = launchGroupInviteFlowApp()
+
+        enterMatchLobby(in: app)
+
+        let overflowButton = app.buttons["matchLobby.manageToolbar"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        XCTAssertTrue(app.otherElements["matchLobby.managementActionSheet"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["matchLobby.managementActionSheet.inviteMembers"].exists)
+        XCTAssertTrue(app.buttons["matchLobby.managementActionSheet.edit"].exists)
+        XCTAssertTrue(app.buttons["matchLobby.managementActionSheet.delete"].exists)
+        XCTAssertTrue(app.buttons["matchLobby.managementActionSheet.cancel"].exists)
+    }
+
+    func testMatchLobbyManagementActionSheetInvitePresentsMemberInviteSheet() throws {
+        let app = launchGroupInviteFlowApp()
+
+        enterMatchLobby(in: app)
+
+        let overflowButton = app.buttons["matchLobby.manageToolbar"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        let inviteAction = app.buttons["matchLobby.managementActionSheet.inviteMembers"]
+        XCTAssertTrue(waitForHittable(inviteAction, timeout: 3))
+        inviteAction.tap()
+
+        assertMemberInviteSheetHeader(in: app)
+    }
+
+    func testMatchLobbyManagementActionSheetEditShowsEditFlowNotice() throws {
+        let app = launchGroupInviteFlowApp()
+
+        enterMatchLobby(in: app)
+
+        let overflowButton = app.buttons["matchLobby.manageToolbar"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        let editAction = app.buttons["matchLobby.managementActionSheet.edit"]
+        XCTAssertTrue(waitForHittable(editAction, timeout: 3))
+        editAction.tap()
+
+        XCTAssertTrue(app.alerts["내전 수정은 준비 중입니다"].waitForExistence(timeout: 3))
+    }
+
+    func testMatchLobbyManagementActionSheetDeleteShowsDeleteConfirmation() throws {
+        let app = launchGroupInviteFlowApp()
+
+        enterMatchLobby(in: app)
+
+        let overflowButton = app.buttons["matchLobby.manageToolbar"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        let deleteAction = app.buttons["matchLobby.managementActionSheet.delete"]
+        XCTAssertTrue(waitForHittable(deleteAction, timeout: 3))
+        deleteAction.tap()
+
+        XCTAssertTrue(app.alerts["이 내전을 삭제할까요?"].waitForExistence(timeout: 3))
+    }
+
+    func testRecruitBoardMemberPostOverflowShowsManagementActionSheet() throws {
+        let app = launchRecruitManagementFlowApp()
+
+        let overflowButton = app.buttons["recruitPost.card.debug-member-recruit-post.overflowButton"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        XCTAssertTrue(app.otherElements["recruitPost.managementActionSheet"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["recruitPost.managementActionSheet.edit"].exists)
+        XCTAssertTrue(app.buttons["recruitPost.managementActionSheet.delete"].exists)
+        XCTAssertTrue(app.buttons["recruitPost.managementActionSheet.cancel"].exists)
+    }
+
+    func testRecruitBoardOpponentPostOverflowShowsManagementActionSheet() throws {
+        let app = launchRecruitManagementFlowApp()
+
+        let opponentTypeButton = app.buttons["상대팀 모집"]
+        XCTAssertTrue(waitForHittable(opponentTypeButton, timeout: 5))
+        opponentTypeButton.tap()
+
+        let overflowButton = app.buttons["recruitPost.card.debug-opponent-recruit-post.overflowButton"]
+        XCTAssertTrue(waitForHittable(overflowButton, timeout: 5))
+        overflowButton.tap()
+
+        XCTAssertTrue(app.otherElements["recruitPost.managementActionSheet"].waitForExistence(timeout: 3))
+        XCTAssertTrue(app.buttons["recruitPost.managementActionSheet.edit"].exists)
+        XCTAssertTrue(app.buttons["recruitPost.managementActionSheet.delete"].exists)
+        XCTAssertTrue(app.buttons["recruitPost.managementActionSheet.cancel"].exists)
+    }
+
     func testInviteSheetAndTenMemberMatchFlow() throws {
-        let app = XCUIApplication()
-        app.launchArguments += ["-ui-test-group-invite-flow"]
-        app.launch()
+        let app = launchGroupInviteFlowApp()
 
         XCTAssertTrue(app.navigationBars["롤내전모임"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.buttons["멤버 초대"].exists)
 
-        app.buttons["멤버 초대"].tap()
+        enterMatchLobby(in: app)
 
-        XCTAssertTrue(app.staticTexts["팀원 추가"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.buttons["닫기"].exists)
-        XCTAssertTrue(app.textFields["닉네임으로 팀원 검색"].exists)
-        XCTAssertTrue(app.staticTexts["바로 추가하기"].exists)
-        XCTAssertTrue(app.staticTexts["최근 검색"].exists)
-        XCTAssertTrue(app.staticTexts["선택된 팀원"].exists)
+        let participantCountLabel = app.otherElements["matchLobby.participantCount"]
+        XCTAssertEqual(participantCountLabel.label, "1/10")
 
-        let inviteButton = app.buttons["팀원 추가"]
-        XCTAssertTrue(inviteButton.exists)
-        XCTAssertFalse(inviteButton.isEnabled)
-
-        let searchField = app.textFields["닉네임으로 팀원 검색"]
-        searchField.tap()
-        searchField.typeText("none")
-        XCTAssertTrue(app.staticTexts["검색 결과가 없어요."].waitForExistence(timeout: 3))
-
-        app.buttons["검색어 지우기"].tap()
-        searchField.tap()
-        searchField.typeText("alpha")
-
-        XCTAssertTrue(app.staticTexts["검색 결과"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["나"].exists)
-        XCTAssertTrue(app.staticTexts["이미 멤버"].exists)
-        XCTAssertTrue(app.staticTexts["초대 가능"].exists)
-
-        app.buttons["닫기"].tap()
-        XCTAssertTrue(app.buttons["멤버 초대"].waitForExistence(timeout: 2))
-
-        app.buttons["내전 생성"].tap()
-        XCTAssertTrue(app.navigationBars["내전 로비"].waitForExistence(timeout: 5))
-
-        let manageMembersButton = app.navigationBars["내전 로비"].buttons["참가자 관리 메뉴"]
-        XCTAssertTrue(manageMembersButton.waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["테스터"].waitForExistence(timeout: 3))
+        let manageMembersButton = app.buttons["matchLobby.manageToolbar"]
+        XCTAssertTrue(app.buttons["matchLobby.autoBalanceButton"].waitForExistence(timeout: 5))
         manageMembersButton.tap()
 
-        XCTAssertTrue(app.navigationBars["참가자 추가"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["선택 가능 9명"].exists)
+        XCTAssertTrue(app.otherElements["matchLobby.managementActionSheet"].waitForExistence(timeout: 3))
+        let inviteAction = app.buttons["matchLobby.managementActionSheet.inviteMembers"]
+        XCTAssertTrue(waitForHittable(inviteAction, timeout: 3))
+        inviteAction.tap()
+
+        let lobbyInviteSheet = app.otherElements["memberInviteSheet.root"]
+        XCTAssertTrue(lobbyInviteSheet.waitForExistence(timeout: 3))
+        let lobbyInviteSubmitButton = app.buttons["memberInviteSheet.submitButton"]
+        XCTAssertFalse(lobbyInviteSubmitButton.isEnabled)
 
         app.buttons["남은 멤버 전체 선택"].tap()
-        XCTAssertTrue(app.staticTexts["선택 9명"].waitForExistence(timeout: 2))
-        app.buttons["참가자 추가"].tap()
-        let closeButton = app.buttons["닫기"]
-        if closeButton.waitForExistence(timeout: 2) {
-            closeButton.tap()
-        }
+        XCTAssertTrue(waitForEnabled(lobbyInviteSubmitButton, timeout: 2))
+        lobbyInviteSubmitButton.tap()
 
-        XCTAssertTrue(app.staticTexts["10명이 모였습니다. 자동 팀 생성을 실행할 수 있습니다"].waitForExistence(timeout: 5))
-        XCTAssertTrue(app.staticTexts["MID / TOP"].waitForExistence(timeout: 3))
-        XCTAssertTrue(app.staticTexts["94"].waitForExistence(timeout: 3))
+        XCTAssertTrue(waitForNonExistence(lobbyInviteSheet, timeout: 3))
+        XCTAssertTrue(waitForLabel(participantCountLabel, equals: "10/10", timeout: 5))
 
-        let autoBalanceButton = app.buttons["자동 팀 생성"]
-        XCTAssertTrue(autoBalanceButton.waitForExistence(timeout: 3))
-        XCTAssertTrue(autoBalanceButton.isEnabled)
+        let autoBalanceButton = app.buttons["matchLobby.autoBalanceButton"]
+        XCTAssertTrue(waitForEnabled(autoBalanceButton, timeout: 10))
 
-        let manualAssignButton = app.buttons["수동 배치"]
-        XCTAssertTrue(manualAssignButton.exists)
-        XCTAssertTrue(manualAssignButton.isEnabled)
+        let manualAssignButton = app.buttons["matchLobby.manualAssignButton"]
+        XCTAssertTrue(waitForEnabled(manualAssignButton, timeout: 3))
 
         autoBalanceButton.tap()
         XCTAssertTrue(app.navigationBars["팀 밸런스 결과"].waitForExistence(timeout: 5))
@@ -91,5 +176,78 @@ final class InhouseMakeriOSUITests: XCTestCase {
         app.buttons["테스터"].tap()
         app.buttons["내 계정에 저장"].tap()
         XCTAssertTrue(app.staticTexts["라인별 승패를 모두 선택해 주세요. 누락: TOP, JGL, MID, BOT"].waitForExistence(timeout: 3))
+    }
+
+    private func launchGroupInviteFlowApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += ["-ui-test-group-invite-flow"]
+        app.launch()
+        return app
+    }
+
+    private func launchRecruitManagementFlowApp() -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += ["-ui-test-recruit-management-flow"]
+        app.launch()
+        return app
+    }
+
+    private func enterMatchLobby(in app: XCUIApplication) {
+        let createMatchButton = app.buttons["내전 생성"]
+        if !waitForHittable(createMatchButton, timeout: 2) {
+            app.swipeUp()
+        }
+        XCTAssertTrue(waitForHittable(createMatchButton, timeout: 5))
+        createMatchButton.tap()
+
+        XCTAssertTrue(app.otherElements["matchLobby.root"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.otherElements["matchLobby.participantCount"].waitForExistence(timeout: 5))
+    }
+
+    private func assertMemberInviteSheetHeader(in app: XCUIApplication) {
+        let inviteSheet = app.otherElements["memberInviteSheet.root"]
+        XCTAssertTrue(inviteSheet.waitForExistence(timeout: 3))
+        XCTAssertTrue(app.staticTexts["memberInviteSheet.title"].exists)
+        XCTAssertFalse(app.buttons["memberInviteSheet.closeButton"].exists)
+        XCTAssertTrue(app.textFields["memberInviteSheet.searchField"].exists)
+        XCTAssertTrue(app.buttons["memberInviteSheet.submitButton"].exists)
+        XCTAssertFalse(app.buttons["닫기"].exists)
+        XCTAssertFalse(app.navigationBars["팀원 추가"].exists)
+    }
+
+    private func waitForEnabled(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate { object, _ in
+            guard let element = object as? XCUIElement else { return false }
+            return element.exists && element.isEnabled
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitForNonExistence(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate { object, _ in
+            guard let element = object as? XCUIElement else { return false }
+            return !element.exists
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitForHittable(_ element: XCUIElement, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate { object, _ in
+            guard let element = object as? XCUIElement else { return false }
+            return element.exists && element.isHittable
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func waitForLabel(_ element: XCUIElement, equals label: String, timeout: TimeInterval) -> Bool {
+        let predicate = NSPredicate { object, _ in
+            guard let element = object as? XCUIElement else { return false }
+            return element.exists && element.label == label
+        }
+        let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
+        return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
     }
 }
