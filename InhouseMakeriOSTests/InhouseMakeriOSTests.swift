@@ -1704,10 +1704,7 @@ final class InhouseMakeriOSTests: XCTestCase {
                     XCTAssertEqual(payload["email"] as? String, "user@example.com")
                     XCTAssertEqual(payload["password"] as? String, "Password1!")
                     XCTAssertEqual(payload["nickname"] as? String, "tester")
-                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
-                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
-                    XCTAssertEqual(payload["agreedToMarketing"] as? Bool, false)
-                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname", "agreedToTerms", "agreedToPrivacy", "agreedToMarketing"]))
+                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname"]))
 
                     let response = AuthTokensDTO(
                         user: AuthUserDTO(
@@ -1729,10 +1726,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         let tokens = try await repository.signUpWithEmail(
             email: "user@example.com",
             password: "Password1!",
-            nickname: "tester",
-            agreedToTerms: true,
-            agreedToPrivacy: true,
-            agreedToMarketing: false
+            nickname: "tester"
         )
 
         XCTAssertEqual(tokens.user.email, "user@example.com")
@@ -1790,7 +1784,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(tokens.user.provider, .apple)
     }
 
-    func testEmailSignUpRequestOmitsMarketingWhenNotProvided() async throws {
+    func testEmailSignUpRequestDoesNotSendConsentPayload() async throws {
         let tokenStore = makeTokenStore()
         let repository = AuthRepository(
             apiClient: APIClient(
@@ -1801,9 +1795,10 @@ final class InhouseMakeriOSTests: XCTestCase {
 
                     let body = try XCTUnwrap(self.requestBodyData(from: request))
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
-                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
-                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
+                    XCTAssertNil(payload["agreedToTerms"])
+                    XCTAssertNil(payload["agreedToPrivacy"])
                     XCTAssertNil(payload["agreedToMarketing"])
+                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname"]))
 
                     let response = AuthTokensDTO(
                         user: AuthUserDTO(
@@ -1825,10 +1820,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         _ = try await repository.signUpWithEmail(
             email: "user@example.com",
             password: "Password1!",
-            nickname: "tester",
-            agreedToTerms: true,
-            agreedToPrivacy: true,
-            agreedToMarketing: nil
+            nickname: "tester"
         )
     }
 
@@ -2019,10 +2011,7 @@ final class InhouseMakeriOSTests: XCTestCase {
                     XCTAssertEqual(payload["email"] as? String, expectedEmail)
                     XCTAssertEqual(payload["password"] as? String, "Password1!")
                     XCTAssertEqual(payload["nickname"] as? String, "aa34")
-                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
-                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
-                    XCTAssertEqual(payload["agreedToMarketing"] as? Bool, false)
-                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname", "agreedToTerms", "agreedToPrivacy", "agreedToMarketing"]))
+                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname"]))
 
                     let response = AuthTokensDTO(
                         user: AuthUserDTO(
@@ -2063,8 +2052,6 @@ final class InhouseMakeriOSTests: XCTestCase {
         viewModel.updatePassword("Password1!")
         viewModel.updatePasswordConfirmation("Password1!")
         viewModel.updateNickname("aa34")
-        viewModel.toggleServiceTerms()
-        viewModel.togglePrivacyTerms()
 
         XCTAssertTrue(viewModel.state.isSubmitEnabled)
 
@@ -2089,7 +2076,7 @@ final class InhouseMakeriOSTests: XCTestCase {
     }
 
     @MainActor
-    func testEmailSignUpSubmitIsBlockedWithoutRequiredTerms() async {
+    func testEmailSignUpSubmitUsesInputValidationOnly() async {
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: makeTokenStore(),
@@ -2106,12 +2093,11 @@ final class InhouseMakeriOSTests: XCTestCase {
         viewModel.updatePasswordConfirmation("Password1!")
         viewModel.updateNickname("tester1")
 
+        XCTAssertTrue(viewModel.state.isSubmitEnabled)
+
+        viewModel.updateNickname("")
+
         XCTAssertFalse(viewModel.state.isSubmitEnabled)
-
-        await viewModel.submit()
-
-        XCTAssertNil(session.authTokens)
-        XCTAssertTrue(viewModel.state.termsState.hasAttemptedValidation)
     }
 
     @MainActor
@@ -2143,8 +2129,6 @@ final class InhouseMakeriOSTests: XCTestCase {
         viewModel.updatePassword("Password1!")
         viewModel.updatePasswordConfirmation("Password1!")
         viewModel.updateNickname("tester1")
-        viewModel.toggleServiceTerms()
-        viewModel.togglePrivacyTerms()
 
         await viewModel.submit()
 
