@@ -450,6 +450,7 @@ private enum ErrorMappingContext {
     case authSignup
     case authLogin
     case recruitingList
+    case resultPreviewValidation
     case genericForm
     case generic
 }
@@ -501,6 +502,8 @@ extension UserFacingError {
             return .authLogin
         case ("GET", "/recruiting-posts"), ("GET", "/recruiting-posts/public"):
             return .recruitingList
+        case ("POST", "/matches/result/preview"):
+            return .resultPreviewValidation
         default:
             if statusCode == 400 {
                 return .genericForm
@@ -685,6 +688,10 @@ enum ErrorMapper {
         let rawMessage = error.message.lowercased()
 
         if error.statusCode == 403 {
+            if error.serverContractCode == .forbiddenFeature {
+                return nil
+            }
+
             if rawMessage.contains("share the same inhouse group") {
                 return error.withPresentation(
                     title: "같은 그룹 멤버만 볼 수 있어요",
@@ -752,6 +759,11 @@ enum ErrorMapper {
             return error.withPresentation(
                 title: "필터 조건을 다시 확인해 주세요",
                 message: "목록을 불러오는 조건이 올바르지 않습니다."
+            )
+        case .resultPreviewValidation:
+            return error.withPresentation(
+                title: "결과를 다시 확인해 주세요",
+                message: error.message
             )
         case .genericForm, .generic:
             return error.withPresentation(

@@ -692,6 +692,7 @@ final class InhouseMakeriOSTests: XCTestCase {
             _ = try await repository.previewResult(draft: .defaultValue())
             XCTFail("Expected validation failure")
         } catch let error as UserFacingError {
+            XCTAssertEqual(error.title, "결과를 다시 확인해 주세요")
             XCTAssertEqual(error.message, "MVP를 다시 선택해 주세요.")
         } catch {
             XCTFail("Unexpected error: \(error)")
@@ -846,7 +847,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         ).serverContractMapped
 
         XCTAssertEqual(mappedError.title, "모집이 마감되었어요")
-        XCTAssertEqual(mappedError.message, "모집이 종료되어 더 이상 진행할 수 없어요.")
+        XCTAssertEqual(mappedError.message, "모집이 마감되어 참가 신청할 수 없어요.")
     }
 
     func testErrorMapperMapsRecruitingApplyClosedOrFullToFriendlyMessage() {
@@ -2871,6 +2872,9 @@ final class InhouseMakeriOSTests: XCTestCase {
                 case "/recruiting-posts":
                     let payload = try JSONEncoder.app.encode(RecruitPostListDTO(items: [self.makeRecruitPostDTO(id: "auth-post", title: "계정 모집")]))
                     return (200, payload)
+                case "/groups/group-1":
+                    let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "테스트 그룹"))
+                    return (200, payload)
                 default:
                     XCTFail("Unexpected path \(request.url?.path ?? "nil")")
                     return (500, Data())
@@ -3029,11 +3033,28 @@ final class InhouseMakeriOSTests: XCTestCase {
         let releaseFirstRequest = DispatchSemaphore(value: 0)
         let requestLock = NSLock()
         var requestedPostTypes: [String] = []
+        let suiteName = "InhouseMakeriOSTests.recruit.queue.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.setRecruitFilterType(.memberRecruit)
 
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: tokenStore,
+            localStore: localStore,
             urlSession: makeURLSession { request in
+                guard request.url?.path == "/recruiting-posts" else {
+                    if request.url?.path == "/groups/group-1" {
+                        let payload = try JSONEncoder.app.encode(self.makeGroupSummaryDTO(id: "group-1", name: "테스트 그룹"))
+                        return (200, payload)
+                    }
+                    XCTFail("Unexpected path \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+
                 let postType = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
                     .queryItems?
                     .first(where: { $0.name == "postType" })?
@@ -3129,6 +3150,7 @@ final class InhouseMakeriOSTests: XCTestCase {
             }
         )
         let session = AppSessionViewModel(container: container)
+        session.restoreGuestSession()
         let viewModel = RecruitBoardViewModel(session: session)
 
         await viewModel.applyFilters(filterState, reason: .date)
@@ -3156,6 +3178,12 @@ final class InhouseMakeriOSTests: XCTestCase {
     func testHomeViewModelRecruitingFailureKeepsContentAndOmitsUnsupportedQuery() async throws {
         let tokenStore = makeTokenStore()
         await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.recruiting-failure.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
         let requestLock = NSLock()
         var capturedRecruitingURL: URL?
         let historyDate = Date(timeIntervalSince1970: 1_776_643_200)
@@ -3163,6 +3191,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: tokenStore,
+            localStore: localStore,
             urlSession: makeURLSession { request in
                 switch (request.httpMethod, request.url?.path) {
                 case ("GET", "/recruiting-posts"):
@@ -3808,9 +3837,16 @@ final class InhouseMakeriOSTests: XCTestCase {
     func testRecruitDetailViewModelBuildsDisplayStateWithoutRawIdentifiers() async throws {
         let tokenStore = makeTokenStore()
         await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.recruit.detail-display.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+        let localStore = AppLocalStore(defaults: defaults)
         let container = AppContainer(
             configuration: makeConfiguration(),
             tokenStore: tokenStore,
+            localStore: localStore,
             urlSession: makeURLSession { request in
                 switch request.url?.path {
                 case "/recruiting-posts/post-1":
@@ -4806,6 +4842,8 @@ final class InhouseMakeriOSTests: XCTestCase {
                     return (200, payload)
                 case ("GET", "/users/u1/inhouse-history"):
                     return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                case ("GET", "/users/u1/power-profile"):
+                    return (200, try JSONEncoder.app.encode(self.makePowerProfileDTO(userId: "u1")))
                 default:
                     XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
                     return (500, Data())
@@ -6163,6 +6201,18 @@ final class InhouseMakeriOSTests: XCTestCase {
             ownerUserId: "owner",
             memberCount: 10,
             recentMatches: 3
+        )
+    }
+
+    private func makePowerProfileDTO(userId: String = "u1") -> PowerProfileDTO {
+        PowerProfileDTO(
+            userId: userId,
+            overallPower: 80,
+            lanePower: ["MID": 80],
+            primaryPosition: .mid,
+            secondaryPosition: .top,
+            style: PowerProfileDTO.StyleDTO(stability: 80, carry: 80, teamContribution: 80, laneInfluence: 80),
+            version: "test"
         )
     }
 

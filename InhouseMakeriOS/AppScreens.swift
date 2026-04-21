@@ -1761,13 +1761,6 @@ final class RecruitBoardViewModel: ObservableObject {
         }
         guard initialLoadTracker.begin(force: force, trigger: trigger.rawValue) else { return }
         var didSucceed = false
-        defer {
-            initialLoadTracker.finish(success: didSucceed)
-            if let pendingForcedLoadTrigger {
-                self.pendingForcedLoadTrigger = nil
-                Task { await self.load(force: true, trigger: pendingForcedLoadTrigger) }
-            }
-        }
         if force, let current = state.value {
             state = .refreshing(current)
         } else {
@@ -1786,22 +1779,22 @@ final class RecruitBoardViewModel: ObservableObject {
                 query: query,
                 groupRegionsByID: groupMetadata.groupRegionsByID
             )
-            guard requestedType == selectedType, requestedFilterState == filterState else {
+            if requestedType != selectedType || requestedFilterState != filterState {
                 debugRecruitScreen(
                     "discardLoadResult requestedPostType=\(requestedType.rawValue) currentPostType=\(selectedType.rawValue) trigger=\(trigger.rawValue)"
                 )
-                return
+            } else {
+                let snapshot = RecruitBoardSnapshot(
+                    selectedType: requestedType,
+                    filterState: requestedFilterState,
+                    posts: filteredPosts,
+                    groupNamesByID: groupMetadata.groupNamesByID,
+                    groupRegionsByID: groupMetadata.groupRegionsByID
+                )
+                state = filteredPosts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(snapshot)
+                lastLoadedQuery = query
+                didSucceed = true
             }
-            let snapshot = RecruitBoardSnapshot(
-                selectedType: requestedType,
-                filterState: requestedFilterState,
-                posts: filteredPosts,
-                groupNamesByID: groupMetadata.groupNamesByID,
-                groupRegionsByID: groupMetadata.groupRegionsByID
-            )
-            state = filteredPosts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(snapshot)
-            lastLoadedQuery = query
-            didSucceed = true
         } catch let error as UserFacingError {
             if session.isAuthenticated {
                 session.handleProtectedLoadError(
@@ -1815,6 +1808,11 @@ final class RecruitBoardViewModel: ObservableObject {
             }
         } catch {
             state = .error(UserFacingError(title: "모집 로딩 실패", message: "모집 목록을 불러오지 못했습니다."))
+        }
+        initialLoadTracker.finish(success: didSucceed)
+        if let pendingForcedLoadTrigger {
+            self.pendingForcedLoadTrigger = nil
+            await load(force: true, trigger: pendingForcedLoadTrigger)
         }
     }
 
@@ -3939,6 +3937,9 @@ final class GroupDetailViewModel: ObservableObject {
     private func message(for errorType: GroupDetailMutationErrorType, operation: String, error: UserFacingError) -> String {
         if error.isGroupNotFoundResource {
             return error.message
+        }
+        if operation == "delete", error.normalizedCode == "GROUP_DELETE_ENDPOINT_NOT_READY" {
+            return "이미 삭제되었거나 서버에서 삭제 기능을 아직 지원하지 않습니다."
         }
 
         switch (operation, errorType) {
