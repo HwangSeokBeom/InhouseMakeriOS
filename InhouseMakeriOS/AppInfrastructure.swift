@@ -136,6 +136,7 @@ struct AppConfiguration {
 enum AppExternalLink: String, CaseIterable, Identifiable {
     case product
     case support
+    case serviceTerms
     case terms
     case privacy
     case openSource
@@ -148,6 +149,8 @@ enum AppExternalLink: String, CaseIterable, Identifiable {
             return "InhouseMaker"
         case .support:
             return "문의하기"
+        case .serviceTerms:
+            return "서비스 이용약관"
         case .terms:
             return "이용약관"
         case .privacy:
@@ -163,6 +166,8 @@ enum AppExternalLink: String, CaseIterable, Identifiable {
             return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal")!
         case .support:
             return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/support.html")!
+        case .serviceTerms:
+            return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/")!
         case .terms:
             return URL(string: "https://hwangseokbeom.github.io/InhouseMaker-legal/community.html")!
         case .privacy:
@@ -2146,9 +2151,6 @@ struct EmailSignUpRequestDTO: Encodable {
     let email: String
     let password: String
     let nickname: String
-    let agreedToTerms: Bool
-    let agreedToPrivacy: Bool
-    let agreedToMarketing: Bool?
 }
 
 struct EmailLoginRequestDTO: Encodable {
@@ -4062,10 +4064,7 @@ final class AuthRepository {
     func signUpWithEmail(
         email: String,
         password: String,
-        nickname: String,
-        agreedToTerms: Bool,
-        agreedToPrivacy: Bool,
-        agreedToMarketing: Bool?
+        nickname: String
     ) async throws -> AuthTokens {
         do {
             let response: AuthTokensDTO = try await apiClient.send(
@@ -4075,10 +4074,7 @@ final class AuthRepository {
                     EmailSignUpRequestDTO(
                         email: email,
                         password: password,
-                        nickname: nickname,
-                        agreedToTerms: agreedToTerms,
-                        agreedToPrivacy: agreedToPrivacy,
-                        agreedToMarketing: agreedToMarketing
+                        nickname: nickname
                     )
                 ),
                 requiresAuth: false

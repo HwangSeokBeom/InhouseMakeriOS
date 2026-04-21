@@ -1087,29 +1087,6 @@ enum FieldValidationState: Equatable {
     }
 }
 
-struct EmailAuthTermsState: Equatable {
-    var hasAcceptedServiceTerms = false
-    var hasAcceptedPrivacyPolicy = false
-    var hasAcceptedMarketing = false
-    var hasAttemptedValidation = false
-
-    var hasAcceptedRequiredTerms: Bool {
-        hasAcceptedServiceTerms && hasAcceptedPrivacyPolicy
-    }
-
-    var isAllSelected: Bool {
-        hasAcceptedServiceTerms && hasAcceptedPrivacyPolicy && hasAcceptedMarketing
-    }
-
-    var validationState: FieldValidationState {
-        guard hasAttemptedValidation else { return .idle }
-        if hasAcceptedRequiredTerms {
-            return .valid("필수 약관 동의가 완료되었습니다")
-        }
-        return .invalid("서비스 이용약관과 개인정보 처리방침에 동의해 주세요")
-    }
-}
-
 enum EmailSignUpField: Hashable {
     case email
     case password
@@ -1135,7 +1112,6 @@ struct EmailSignUpFormState: Equatable {
     var hasEditedPassword = false
     var hasEditedPasswordConfirmation = false
     var hasEditedNickname = false
-    var termsState = EmailAuthTermsState()
     var isPasswordVisible = false
     var isPasswordConfirmationVisible = false
     var formError: PresentationError?
@@ -1147,7 +1123,6 @@ struct EmailSignUpFormState: Equatable {
             passwordValidation.isValid &&
             passwordConfirmationValidation.isValid &&
             nicknameValidation.isValid &&
-            termsState.hasAcceptedRequiredTerms &&
             !submittingState.isLoading
     }
 }
@@ -1321,28 +1296,6 @@ final class EmailSignUpViewModel: ObservableObject {
         state.isPasswordConfirmationVisible.toggle()
     }
 
-    func toggleAllTerms() {
-        let shouldSelectAll = !state.termsState.isAllSelected
-        state.termsState.hasAcceptedServiceTerms = shouldSelectAll
-        state.termsState.hasAcceptedPrivacyPolicy = shouldSelectAll
-        state.termsState.hasAcceptedMarketing = shouldSelectAll
-        if state.termsState.hasAttemptedValidation {
-            state.termsState.hasAttemptedValidation = true
-        }
-    }
-
-    func toggleServiceTerms() {
-        state.termsState.hasAcceptedServiceTerms.toggle()
-    }
-
-    func togglePrivacyTerms() {
-        state.termsState.hasAcceptedPrivacyPolicy.toggle()
-    }
-
-    func toggleMarketingTerms() {
-        state.termsState.hasAcceptedMarketing.toggle()
-    }
-
     func submit() async {
         clearSubmissionFeedback()
         validateAll(force: true)
@@ -1356,10 +1309,7 @@ final class EmailSignUpViewModel: ObservableObject {
             let tokens = try await session.container.authRepository.signUpWithEmail(
                 email: EmailAuthValidator.normalizedEmail(state.email),
                 password: state.password,
-                nickname: EmailAuthValidator.normalizedNickname(state.nickname),
-                agreedToTerms: state.termsState.hasAcceptedServiceTerms,
-                agreedToPrivacy: state.termsState.hasAcceptedPrivacyPolicy,
-                agreedToMarketing: state.termsState.hasAcceptedMarketing
+                nickname: EmailAuthValidator.normalizedNickname(state.nickname)
             )
             _ = try await session.completeAuthenticatedSession(tokens: tokens, event: .emailSignUp)
             state.submittingState = .idle
@@ -1394,7 +1344,7 @@ final class EmailSignUpViewModel: ObservableObject {
             state.passwordValidation = .invalid(message ?? "비밀번호 조건을 만족해 주세요")
             return
         case .requiredTermsNotAgreed:
-            state.termsState.hasAttemptedValidation = true
+            state.formError = authError.presentationError
             return
         case let .invalidPayload(issues, message):
             if applyServerValidationIssues(issues) {
@@ -1438,7 +1388,6 @@ final class EmailSignUpViewModel: ObservableObject {
             state.hasEditedPassword = true
             state.hasEditedPasswordConfirmation = true
             state.hasEditedNickname = true
-            state.termsState.hasAttemptedValidation = true
         }
         validate(field: .email)
         validate(field: .password)
@@ -1490,9 +1439,6 @@ final class EmailSignUpViewModel: ObservableObject {
                 appliedFieldError = true
             case "nickname":
                 state.nicknameValidation = .invalid(issue.message)
-                appliedFieldError = true
-            case "agreedToTerms", "agreedToPrivacy":
-                state.termsState.hasAttemptedValidation = true
                 appliedFieldError = true
             default:
                 if !issue.message.isEmpty {
@@ -2223,6 +2169,8 @@ private struct EmailSignUpScreen: View {
     @ObservedObject var viewModel: EmailSignUpViewModel
     let onSwitchToLogin: () -> Void
     @FocusState private var focusedField: EmailSignUpField?
+    @State private var activeLegalLink: AppExternalLink?
+    @State private var legalLinkErrorMessage: String?
 
     var body: some View {
         ScrollView(showsIndicators: false) {
@@ -2316,7 +2264,9 @@ private struct EmailSignUpScreen: View {
                     )
                 }
 
-                TermsAgreementCard(viewModel: viewModel)
+                SignupLegalDocumentLinks { link in
+                    activeLegalLink = link
+                }
 
                 VStack(spacing: 14) {
                     AuthDividerLabel(title: "또는 소셜로 빠르게 시작")
@@ -2345,6 +2295,29 @@ private struct EmailSignUpScreen: View {
         .onChange(of: focusedField) { previousField, currentField in
             viewModel.handleFocusChange(from: previousField, to: currentField)
         }
+        .sheet(item: $activeLegalLink) { link in
+            SafariSheetView(link: link) {
+                handleLegalLinkLoadFailure(link)
+            }
+            .ignoresSafeArea()
+        }
+        .alert(
+            "문서를 열 수 없습니다",
+            isPresented: Binding(
+                get: { legalLinkErrorMessage != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        legalLinkErrorMessage = nil
+                    }
+                }
+            )
+        ) {
+            Button("확인", role: .cancel) {
+                legalLinkErrorMessage = nil
+            }
+        } message: {
+            Text(legalLinkErrorMessage ?? "잠시 후 다시 시도해 주세요.")
+        }
         .safeAreaInset(edge: .bottom) {
             VStack(spacing: 10) {
                 Button {
@@ -2366,6 +2339,11 @@ private struct EmailSignUpScreen: View {
                 AuthBlockingProgressView(title: viewModel.state.submittingState.title ?? "회원가입 중입니다")
             }
         }
+    }
+
+    private func handleLegalLinkLoadFailure(_ link: AppExternalLink) {
+        activeLegalLink = nil
+        legalLinkErrorMessage = "\(link.title) 페이지를 열지 못했습니다. 네트워크 상태를 확인한 뒤 다시 시도해 주세요."
     }
 }
 
@@ -2485,103 +2463,45 @@ private struct EmailLoginScreen: View {
     }
 }
 
-private struct TermsAgreementCard: View {
-    @ObservedObject var viewModel: EmailSignUpViewModel
+private struct SignupLegalDocumentLinks: View {
+    let onOpen: (AppExternalLink) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Button {
-                viewModel.toggleAllTerms()
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: viewModel.state.termsState.isAllSelected ? "checkmark.circle.fill" : "circle")
-                        .foregroundStyle(viewModel.state.termsState.isAllSelected ? AppPalette.accentBlue : AppPalette.textMuted)
-                    Text("전체 동의")
-                        .font(AppTypography.body(15, weight: .semibold))
-                        .foregroundStyle(AppPalette.textPrimary)
-                    Spacer()
-                    Text("필수 + 선택")
-                        .font(AppTypography.body(11))
-                        .foregroundStyle(AppPalette.textMuted)
-                }
-            }
-            .buttonStyle(.plain)
-
-            Divider()
-                .overlay(AppPalette.border)
-
-            VStack(spacing: 12) {
-                TermsAgreementRow(
-                    title: "서비스 이용약관 동의",
-                    isRequired: true,
-                    isAccepted: viewModel.state.termsState.hasAcceptedServiceTerms,
-                    action: { viewModel.toggleServiceTerms() }
-                )
-                TermsAgreementRow(
-                    title: "개인정보 처리방침 동의",
-                    isRequired: true,
-                    isAccepted: viewModel.state.termsState.hasAcceptedPrivacyPolicy,
-                    action: { viewModel.togglePrivacyTerms() }
-                )
-                TermsAgreementRow(
-                    title: "마케팅 수신 동의",
-                    isRequired: false,
-                    isAccepted: viewModel.state.termsState.hasAcceptedMarketing,
-                    action: { viewModel.toggleMarketingTerms() }
-                )
-            }
-
-            ValidationMessageRow(
-                state: viewModel.state.termsState.validationState,
-                helperText: "필수 약관 2개에 동의하면 회원가입 버튼이 활성화됩니다"
-            )
-        }
-        .padding(18)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(AppPalette.bgCard)
-        .overlay(
-            RoundedRectangle(cornerRadius: 18)
-                .stroke(AppPalette.border, lineWidth: 1)
-        )
-        .clipShape(RoundedRectangle(cornerRadius: 18))
-    }
-}
-
-private struct TermsAgreementRow: View {
-    let title: String
-    let isRequired: Bool
-    let isAccepted: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
+        ViewThatFits(in: .horizontal) {
             HStack(spacing: 12) {
-                Image(systemName: isAccepted ? "checkmark.square.fill" : "square")
-                    .foregroundStyle(isAccepted ? AppPalette.accentBlue : AppPalette.textMuted)
-                Text(title)
-                    .font(AppTypography.body(14))
-                    .foregroundStyle(AppPalette.textPrimary)
-                if isRequired {
-                    Text("필수")
-                        .font(AppTypography.body(10, weight: .semibold))
-                        .foregroundStyle(AppPalette.accentOrange)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(AppPalette.accentOrange.opacity(0.14))
-                        .clipShape(Capsule())
-                } else {
-                    Text("선택")
-                        .font(AppTypography.body(10, weight: .semibold))
-                        .foregroundStyle(AppPalette.textMuted)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(AppPalette.bgSecondary)
-                        .clipShape(Capsule())
-                }
-                Spacer()
+                legalLinkButton(title: "서비스 이용약관 보기", systemImage: "doc.text", link: .serviceTerms)
+                separator
+                legalLinkButton(title: "개인정보 처리방침 보기", systemImage: "doc.badge.shield", link: .privacy)
             }
+
+            VStack(alignment: .leading, spacing: 10) {
+                legalLinkButton(title: "서비스 이용약관 보기", systemImage: "doc.text", link: .serviceTerms)
+                legalLinkButton(title: "개인정보 처리방침 보기", systemImage: "doc.badge.shield", link: .privacy)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 2)
+    }
+
+    private var separator: some View {
+        Circle()
+            .fill(AppPalette.textMuted.opacity(0.55))
+            .frame(width: 3, height: 3)
+    }
+
+    private func legalLinkButton(title: String, systemImage: String, link: AppExternalLink) -> some View {
+        Button {
+            onOpen(link)
+        } label: {
+            Label(title, systemImage: systemImage)
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(AppPalette.accentBlue.opacity(0.86))
+                .labelStyle(.titleAndIcon)
+                .lineLimit(1)
+                .minimumScaleFactor(0.9)
         }
         .buttonStyle(.plain)
+        .accessibilityLabel(title)
     }
 }
 
