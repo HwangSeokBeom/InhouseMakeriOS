@@ -97,6 +97,249 @@ extension View {
     }
 }
 
+enum BottomActionSheetActionRole {
+    case regular
+    case destructive
+    case cancel
+}
+
+struct BottomActionSheetAction: Identifiable {
+    let id: String
+    let title: String
+    var role: BottomActionSheetActionRole = .regular
+    var accessibilityIdentifier: String? = nil
+    let action: () -> Void
+
+    init(
+        id: String,
+        title: String,
+        role: BottomActionSheetActionRole = .regular,
+        accessibilityIdentifier: String? = nil,
+        action: @escaping () -> Void
+    ) {
+        self.id = id
+        self.title = title
+        self.role = role
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.action = action
+    }
+}
+
+struct BottomSheetHeader: View {
+    let title: String
+    var titleAccessibilityIdentifier: String? = nil
+    var closeAccessibilityIdentifier: String? = nil
+    var showsCloseButton = true
+    var onClose: (() -> Void)? = nil
+
+    var body: some View {
+        ZStack {
+            Text(title)
+                .font(AppTypography.heading(18, weight: .semibold))
+                .foregroundStyle(AppPalette.textPrimary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .accessibilityIdentifier(titleAccessibilityIdentifier ?? "")
+
+            HStack {
+                Spacer()
+                if showsCloseButton, let onClose {
+                    Button(action: onClose) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(AppPalette.textMuted)
+                            .frame(width: 28, height: 28)
+                            .background(AppPalette.bgTertiary.opacity(0.92))
+                            .clipShape(Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("시트 닫기")
+                    .accessibilityIdentifier(closeAccessibilityIdentifier ?? "")
+                }
+            }
+        }
+        .frame(height: 32)
+    }
+}
+
+struct BottomActionSheet: View {
+    let title: String?
+    let message: String?
+    let accessibilityIdentifier: String?
+    let actions: [BottomActionSheetAction]
+    let onDismiss: () -> Void
+
+    @GestureState private var dragOffset: CGFloat = 0
+
+    init(
+        title: String? = nil,
+        message: String? = nil,
+        accessibilityIdentifier: String? = nil,
+        actions: [BottomActionSheetAction],
+        onDismiss: @escaping () -> Void
+    ) {
+        self.title = title
+        self.message = message
+        self.accessibilityIdentifier = accessibilityIdentifier
+        self.actions = actions
+        self.onDismiss = onDismiss
+    }
+
+    private var primaryActions: [BottomActionSheetAction] {
+        actions.filter { $0.role != .cancel }
+    }
+
+    private var cancelAction: BottomActionSheetAction? {
+        actions.first { $0.role == .cancel }
+    }
+
+    private var showsHeader: Bool {
+        title != nil || message != nil
+    }
+
+    var body: some View {
+        GeometryReader { geometry in
+            ZStack(alignment: .bottom) {
+                Color.black.opacity(0.62)
+                    .ignoresSafeArea()
+                    .onTapGesture(perform: dismiss)
+
+                contentStack(geometry: geometry)
+                    .offset(y: dragOffset)
+                    .gesture(
+                        DragGesture(minimumDistance: 10)
+                            .updating($dragOffset) { value, state, _ in
+                                if value.translation.height > 0 {
+                                    state = value.translation.height
+                                }
+                            }
+                            .onEnded { value in
+                                if value.translation.height > 120 {
+                                    dismiss()
+                                }
+                            }
+                    )
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func contentStack(geometry: GeometryProxy) -> some View {
+        let stack = VStack(spacing: 12) {
+            primaryActionSection
+
+            if let cancelAction {
+                actionRow(cancelAction, standalone: true)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(maxHeight: min(geometry.size.height - 20, 420), alignment: .bottom)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 10)
+
+        if let accessibilityIdentifier {
+            stack
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier(accessibilityIdentifier)
+        } else {
+            stack
+        }
+    }
+
+    private var primaryActionSection: some View {
+        VStack(spacing: 0) {
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.18))
+                .frame(width: 38, height: 5)
+                .padding(.top, 10)
+                .padding(.bottom, showsHeader ? 14 : 12)
+
+            if showsHeader {
+                VStack(spacing: 6) {
+                    if let title {
+                        Text(title)
+                            .font(AppTypography.body(13, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                    }
+                    if let message {
+                        Text(message)
+                            .font(AppTypography.body(12))
+                            .foregroundStyle(AppPalette.textSecondary)
+                            .multilineTextAlignment(.center)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 12)
+            }
+
+            VStack(spacing: 0) {
+                ForEach(Array(primaryActions.enumerated()), id: \.element.id) { index, action in
+                    if index > 0 {
+                        Rectangle()
+                            .fill(AppPalette.border.opacity(0.9))
+                            .frame(height: 1)
+                            .padding(.horizontal, 18)
+                    }
+                    actionRow(action, standalone: false)
+                }
+            }
+        }
+        .background(AppPalette.bgSecondary)
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .stroke(Color.white.opacity(0.06), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+    }
+
+    @ViewBuilder
+    private func actionRow(_ action: BottomActionSheetAction, standalone: Bool) -> some View {
+        let button = Button {
+            dismiss()
+            Task { @MainActor in
+                action.action()
+            }
+        } label: {
+            Text(action.title)
+                .font(AppTypography.body(16, weight: action.role == .cancel ? .semibold : .regular))
+                .foregroundStyle(titleColor(for: action.role))
+                .frame(maxWidth: .infinity)
+                .frame(height: 56)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+
+        if let accessibilityIdentifier = action.accessibilityIdentifier {
+            button
+                .background(standalone ? AppPalette.bgCard : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: standalone ? 18 : 0, style: .continuous))
+                .accessibilityIdentifier(accessibilityIdentifier)
+        } else {
+            button
+                .background(standalone ? AppPalette.bgCard : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: standalone ? 18 : 0, style: .continuous))
+        }
+    }
+
+    private func titleColor(for role: BottomActionSheetActionRole) -> Color {
+        switch role {
+        case .regular, .cancel:
+            return AppPalette.textPrimary
+        case .destructive:
+            return AppPalette.accentRed
+        }
+    }
+
+    private func dismiss() {
+        withAnimation(.spring(response: 0.34, dampingFraction: 0.9)) {
+            onDismiss()
+        }
+    }
+}
+
 struct StatusBarView: View {
     var body: some View {
         EmptyView()

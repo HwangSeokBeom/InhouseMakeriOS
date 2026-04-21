@@ -1,0 +1,370 @@
+{
+  "object" : {
+    "artifacts" : [
+
+    ],
+    "dependencies" : [
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "app-check",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/google/app-check.git",
+          "name" : "app-check"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "61b85103a1aeed8218f17c794687781505fbbef5",
+            "version" : "11.2.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "app-check"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "appauth-ios",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/openid/AppAuth-iOS.git",
+          "name" : "AppAuth-iOS"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "145104f5ea9d58ae21b60add007c33c1cc0c948e",
+            "version" : "2.0.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "AppAuth-iOS"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "combine-schedulers",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/combine-schedulers",
+          "name" : "combine-schedulers"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "fd16d76fd8b9a976d88bfb6cacc05ca8d19c91b6",
+            "version" : "1.1.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "combine-schedulers"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "googlesignin-ios",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/google/GoogleSignIn-iOS.git",
+          "name" : "GoogleSignIn-iOS"
+        },
+        "state" : {
+          "checkoutState" : {
+            "branch" : "main",
+            "revision" : "197d23b25b2998fea4b9a584b9ba9d3929440f0f"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "GoogleSignIn-iOS"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "googleutilities",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/google/GoogleUtilities.git",
+          "name" : "GoogleUtilities"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "60da361632d0de02786f709bdc0c4df340f7613e",
+            "version" : "8.1.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "GoogleUtilities"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "gtm-session-fetcher",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/google/gtm-session-fetcher.git",
+          "name" : "gtm-session-fetcher"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "a2ab612cb980066ee56d90d60d8462992c07f24b",
+            "version" : "3.5.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "gtm-session-fetcher"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "gtmappauth",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/google/GTMAppAuth.git",
+          "name" : "GTMAppAuth"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "56e0ccf09a6dd29dc7e68bdf729598240ca8aa16",
+            "version" : "5.0.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "GTMAppAuth"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "promises",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/google/promises.git",
+          "name" : "promises"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "540318ecedd63d883069ae7f1ed811a2df00b6ac",
+            "version" : "2.4.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "promises"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-case-paths",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-case-paths",
+          "name" : "swift-case-paths"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "206cbce3882b4de9aee19ce62ac5b7306cadd45b",
+            "version" : "1.7.3"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-case-paths"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-clocks",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-clocks",
+          "name" : "swift-clocks"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "cc46202b53476d64e824e0b6612da09d84ffde8e",
+            "version" : "1.0.6"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-clocks"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-collections",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/apple/swift-collections",
+          "name" : "swift-collections"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "6675bc0ff86e61436e615df6fc5174e043e57924",
+            "version" : "1.4.1"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-collections"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-composable-architecture",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-composable-architecture.git",
+          "name" : "swift-composable-architecture"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "1eaa6fa2ee57ac42843283b9fd3457af408c858d",
+            "version" : "1.25.5"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-composable-architecture"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-concurrency-extras",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-concurrency-extras",
+          "name" : "swift-concurrency-extras"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "5a3825302b1a0d744183200915a47b508c828e6f",
+            "version" : "1.3.2"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-concurrency-extras"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-custom-dump",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-custom-dump",
+          "name" : "swift-custom-dump"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "06c57924455064182d6b217f06ebc05d00cb2990",
+            "version" : "1.5.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-custom-dump"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-dependencies",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-dependencies",
+          "name" : "swift-dependencies"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "706feb7858a7f6c242879d137b8ee30926aa5b26",
+            "version" : "1.12.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-dependencies"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-identified-collections",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-identified-collections",
+          "name" : "swift-identified-collections"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "322d9ffeeba85c9f7c4984b39422ec7cc3c56597",
+            "version" : "1.1.1"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-identified-collections"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-navigation",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-navigation",
+          "name" : "swift-navigation"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "32f35241b8be0719c4c7f00eb27713b1cadb6248",
+            "version" : "2.8.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-navigation"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-perception",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-perception",
+          "name" : "swift-perception"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "25ac73741c3436605d61eceb5207e896973918e7",
+            "version" : "2.0.10"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-perception"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-sharing",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/swift-sharing",
+          "name" : "swift-sharing"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "bc27f8322bc30f6ce7d864d137dc77a6de8b57eb",
+            "version" : "2.8.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-sharing"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "swift-syntax",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/swiftlang/swift-syntax",
+          "name" : "swift-syntax"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "2b59c0c741e9184ab057fd22950b491076d42e91",
+            "version" : "603.0.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "swift-syntax"
+      },
+      {
+        "basedOn" : null,
+        "packageRef" : {
+          "identity" : "xctest-dynamic-overlay",
+          "kind" : "remoteSourceControl",
+          "location" : "https://github.com/pointfreeco/xctest-dynamic-overlay",
+          "name" : "xctest-dynamic-overlay"
+        },
+        "state" : {
+          "checkoutState" : {
+            "revision" : "dfd70507def84cb5fb821278448a262c6ff2bbad",
+            "version" : "1.9.0"
+          },
+          "name" : "sourceControlCheckout"
+        },
+        "subpath" : "xctest-dynamic-overlay"
+      }
+    ],
+    "prebuilts" : [
+
+    ]
+  },
+  "version" : 7
+}

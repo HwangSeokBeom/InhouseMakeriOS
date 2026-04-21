@@ -839,6 +839,15 @@ enum MatchStatus: String, Codable, Hashable {
     case confirmed = "CONFIRMED"
     case disputed = "DISPUTED"
     case closed = "CLOSED"
+
+    var countsAsCompletedGroupHistory: Bool {
+        switch self {
+        case .confirmed, .closed:
+            return true
+        case .draft, .recruiting, .locked, .balanced, .inProgress, .resultPending, .disputed:
+            return false
+        }
+    }
 }
 
 enum TeamSide: String, Codable, Hashable {
@@ -2203,6 +2212,7 @@ struct GroupSummary: Codable, Hashable, Identifiable {
     let inviteMembersBlockedReason: String?
     let memberCount: Int
     let recentMatches: Int
+    let recentMatchCountSource: GroupMatchCountSource
 
     init(
         id: String,
@@ -2216,7 +2226,8 @@ struct GroupSummary: Codable, Hashable, Identifiable {
         canInviteMembers: Bool? = nil,
         inviteMembersBlockedReason: String? = nil,
         memberCount: Int,
-        recentMatches: Int
+        recentMatches: Int,
+        recentMatchCountSource: GroupMatchCountSource = .completedHistory
     ) {
         self.id = id
         self.name = name
@@ -2230,6 +2241,7 @@ struct GroupSummary: Codable, Hashable, Identifiable {
         self.inviteMembersBlockedReason = inviteMembersBlockedReason
         self.memberCount = memberCount
         self.recentMatches = recentMatches
+        self.recentMatchCountSource = recentMatchCountSource
     }
 
     var isPubliclyVisible: Bool {
@@ -2238,6 +2250,92 @@ struct GroupSummary: Codable, Hashable, Identifiable {
 
     func isAccessible(knownMember: Bool = false) -> Bool {
         isPubliclyVisible || isMember == true || knownMember
+    }
+}
+
+enum GroupMatchCountSource: String, Codable, Hashable {
+    case completedHistory = "completed_history"
+    case legacyRecentMatches = "legacy_recent_matches"
+    case legacyAdjustedByLobbyCount = "legacy_adjusted_by_lobby_count"
+
+    var needsPendingLobbyCorrection: Bool {
+        self == .legacyRecentMatches
+    }
+}
+
+enum GroupCompletedInhouseDisplayState: Hashable {
+    case confirmedCount(Int)
+    case empty
+    case unverified
+}
+
+struct GroupCompletedInhouseDisplay: Hashable {
+    let state: GroupCompletedInhouseDisplayState
+
+    var recentInhouseText: String {
+        switch state {
+        case let .confirmedCount(count):
+            return "최근 내전: \(count)회 진행"
+        case .empty:
+            return "최근 내전: 기록 없음"
+        case .unverified:
+            return "최근 내전: 기록 확인 중"
+        }
+    }
+
+    var summaryText: String {
+        switch state {
+        case let .confirmedCount(count):
+            return "최근 내전 \(count)회"
+        case .empty:
+            return "최근 내전 기록 없음"
+        case .unverified:
+            return "최근 내전 확인 중"
+        }
+    }
+
+    var statValueText: String {
+        switch state {
+        case let .confirmedCount(count):
+            return String(count)
+        case .empty:
+            return "없음"
+        case .unverified:
+            return "확인 중"
+        }
+    }
+
+    var shouldHighlight: Bool {
+        if case .confirmedCount = state {
+            return true
+        }
+        return false
+    }
+}
+
+enum GroupCompletedInhouseDisplayFormatter {
+    static func makeDisplay(for group: GroupSummary) -> GroupCompletedInhouseDisplay {
+        let sanitizedCount = max(group.recentMatches, 0)
+        switch group.recentMatchCountSource {
+        case .completedHistory:
+            guard sanitizedCount > 0 else {
+                return GroupCompletedInhouseDisplay(state: .empty)
+            }
+            return GroupCompletedInhouseDisplay(state: .confirmedCount(sanitizedCount))
+        case .legacyRecentMatches, .legacyAdjustedByLobbyCount:
+            // TODO: Remove this neutral fallback once the groups API guarantees an explicit
+            // completed-history field for group cards and related summaries.
+            guard sanitizedCount > 0 else {
+                return GroupCompletedInhouseDisplay(state: .empty)
+            }
+            return GroupCompletedInhouseDisplay(state: .unverified)
+        }
+    }
+}
+
+extension GroupSummary {
+    var completedInhouseDisplay: GroupCompletedInhouseDisplay {
+        GroupCompletedInhouseDisplayFormatter.makeDisplay(for: self)
     }
 }
 
@@ -2920,12 +3018,23 @@ struct RiotAccountSnapshot: Equatable {
     let accounts: [RiotAccount]
 }
 
+struct RecruitBoardPostItem: Equatable, Identifiable {
+    let post: RecruitPost
+    let canShowOverflowMenu: Bool
+
+    var id: String { post.id }
+}
+
 struct RecruitBoardSnapshot: Equatable {
     let selectedType: RecruitingPostType
     let filterState: RecruitBoardFilterState
-    let posts: [RecruitPost]
+    let items: [RecruitBoardPostItem]
     let groupNamesByID: [String: String]
     let groupRegionsByID: [String: String]
+
+    var posts: [RecruitPost] {
+        items.map(\.post)
+    }
 }
 
 enum HistoryContentState: Equatable {

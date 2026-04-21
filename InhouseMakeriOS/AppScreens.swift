@@ -1784,7 +1784,7 @@ final class RecruitBoardViewModel: ObservableObject {
                     "discardLoadResult requestedPostType=\(requestedType.rawValue) currentPostType=\(selectedType.rawValue) trigger=\(trigger.rawValue)"
                 )
             } else {
-                let snapshot = RecruitBoardSnapshot(
+                let snapshot = makeRecruitBoardSnapshot(
                     selectedType: requestedType,
                     filterState: requestedFilterState,
                     posts: filteredPosts,
@@ -1891,8 +1891,8 @@ final class RecruitBoardViewModel: ObservableObject {
         debugRecruitScreen("createSuccess postId=\(post.id) postType=\(post.postType.rawValue)")
         _ = updateSelectedTypeIfNeeded(post.postType, reason: .createSuccess)
         guard filterState.isDefault else { return }
-        let existingPosts = currentPosts(for: post.postType)
-        let mergedPosts = [post] + existingPosts.filter { $0.id != post.id }
+        let existingItems = currentPostItems(for: post.postType)
+        let mergedItems = [makeRecruitBoardPostItem(from: post, canShowOverflowMenu: false)] + existingItems.filter { $0.id != post.id }
         let existingSnapshot = currentSnapshot(for: post.postType)
         var groupNamesByID = existingSnapshot?.groupNamesByID ?? [:]
         if let groupName = session.container.localStore.groupName(for: post.groupID) {
@@ -1902,7 +1902,7 @@ final class RecruitBoardViewModel: ObservableObject {
             RecruitBoardSnapshot(
                 selectedType: post.postType,
                 filterState: filterState,
-                posts: mergedPosts,
+                items: mergedItems,
                 groupNamesByID: groupNamesByID,
                 groupRegionsByID: existingSnapshot?.groupRegionsByID ?? [:]
             )
@@ -1914,17 +1914,17 @@ final class RecruitBoardViewModel: ObservableObject {
         actionState = .success("모집글이 수정되었습니다")
 
         guard selectedType == post.postType, let snapshot = currentSnapshot(for: selectedType) else { return }
-        let updatedPosts = snapshot.posts.map { existingPost in
-            existingPost.id == post.id ? post : existingPost
+        let updatedItems = snapshot.items.map { existingItem in
+            existingItem.post.id == post.id ? makeRecruitBoardPostItem(from: post) : existingItem
         }
         let updatedSnapshot = RecruitBoardSnapshot(
             selectedType: snapshot.selectedType,
             filterState: snapshot.filterState,
-            posts: updatedPosts,
+            items: updatedItems,
             groupNamesByID: snapshot.groupNamesByID,
             groupRegionsByID: snapshot.groupRegionsByID
         )
-        state = updatedPosts.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(updatedSnapshot)
+        state = updatedItems.isEmpty ? .empty("현재 조건에 맞는 모집글이 없습니다.") : .content(updatedSnapshot)
         Task { await load(force: true, trigger: .postUpdated) }
     }
 
@@ -1934,20 +1934,97 @@ final class RecruitBoardViewModel: ObservableObject {
 
         guard selectedType == post.postType, let snapshot = currentSnapshot(for: selectedType) else { return }
 
-        let remainingPosts = snapshot.posts.filter { $0.id != post.id }
-        state = remainingPosts.isEmpty
+        let remainingItems = snapshot.items.filter { $0.post.id != post.id }
+        state = remainingItems.isEmpty
             ? .empty("현재 조건에 맞는 모집글이 없습니다.")
             : .content(
                 RecruitBoardSnapshot(
                     selectedType: selectedType,
                     filterState: filterState,
-                    posts: remainingPosts,
+                    items: remainingItems,
                     groupNamesByID: snapshot.groupNamesByID,
                     groupRegionsByID: snapshot.groupRegionsByID
                 )
             )
 
         Task { await load(force: true, trigger: .postDeleted) }
+    }
+
+    func canManage(_ post: RecruitPost) -> Bool {
+        guard
+            let currentUserID = session.currentUserID,
+            let createdBy = normalizedRecruitAuthor(post.createdBy)
+        else {
+            return false
+        }
+        return createdBy == currentUserID
+    }
+
+    func updatePost(
+        _ post: RecruitPost,
+        title: String,
+        body: String,
+        tags: [String],
+        scheduledAt: Date?,
+        positions: [String]
+    ) async -> RecruitPost? {
+        guard canManage(post) else {
+            actionState = .failure("작성자 본인만 모집글을 수정할 수 있습니다.")
+            return nil
+        }
+
+        actionState = .inProgress("모집글을 수정하는 중입니다")
+
+        do {
+            let updatedPost = try await session.container.recruitingRepository.update(
+                postID: post.id,
+                type: post.postType,
+                title: title,
+                body: body.isEmpty ? nil : body,
+                tags: tags,
+                scheduledAt: scheduledAt,
+                requiredPositions: positions
+            )
+            actionState = .success("모집글이 수정되었습니다")
+            return updatedPost
+        } catch let error as UserFacingError {
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .recruitingWrite)
+                return nil
+            }
+            actionState = .failure(recruitMutationMessage(for: error, operation: "update"))
+            return nil
+        } catch {
+            actionState = .failure("모집글 수정에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            return nil
+        }
+    }
+
+    func deletePost(_ post: RecruitPost) async -> RecruitPost? {
+        guard canManage(post) else {
+            actionState = .failure("작성자 본인만 모집글을 삭제할 수 있습니다.")
+            return nil
+        }
+
+        actionState = .inProgress("모집글을 삭제하는 중입니다")
+
+        do {
+            try await session.container.recruitingRepository.delete(postID: post.id)
+            actionState = .success("모집글이 삭제되었습니다")
+            return post
+        } catch let error as UserFacingError {
+            if error.requiresAuthentication {
+                actionState = .idle
+                session.requireReauthentication(for: .recruitingWrite)
+                return nil
+            }
+            actionState = .failure(recruitMutationMessage(for: error, operation: "delete"))
+            return nil
+        } catch {
+            actionState = .failure("모집글 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요.")
+            return nil
+        }
     }
 
     func reset() {
@@ -2008,14 +2085,67 @@ final class RecruitBoardViewModel: ObservableObject {
         debugRecruitScreen("selectedPostType changed \(oldValue.rawValue) -> \(storedType.rawValue) reason=\(reason.rawValue)")
     }
 
-    private func currentPosts(for type: RecruitingPostType) -> [RecruitPost] {
+    private func currentPostItems(for type: RecruitingPostType) -> [RecruitBoardPostItem] {
         guard let snapshot = currentSnapshot(for: type) else { return [] }
-        return snapshot.posts
+        return snapshot.items
     }
 
     private func currentSnapshot(for type: RecruitingPostType) -> RecruitBoardSnapshot? {
         guard let snapshot = state.value, snapshot.selectedType == type else { return nil }
         return snapshot
+    }
+
+    private func makeRecruitBoardSnapshot(
+        selectedType: RecruitingPostType,
+        filterState: RecruitBoardFilterState,
+        posts: [RecruitPost],
+        groupNamesByID: [String: String],
+        groupRegionsByID: [String: String]
+    ) -> RecruitBoardSnapshot {
+        RecruitBoardSnapshot(
+            selectedType: selectedType,
+            filterState: filterState,
+            items: posts.map { makeRecruitBoardPostItem(from: $0) },
+            groupNamesByID: groupNamesByID,
+            groupRegionsByID: groupRegionsByID
+        )
+    }
+
+    private func makeRecruitBoardPostItem(
+        from post: RecruitPost,
+        canShowOverflowMenu: Bool? = nil
+    ) -> RecruitBoardPostItem {
+        RecruitBoardPostItem(
+            post: post,
+            canShowOverflowMenu: canShowOverflowMenu ?? canManage(post)
+        )
+    }
+
+    private func normalizedRecruitAuthor(_ rawValue: String?) -> String? {
+        guard let rawValue else { return nil }
+        let trimmedValue = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedValue.isEmpty ? nil : trimmedValue
+    }
+
+    private func recruitMutationMessage(for error: UserFacingError, operation: String) -> String {
+        if error.statusCode == 403 {
+            return operation == "update"
+                ? "작성자 본인만 모집글을 수정할 수 있습니다."
+                : "작성자 본인만 모집글을 삭제할 수 있습니다."
+        }
+        if error.statusCode == 404 {
+            return operation == "update"
+                ? "수정할 모집글을 찾을 수 없습니다."
+                : "이미 삭제되었거나 찾을 수 없는 모집글입니다."
+        }
+        if error.statusCode == 409 {
+            return operation == "update"
+                ? "현재 모집 상태에서는 수정할 수 없습니다."
+                : "현재 모집 상태에서는 삭제할 수 없습니다."
+        }
+        return operation == "update"
+            ? "모집글 수정에 실패했습니다. 잠시 후 다시 시도해 주세요."
+            : "모집글 삭제에 실패했습니다. 잠시 후 다시 시도해 주세요."
     }
 
     private func buildListQuery(for type: RecruitingPostType, filters: RecruitBoardFilterState) -> RecruitPostListQuery {
@@ -3544,6 +3674,7 @@ fileprivate final class HomeRecentMatchesViewModel: ObservableObject {
 
 enum GroupDetailLoadTrigger: String {
     case screenAppear = "screen_appear"
+    case screenReappear = "screen_reappear"
     case retry = "retry"
     case memberInvited = "member_invited"
     case groupUpdated = "group_updated"
@@ -3654,7 +3785,8 @@ final class GroupDetailViewModel: ObservableObject {
             state = .loading
         }
         do {
-            let group = try await session.container.groupRepository.detail(groupID: groupID)
+            let groupResponse = try await session.container.groupRepository.detail(groupID: groupID)
+            let group = await resolvedGroupSummary(from: groupResponse)
             guard isCurrentLoad(loadToken) else { return }
             let members = try await session.container.groupRepository.members(groupID: groupID)
             guard isCurrentLoad(loadToken) else { return }
@@ -4054,7 +4186,8 @@ final class GroupDetailViewModel: ObservableObject {
             canInviteMembers: snapshot.group.canInviteMembers,
             inviteMembersBlockedReason: snapshot.group.inviteMembersBlockedReason,
             memberCount: members.count,
-            recentMatches: snapshot.group.recentMatches
+            recentMatches: snapshot.group.recentMatches,
+            recentMatchCountSource: snapshot.group.recentMatchCountSource
         )
 
         var powerProfiles = snapshot.powerProfiles
@@ -4073,6 +4206,67 @@ final class GroupDetailViewModel: ObservableObject {
         logManagementVisibility(for: updatedSnapshot)
         logRealMemberSnapshot(memberCount: members.count, source: "live", context: GroupDetailLoadTrigger.memberInvited.rawValue)
         debugGroupDetail("group members refreshed count=\(members.count)")
+    }
+
+    private func resolvedGroupSummary(from group: GroupSummary) async -> GroupSummary {
+        guard group.recentMatchCountSource.needsPendingLobbyCorrection, group.recentMatches > 0 else {
+            return group
+        }
+
+        let pendingLobbyCount = await pendingTrackedLobbyCount(for: group.id)
+        guard pendingLobbyCount > 0 else { return group }
+
+        let correctedRecentMatches = max(group.recentMatches - pendingLobbyCount, 0)
+        guard correctedRecentMatches != group.recentMatches else { return group }
+
+        debugGroupDetail(
+            "recent match count corrected groupId=\(group.id) raw=\(group.recentMatches) pendingLobbyCount=\(pendingLobbyCount) corrected=\(correctedRecentMatches)"
+        )
+
+        return GroupSummary(
+            id: group.id,
+            name: group.name,
+            description: group.description,
+            visibility: group.visibility,
+            isMember: group.isMember,
+            joinPolicy: group.joinPolicy,
+            tags: group.tags,
+            ownerUserID: group.ownerUserID,
+            canInviteMembers: group.canInviteMembers,
+            inviteMembersBlockedReason: group.inviteMembersBlockedReason,
+            memberCount: group.memberCount,
+            recentMatches: correctedRecentMatches,
+            recentMatchCountSource: group.recentMatchCountSource
+        )
+    }
+
+    private func pendingTrackedLobbyCount(for groupID: String) async -> Int {
+        let trackedMatchIDs = Array(
+            Set(
+                session.container.localStore.recentMatches
+                    .filter { $0.groupID == groupID }
+                    .map(\.matchID)
+            )
+        )
+        guard !trackedMatchIDs.isEmpty else { return 0 }
+
+        let repository = session.container.matchRepository
+        return await withTaskGroup(of: Bool.self, returning: Int.self) { taskGroup in
+            for matchID in trackedMatchIDs {
+                taskGroup.addTask {
+                    guard let match = try? await repository.detail(matchID: matchID) else { return false }
+                    return !match.status.countsAsCompletedGroupHistory
+                }
+            }
+
+            var pendingCount = 0
+            for await isPendingLobby in taskGroup {
+                if isPendingLobby {
+                    pendingCount += 1
+                }
+            }
+            return pendingCount
+        }
     }
 
     private func canUseGroupContextForRequests(trigger: GroupDetailLoadTrigger) -> Bool {
@@ -7020,7 +7214,7 @@ fileprivate struct HomeGroupsScreen: View {
                                                     .clipShape(Capsule())
                                             }
                                         }
-                                        Text("멤버 \(group.memberCount)명 · 최근 내전 \(group.recentMatches)회")
+                                        Text("멤버 \(group.memberCount)명 · \(group.completedInhouseDisplay.summaryText)")
                                             .font(AppTypography.body(12))
                                             .foregroundStyle(AppPalette.textSecondary)
                                         if let description = group.description, !description.isEmpty {
@@ -7885,6 +8079,21 @@ fileprivate enum RecruitFilterSheet: String, Identifiable {
     var id: String { rawValue }
 }
 
+fileprivate struct GroupMainCardViewState: Hashable, Identifiable {
+    let group: GroupSummary
+    let recentInhouseText: String
+    let highlightsRecentInhouse: Bool
+
+    var id: String { group.id }
+
+    init(group: GroupSummary) {
+        let display = group.completedInhouseDisplay
+        self.group = group
+        self.recentInhouseText = display.recentInhouseText
+        self.highlightsRecentInhouse = display.shouldHighlight
+    }
+}
+
 struct GroupMainScreen: View {
     private enum ActiveSheet: String, Identifiable {
         case createGroup
@@ -7917,28 +8126,30 @@ struct GroupMainScreen: View {
                         }
                     }
                 case let .content(groups), let .refreshing(groups):
+                    let cards = groups.map(GroupMainCardViewState.init)
                     ScrollView(showsIndicators: false) {
                         VStack(spacing: 0) {
                             VStack(spacing: 16) {
-                                ForEach(groups) { group in
+                                ForEach(cards) { card in
                                     Button {
-                                        session.openGroupDetailIfAccessible(group, router: router)
+                                        session.openGroupDetailIfAccessible(card.group, router: router)
                                     } label: {
                                         VStack(alignment: .leading, spacing: 10) {
                                             HStack {
-                                                Text(group.name)
+                                                Text(card.group.name)
                                                     .font(AppTypography.body(16, weight: .semibold))
                                                 Spacer()
-                                                if group.tags.contains("빡겜") {
+                                                if card.group.tags.contains("빡겜") {
                                                     tagBadge("빡겜", tint: AppPalette.accentGreen)
                                                 }
                                             }
-                                            Text("멤버 \(group.memberCount)명 · \(group.tags.joined(separator: " · "))")
+                                            Text("멤버 \(card.group.memberCount)명 · \(card.group.tags.joined(separator: " · "))")
                                                 .font(AppTypography.body(13))
                                                 .foregroundStyle(AppPalette.textSecondary)
-                                            Text("최근 내전: \(group.recentMatches > 0 ? "\(group.recentMatches)회 진행" : "기록 없음")")
+                                            Text(card.recentInhouseText)
                                                 .font(AppTypography.body(12))
-                                                .foregroundStyle(group.recentMatches > 0 ? AppPalette.accentBlue : AppPalette.textMuted)
+                                                .foregroundStyle(card.highlightsRecentInhouse ? AppPalette.accentBlue : AppPalette.textMuted)
+                                                .fixedSize(horizontal: false, vertical: true)
                                         }
                                         .padding(16)
                                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -8102,7 +8313,7 @@ struct GroupDetailScreen: View {
     let onGroupDeleted: (String) -> Void
     @State private var inviteSheetViewModel: GroupMemberInviteViewModel?
     @State private var showsPowerGuideSheet = false
-    @State private var showsManagementDialog = false
+    @State private var showsManagementActionSheet = false
     @State private var showsDeleteConfirmation = false
     @State private var showsEditorSheet = false
     @State private var groupEditorDraft = GroupEditorDraft()
@@ -8113,7 +8324,8 @@ struct GroupDetailScreen: View {
             title: "롤내전모임",
             onBack: router.pop,
             rightSystemImage: viewModel.isEditVisible ? "ellipsis.circle" : nil,
-            onRightTap: { showsManagementDialog = true }
+            rightAccessibilityIdentifier: "groupDetail.overflowButton",
+            onRightTap: { showsManagementActionSheet = true }
         ) {
             switch viewModel.state {
             case .initial:
@@ -8156,7 +8368,7 @@ struct GroupDetailScreen: View {
                             }
                             HStack(spacing: 16) {
                                 statBlock("\(snapshot.group.memberCount)", label: "멤버")
-                                statBlock("\(snapshot.group.recentMatches)", label: "내전")
+                                statBlock(snapshot.group.completedInhouseDisplay.statValueText, label: "지난 내전")
                                 statBlock(snapshot.group.tags.first ?? "-", label: "성향")
                             }
                         }
@@ -8271,6 +8483,10 @@ struct GroupDetailScreen: View {
                 }
             }
         }
+        .onAppear {
+            guard viewModel.state.value != nil else { return }
+            Task { await viewModel.load(force: true, trigger: .screenReappear) }
+        }
         .sheet(item: $inviteSheetViewModel, onDismiss: clearInviteSheet) { inviteSheetViewModel in
             GroupMemberInviteSheet(
                 viewModel: inviteSheetViewModel,
@@ -8312,36 +8528,63 @@ struct GroupDetailScreen: View {
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
         .overlay {
-            if showsPowerGuideSheet {
-                let guide = PowerViewStateBuilder.groupGuide()
-                DimmedBottomSheet(
-                    title: guide.title,
-                    onDismiss: { showsPowerGuideSheet = false },
-                    maxHeightRatio: 0.42
-                ) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        GroupPowerGuideCard(guide: guide)
+            ZStack {
+                if showsPowerGuideSheet {
+                    let guide = PowerViewStateBuilder.groupGuide()
+                    DimmedBottomSheet(
+                        title: guide.title,
+                        onDismiss: { showsPowerGuideSheet = false },
+                        maxHeightRatio: 0.42
+                    ) {
+                        VStack(alignment: .leading, spacing: 16) {
+                            GroupPowerGuideCard(guide: guide)
 
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("안내")
-                                .font(AppTypography.body(13, weight: .semibold))
-                                .foregroundStyle(AppPalette.textPrimary)
-                            Text("그룹 화면에 보이는 값은 멤버 구성이 바뀌지 않도록 비교 기준을 유지하기 위한 그룹 기준 파워예요. 그룹 스냅샷이 아직 없으면 최신 종합 파워로 대체되고, 홈과 프로필에서는 개인 최신 종합 파워를 확인할 수 있어요.")
-                                .font(AppTypography.body(12))
-                                .foregroundStyle(AppPalette.textSecondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("안내")
+                                    .font(AppTypography.body(13, weight: .semibold))
+                                    .foregroundStyle(AppPalette.textPrimary)
+                                Text("그룹 화면에 보이는 값은 멤버 구성이 바뀌지 않도록 비교 기준을 유지하기 위한 그룹 기준 파워예요. 그룹 스냅샷이 아직 없으면 최신 종합 파워로 대체되고, 홈과 프로필에서는 개인 최신 종합 파워를 확인할 수 있어요.")
+                                    .font(AppTypography.body(12))
+                                    .foregroundStyle(AppPalette.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                            .padding(16)
+                            .background(AppPalette.bgCard)
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                         }
-                        .padding(16)
-                        .background(AppPalette.bgCard)
-                        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
                     }
                 }
+
+                if showsManagementActionSheet {
+                    BottomActionSheet(
+                        accessibilityIdentifier: "groupDetail.managementActionSheet",
+                        actions: [
+                            BottomActionSheetAction(
+                                id: "edit",
+                                title: "수정",
+                                accessibilityIdentifier: "groupDetail.managementActionSheet.edit",
+                                action: presentGroupEditor
+                            ),
+                            BottomActionSheetAction(
+                                id: "delete",
+                                title: "삭제",
+                                role: .destructive,
+                                accessibilityIdentifier: "groupDetail.managementActionSheet.delete"
+                            ) {
+                                showsDeleteConfirmation = true
+                            },
+                            BottomActionSheetAction(
+                                id: "cancel",
+                                title: "취소",
+                                role: .cancel,
+                                accessibilityIdentifier: "groupDetail.managementActionSheet.cancel",
+                                action: {}
+                            ),
+                        ],
+                        onDismiss: { showsManagementActionSheet = false }
+                    )
+                }
             }
-        }
-        .confirmationDialog("내전 방 관리", isPresented: $showsManagementDialog, titleVisibility: .visible) {
-            Button("수정") { presentGroupEditor() }
-            Button("삭제", role: .destructive) { showsDeleteConfirmation = true }
-            Button("취소", role: .cancel) {}
         }
         .alert("이 내전 방을 삭제할까요?", isPresented: $showsDeleteConfirmation) {
             Button("취소", role: .cancel) {}
@@ -8352,6 +8595,7 @@ struct GroupDetailScreen: View {
             Text("삭제한 내전 방은 복구할 수 없습니다.")
         }
         .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsPowerGuideSheet)
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: showsManagementActionSheet)
     }
 
     private func presentInviteSheet() {
@@ -8413,7 +8657,7 @@ struct GroupDetailScreen: View {
     private func confirmGroupDelete() async {
         guard let deletedGroupID = await viewModel.deleteGroup() else { return }
         showsDeleteConfirmation = false
-        showsManagementDialog = false
+        showsManagementActionSheet = false
         showsEditorSheet = false
         onGroupDeleted(deletedGroupID)
         router.removeRoutes(referencingGroupID: deletedGroupID)
@@ -8465,13 +8709,14 @@ private struct GroupMemberInviteSheet: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
-                VStack(spacing: 16) {
-                    headerSection
-                    searchField
-                }
-                .padding(.horizontal, 16)
-                .padding(.top, 18)
-                .padding(.bottom, 12)
+                headerSection
+                    .padding(.horizontal, 16)
+                    .padding(.top, 20)
+                    .padding(.bottom, 14)
+
+                searchField
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 12)
 
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 16) {
@@ -8495,6 +8740,8 @@ private struct GroupMemberInviteSheet: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomActionBar
         }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("memberInviteSheet.root")
         .onAppear {
             viewModel.handleSheetAppear()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
@@ -8510,23 +8757,12 @@ private struct GroupMemberInviteSheet: View {
     }
 
     private var headerSection: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("팀원 추가")
-                    .font(AppTypography.heading(20, weight: .bold))
-                    .foregroundStyle(AppPalette.textPrimary)
-                Text("닉네임으로 검색해 팀원을 추가해보세요. 추가할 사용자를 선택하면 바로 초대할 수 있어요.")
-                    .font(AppTypography.body(12))
-                    .foregroundStyle(AppPalette.textSecondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
-            Spacer()
-
-            Button("닫기", action: onClose)
-                .font(AppTypography.body(13, weight: .semibold))
-                .foregroundStyle(AppPalette.textSecondary)
-        }
+        BottomSheetHeader(
+            title: "팀원 추가",
+            titleAccessibilityIdentifier: "memberInviteSheet.title",
+            showsCloseButton: false,
+            onClose: onClose
+        )
     }
 
     private var searchField: some View {
@@ -8544,6 +8780,7 @@ private struct GroupMemberInviteSheet: View {
                 .onSubmit {
                     viewModel.submitSearch(searchText)
                 }
+                .accessibilityIdentifier("memberInviteSheet.searchField")
 
             if !searchText.isEmpty {
                 Button {
@@ -8889,6 +9126,7 @@ private struct GroupMemberInviteSheet: View {
                         .font(AppTypography.body(13, weight: .semibold))
                         .foregroundStyle(viewModel.selectedUser == nil ? AppPalette.textMuted : AppPalette.textPrimary)
                         .lineLimit(1)
+                        .accessibilityIdentifier("memberInviteSheet.selectedSummary")
                 }
 
                 Spacer()
@@ -8917,6 +9155,7 @@ private struct GroupMemberInviteSheet: View {
                 )
             )
             .disabled(!viewModel.canSubmitSelection)
+            .accessibilityIdentifier("memberInviteSheet.submitButton")
         }
         .padding(.horizontal, 16)
         .padding(.top, 12)
@@ -8970,6 +9209,11 @@ struct RecruitBoardScreen: View {
     @State private var activeCreateGroupID: String?
     @State private var activeFilterSheet: RecruitFilterSheet?
     @State private var filterDraft = RecruitBoardFilterState.defaultValue
+    @State private var activeManagementPost: RecruitPost?
+    @State private var editingPost: RecruitPost?
+    @State private var editPostErrorMessage: String?
+    @State private var pendingDeletePost: RecruitPost?
+    @State private var isDeleteConfirmationPresented = false
 
     var body: some View {
         TabRootScaffold(title: AppTab.recruit.title, trailingAction: createRecruitHeaderAction) {
@@ -8995,6 +9239,16 @@ struct RecruitBoardScreen: View {
                 createSheet
             }
         }
+        .sheet(item: $editingPost, onDismiss: clearRecruitEditError) { post in
+            RecruitEditorSheet(
+                mode: .edit,
+                draft: $recruitEditorDraft,
+                errorMessage: editPostErrorMessage,
+                isSubmitting: isEditRecruitSubmitInFlight,
+                onClose: { editingPost = nil },
+                onSubmit: { submitRecruitUpdate(post) }
+            )
+        }
         .onChange(of: activeSheet) { _, newValue in
             guard newValue == .createPost else { return }
             debugCreateRecruitingPost("showModal=createRecruitingPost")
@@ -9005,17 +9259,38 @@ struct RecruitBoardScreen: View {
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
         .overlay {
-            if let activeFilterSheet {
-                DimmedBottomSheet(
-                    title: filterSheetTitle(for: activeFilterSheet),
-                    onDismiss: { self.activeFilterSheet = nil },
-                    maxHeightRatio: 0.66
-                ) {
-                    filterSheetContent(activeFilterSheet)
+            ZStack {
+                if let activeFilterSheet {
+                    DimmedBottomSheet(
+                        title: filterSheetTitle(for: activeFilterSheet),
+                        onDismiss: { self.activeFilterSheet = nil },
+                        maxHeightRatio: 0.66
+                    ) {
+                        filterSheetContent(activeFilterSheet)
+                    }
+                }
+
+                if activeManagementPost != nil {
+                    BottomActionSheet(
+                        accessibilityIdentifier: "recruitPost.managementActionSheet",
+                        actions: recruitManagementActions,
+                        onDismiss: { activeManagementPost = nil }
+                    )
                 }
             }
         }
+        .alert("이 모집글을 삭제할까요?", isPresented: $isDeleteConfirmationPresented) {
+            Button("취소", role: .cancel) {
+                pendingDeletePost = nil
+            }
+            Button("삭제", role: .destructive) {
+                Task { await confirmRecruitDelete() }
+            }
+        } message: {
+            Text("삭제한 모집글은 복구할 수 없습니다.")
+        }
         .animation(.spring(response: 0.34, dampingFraction: 0.9), value: activeFilterSheet)
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: activeManagementPost != nil)
     }
 
     private var createRecruitHeaderAction: TabHeaderAction {
@@ -9057,6 +9332,10 @@ struct RecruitBoardScreen: View {
             return true
         }
         return false
+    }
+
+    private var isEditRecruitSubmitInFlight: Bool {
+        editingPost != nil && isCreateRecruitSubmitInFlight
     }
 
     private func presentCreateRecruitEntry(source: String) {
@@ -9162,6 +9441,85 @@ struct RecruitBoardScreen: View {
         createPostErrorMessage = nil
     }
 
+    private func presentRecruitManagement(for post: RecruitPost) {
+        activeManagementPost = post
+    }
+
+    private func presentRecruitEditor(_ post: RecruitPost) {
+        recruitEditorDraft = RecruitEditorDraft(postType: post.postType, post: post)
+        editPostErrorMessage = nil
+        editingPost = post
+    }
+
+    private func submitRecruitUpdate(_ post: RecruitPost) {
+        editPostErrorMessage = nil
+        Task {
+            let updatedPost = await viewModel.updatePost(
+                post,
+                title: recruitEditorDraft.normalizedTitle,
+                body: recruitEditorDraft.normalizedBody,
+                tags: recruitEditorDraft.composedTags,
+                scheduledAt: recruitEditorDraft.effectiveScheduledAt,
+                positions: recruitEditorDraft.requiredPositions
+            )
+            if let updatedPost {
+                viewModel.handleUpdateSuccess(updatedPost)
+                editingPost = nil
+                return
+            }
+            if case let .failure(message) = viewModel.actionState {
+                editPostErrorMessage = message
+            }
+        }
+    }
+
+    private func promptRecruitDelete(_ post: RecruitPost) {
+        pendingDeletePost = post
+        isDeleteConfirmationPresented = true
+    }
+
+    private func confirmRecruitDelete() async {
+        guard let pendingDeletePost else { return }
+        if let deletedPost = await viewModel.deletePost(pendingDeletePost) {
+            viewModel.handleDeleteSuccess(deletedPost)
+        }
+        self.pendingDeletePost = nil
+        isDeleteConfirmationPresented = false
+    }
+
+    private func clearRecruitEditError() {
+        editPostErrorMessage = nil
+    }
+
+    private var recruitManagementActions: [BottomActionSheetAction] {
+        guard let activeManagementPost else { return [] }
+
+        return [
+            BottomActionSheetAction(
+                id: "edit",
+                title: "수정",
+                accessibilityIdentifier: "recruitPost.managementActionSheet.edit"
+            ) {
+                presentRecruitEditor(activeManagementPost)
+            },
+            BottomActionSheetAction(
+                id: "delete",
+                title: "삭제",
+                role: .destructive,
+                accessibilityIdentifier: "recruitPost.managementActionSheet.delete"
+            ) {
+                promptRecruitDelete(activeManagementPost)
+            },
+            BottomActionSheetAction(
+                id: "cancel",
+                title: "취소",
+                role: .cancel,
+                accessibilityIdentifier: "recruitPost.managementActionSheet.cancel",
+                action: {}
+            ),
+        ]
+    }
+
     @ViewBuilder
     private func recruitBoardContent(snapshot: RecruitBoardSnapshot?, emptyMessage: String?) -> some View {
         ScrollView(showsIndicators: false) {
@@ -9186,8 +9544,8 @@ struct RecruitBoardScreen: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
 
                     if let snapshot {
-                        ForEach(snapshot.posts) { post in
-                            recruitPostCard(post, snapshot: snapshot)
+                        ForEach(snapshot.items) { item in
+                            recruitPostCard(item, snapshot: snapshot)
                         }
                     } else if let emptyMessage {
                         EmptyStateView(title: "모집", message: emptyMessage, actionTitle: "글 작성") {
@@ -9201,72 +9559,97 @@ struct RecruitBoardScreen: View {
         }
     }
 
-    private func recruitPostCard(_ post: RecruitPost, snapshot: RecruitBoardSnapshot) -> some View {
-        Button {
-            debugRecruitScreen("navigate detail postId=\(post.id)")
-            session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
-        } label: {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Text(post.title)
-                        .font(AppTypography.body(14, weight: .semibold))
-                        .foregroundStyle(AppPalette.textPrimary)
-                    Spacer()
-                    if post.tags.contains("급구") {
-                        Text("급구")
-                            .font(AppTypography.body(11, weight: .semibold))
-                            .foregroundStyle(AppPalette.bgPrimary)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(AppPalette.accentGreen)
-                            .clipShape(Capsule())
-                    }
-                }
+    private func recruitPostCard(_ item: RecruitBoardPostItem, snapshot: RecruitBoardSnapshot) -> some View {
+        let post = item.post
+        let showsOverflowButton = item.canShowOverflowMenu
 
-                HStack(spacing: 8) {
-                    Text(snapshot.groupNamesByID[post.groupID] ?? "그룹 정보 없음")
-                    if let region = snapshot.groupRegionsByID[post.groupID] {
-                        Text(region)
+        return ZStack(alignment: .topTrailing) {
+            Button {
+                debugRecruitScreen("navigate detail postId=\(post.id)")
+                session.openProtectedRoute(.recruitDetail(postID: post.id), requirement: .recruitingWrite, router: router)
+            } label: {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        Text(post.title)
+                            .font(AppTypography.body(14, weight: .semibold))
+                            .foregroundStyle(AppPalette.textPrimary)
+                        Spacer()
+                        if post.tags.contains("급구") {
+                            Text("급구")
+                                .font(AppTypography.body(11, weight: .semibold))
+                                .foregroundStyle(AppPalette.bgPrimary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(AppPalette.accentGreen)
+                                .clipShape(Capsule())
+                        }
                     }
-                    if let scheduledAt = post.scheduledAt {
-                        Text(scheduledAt.shortDateText)
-                            .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
-                    }
-                }
-                .font(AppTypography.body(12))
-                .foregroundStyle(AppPalette.textSecondary)
 
-                HStack(spacing: 6) {
-                    ForEach(post.requiredPositions, id: \.self) { value in
-                        Text(value)
-                            .font(AppTypography.body(11))
-                            .foregroundStyle(AppPalette.accentBlue)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(AppPalette.bgTertiary)
-                            .clipShape(Capsule())
+                    HStack(spacing: 8) {
+                        Text(snapshot.groupNamesByID[post.groupID] ?? "그룹 정보 없음")
+                        if let region = snapshot.groupRegionsByID[post.groupID] {
+                            Text(region)
+                        }
+                        if let scheduledAt = post.scheduledAt {
+                            Text(scheduledAt.shortDateText)
+                                .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentBlue)
+                        }
                     }
-                    ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
-                        Text(value)
-                            .font(AppTypography.body(11))
-                            .foregroundStyle(AppPalette.accentPurple)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3)
-                            .background(AppPalette.bgTertiary)
-                            .clipShape(Capsule())
+                    .font(AppTypography.body(12))
+                    .foregroundStyle(AppPalette.textSecondary)
+
+                    HStack(spacing: 6) {
+                        ForEach(post.requiredPositions, id: \.self) { value in
+                            Text(value)
+                                .font(AppTypography.body(11))
+                                .foregroundStyle(AppPalette.accentBlue)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(AppPalette.bgTertiary)
+                                .clipShape(Capsule())
+                        }
+                        ForEach(post.tags.filter { !$0.isEmpty }, id: \.self) { value in
+                            Text(value)
+                                .font(AppTypography.body(11))
+                                .foregroundStyle(AppPalette.accentPurple)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(AppPalette.bgTertiary)
+                                .clipShape(Capsule())
+                        }
                     }
+                    Text(post.status == .open ? "모집 중" : post.status.rawValue)
+                        .font(AppTypography.body(12, weight: .semibold))
+                        .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
                 }
-                Text(post.status == .open ? "모집 중" : post.status.rawValue)
-                    .font(AppTypography.body(12, weight: .semibold))
-                    .foregroundStyle(post.tags.contains("급구") ? AppPalette.accentRed : AppPalette.accentOrange)
+                .padding(16)
+                .padding(.trailing, showsOverflowButton ? 28 : 0)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(AppPalette.bgCard)
+                .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(AppPalette.bgCard)
-            .overlay(RoundedRectangle(cornerRadius: 12).stroke(post.tags.contains("급구") ? AppPalette.accentGreen : AppPalette.border, lineWidth: 1))
-            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("recruitPost.card.\(post.id)")
+
+            if showsOverflowButton {
+                Button {
+                    presentRecruitManagement(for: post)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                        .frame(width: 28, height: 28)
+                        .background(AppPalette.bgSecondary.opacity(0.94))
+                        .clipShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 12)
+                .padding(.trailing, 12)
+                .accessibilityLabel("모집글 관리")
+                .accessibilityIdentifier("recruitPost.card.\(post.id).overflowButton")
+            }
         }
-        .buttonStyle(.plain)
     }
 
     private func filterChip(_ sheet: RecruitFilterSheet, title: String) -> some View {
@@ -9512,7 +9895,7 @@ struct RecruitDetailScreen: View {
     let onDeleteSuccess: (RecruitPost) -> Void
     @State private var isDeleteConfirmationPresented = false
     @State private var isBlockConfirmationPresented = false
-    @State private var isManagementDialogPresented = false
+    @State private var isManagementActionSheetPresented = false
     @State private var isEditorPresented = false
     @State private var recruitEditorDraft = RecruitEditorDraft(postType: .memberRecruit)
     @State private var recruitEditorErrorMessage: String?
@@ -9522,7 +9905,8 @@ struct RecruitDetailScreen: View {
             title: "모집 상세",
             onBack: router.pop,
             rightSystemImage: viewModel.isMoreMenuVisible ? "ellipsis.circle" : nil,
-            onRightTap: { isManagementDialogPresented = true }
+            rightAccessibilityIdentifier: "recruitDetail.overflowButton",
+            onRightTap: { isManagementActionSheetPresented = true }
         ) {
             switch viewModel.state {
             case .initial:
@@ -9621,24 +10005,14 @@ struct RecruitDetailScreen: View {
             )
         }
         .overlay(alignment: .bottom) { actionBanner(viewModel.actionState) }
-        .confirmationDialog("모집글 관리", isPresented: $isManagementDialogPresented, titleVisibility: .visible) {
-            if let reportTarget = viewModel.reportTarget {
-                Button("신고하기") {
-                    router.push(.report(target: reportTarget))
-                }
+        .overlay {
+            if isManagementActionSheetPresented {
+                BottomActionSheet(
+                    accessibilityIdentifier: "recruitDetail.managementActionSheet",
+                    actions: recruitManagementActions,
+                    onDismiss: { isManagementActionSheetPresented = false }
+                )
             }
-            if viewModel.authorBlockTarget != nil {
-                Button("작성자 차단하기", role: .destructive) {
-                    isBlockConfirmationPresented = true
-                }
-            }
-            if viewModel.isEditVisible {
-                Button("수정") { presentRecruitEditor() }
-            }
-            if viewModel.isDeleteVisible {
-                Button("삭제", role: .destructive) { promptDeleteConfirmation() }
-            }
-            Button("취소", role: .cancel) {}
         }
         .alert("이 모집글을 삭제할까요?", isPresented: $isDeleteConfirmationPresented) {
             Button("취소", role: .cancel) {}
@@ -9660,6 +10034,7 @@ struct RecruitDetailScreen: View {
         } message: {
             Text("차단한 사용자의 모집글과 프로필 노출이 줄어듭니다.")
         }
+        .animation(.spring(response: 0.34, dampingFraction: 0.9), value: isManagementActionSheetPresented)
     }
 
     private func infoRow(_ title: String, value: String) -> some View {
@@ -9676,6 +10051,61 @@ struct RecruitDetailScreen: View {
     private func promptDeleteConfirmation() {
         guard viewModel.beginDeleteConfirmation() else { return }
         isDeleteConfirmationPresented = true
+    }
+
+    private var recruitManagementActions: [BottomActionSheetAction] {
+        var actions: [BottomActionSheetAction] = []
+
+        if let reportTarget = viewModel.reportTarget {
+            actions.append(
+                BottomActionSheetAction(id: "report", title: "신고하기") {
+                    router.push(.report(target: reportTarget))
+                }
+            )
+        }
+
+        if viewModel.authorBlockTarget != nil {
+            actions.append(
+                BottomActionSheetAction(id: "block", title: "작성자 차단하기", role: .destructive) {
+                    isBlockConfirmationPresented = true
+                }
+            )
+        }
+
+        if viewModel.isEditVisible {
+            actions.append(
+                BottomActionSheetAction(
+                    id: "edit",
+                    title: "수정",
+                    accessibilityIdentifier: "recruitDetail.managementActionSheet.edit",
+                    action: presentRecruitEditor
+                )
+            )
+        }
+
+        if viewModel.isDeleteVisible {
+            actions.append(
+                BottomActionSheetAction(
+                    id: "delete",
+                    title: "삭제",
+                    role: .destructive,
+                    accessibilityIdentifier: "recruitDetail.managementActionSheet.delete",
+                    action: promptDeleteConfirmation
+                )
+            )
+        }
+
+        actions.append(
+            BottomActionSheetAction(
+                id: "cancel",
+                title: "취소",
+                role: .cancel,
+                accessibilityIdentifier: "recruitDetail.managementActionSheet.cancel",
+                action: {}
+            )
+        )
+
+        return actions
     }
 
     private func presentRecruitEditor() {

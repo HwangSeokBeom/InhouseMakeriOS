@@ -5,6 +5,7 @@ on:
     branches:
       - dev
       - main
+      - "release/**"
     paths:
       - "InhouseMakeriOS/**"
       - "InhouseMakeriOS.xcodeproj/**"
@@ -16,6 +17,7 @@ on:
     branches:
       - dev
       - main
+      - "release/**"
     paths:
       - "InhouseMakeriOS/**"
       - "InhouseMakeriOS.xcodeproj/**"
@@ -29,14 +31,25 @@ concurrency:
   group: ios-ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PROJECT_PATH: InhouseMakeriOS.xcodeproj
+  SCHEME_NAME: InhouseMakeriOS-Dev
+  CONFIGURATION_NAME: Debug
+  XCODE_VERSION: "26.3"
+  SOURCE_PACKAGES_DIR: ${{ github.workspace }}/.cache/source-packages
+  DERIVED_DATA_PATH: ${{ github.workspace }}/build/DerivedData
+  XCTEST_RESULTS_DIR: ${{ github.workspace }}/build/xcresults
+  XCODEBUILD_LOG_DIR: ${{ github.workspace }}/build/logs
+  SIMULATOR_DEVICE_NAME: iPhone 16
+  SIMULATOR_DEVICE_TYPE_IDENTIFIER: com.apple.CoreSimulator.SimDeviceType.iPhone-16
+  SIMULATOR_RUNTIME_NAME: iOS 26.3
+  SIMULATOR_RUNTIME_IDENTIFIER: com.apple.CoreSimulator.SimRuntime.iOS-26-3
+
 jobs:
-  build-and-test:
-    runs-on: macos-latest
-    env:
-      PROJECT_PATH: InhouseMakeriOS.xcodeproj
-      SCHEME_NAME: InhouseMakeriOS-Dev
-      CONFIGURATION_NAME: Debug
-      SOURCE_PACKAGES_DIR: ${{ github.workspace }}/.cache/source-packages
+  build:
+    name: build
+    runs-on: macos-15
+    timeout-minutes: 25
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -44,14 +57,15 @@ jobs:
       - name: Set up Xcode
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: ${{ env.XCODE_VERSION }}
 
       - name: Cache Swift packages
         uses: actions/cache@v4
         with:
           path: ${{ env.SOURCE_PACKAGES_DIR }}
-          key: ${{ runner.os }}-spm-${{ hashFiles('InhouseMakeriOS.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
+          key: ${{ runner.os }}-xcode-${{ env.XCODE_VERSION }}-spm-${{ hashFiles('InhouseMakeriOS.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved') }}
           restore-keys: |
+            ${{ runner.os }}-xcode-${{ env.XCODE_VERSION }}-spm-
             ${{ runner.os }}-spm-
 
       - name: Resolve Swift packages
@@ -64,24 +78,216 @@ jobs:
             -scheme "${SCHEME_NAME}" \
             -clonedSourcePackagesDirPath "${SOURCE_PACKAGES_DIR}"
 
-      - name: Resolve simulator destination
+      - name: Create and boot simulator
         id: simulator
         run: |
           set -euo pipefail
-          destination="$(bash scripts/ios/select_simulator_destination.sh "${PROJECT_PATH}" "${SCHEME_NAME}")"
-          echo "destination=${destination}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build and test
+          if ! xcrun simctl list devicetypes | grep -Fq "${SIMULATOR_DEVICE_TYPE_IDENTIFIER}"; then
+            echo "::error::Missing simulator device type: ${SIMULATOR_DEVICE_TYPE_IDENTIFIER}"
+            xcrun simctl list devicetypes
+            exit 1
+          fi
+
+          if ! xcrun simctl list runtimes available | grep -Fq "${SIMULATOR_RUNTIME_IDENTIFIER}"; then
+            echo "::error::Missing simulator runtime: ${SIMULATOR_RUNTIME_IDENTIFIER}"
+            xcrun simctl list runtimes available
+            exit 1
+          fi
+
+          simulator_name="InhouseMaker CI ${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          simulator_udid="$(xcrun simctl create "${simulator_name}" "${SIMULATOR_DEVICE_TYPE_IDENTIFIER}" "${SIMULATOR_RUNTIME_IDENTIFIER}")"
+          printf 'udid=%s\n' "${simulator_udid}" >> "${GITHUB_OUTPUT}"
+          printf 'destination=platform=iOS Simulator,id=%s\n' "${simulator_udid}" >> "${GITHUB_OUTPUT}"
+
+          xcrun simctl boot "${simulator_udid}" || true
+          xcrun simctl bootstatus "${simulator_udid}" -b
+
+      - name: Build for testing
         run: |
           set -euo pipefail
+          mkdir -p "${XCTEST_RESULTS_DIR}" "${XCODEBUILD_LOG_DIR}"
+          result_bundle="${XCTEST_RESULTS_DIR}/build.xcresult"
+          rm -rf "${result_bundle}"
+
           xcodebuild \
-            test \
+            build-for-testing \
             -project "${PROJECT_PATH}" \
             -scheme "${SCHEME_NAME}" \
             -configuration "${CONFIGURATION_NAME}" \
             -destination "${{ steps.simulator.outputs.destination }}" \
+            -destination-timeout 60 \
+            -derivedDataPath "${DERIVED_DATA_PATH}" \
             -clonedSourcePackagesDirPath "${SOURCE_PACKAGES_DIR}" \
+            -resultBundlePath "${result_bundle}" \
             -skipPackagePluginValidation \
             -skipMacroValidation \
             CODE_SIGNING_ALLOWED=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            2>&1 | tee "${XCODEBUILD_LOG_DIR}/build-for-testing.log"
+
+      - name: Verify build products
+        run: |
+          set -euo pipefail
+          xctestrun_path="$(find "${DERIVED_DATA_PATH}/Build/Products" -maxdepth 1 -name "*.xctestrun" -print -quit)"
+          if [[ -z "${xctestrun_path}" ]]; then
+            echo "::error::No .xctestrun file was generated by build-for-testing."
+            find "${DERIVED_DATA_PATH}/Build/Products" -maxdepth 2 -print
+            exit 1
+          fi
+          echo "Generated xctestrun: ${xctestrun_path}"
+
+      - name: Upload build products for test jobs
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-products
+          path: ${{ env.DERIVED_DATA_PATH }}/Build/Products
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-diagnostics
+          path: |
+            ${{ env.XCTEST_RESULTS_DIR }}
+            ${{ env.XCODEBUILD_LOG_DIR }}
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Write build summary
+        if: always()
+        run: |
+          {
+            echo "### build"
+            echo "- Status: ${{ job.status }}"
+            echo "- Action: build-for-testing"
+            echo "- Scheme: ${SCHEME_NAME}"
+            echo "- Xcode: ${XCODE_VERSION}"
+            echo "- Simulator: ${SIMULATOR_DEVICE_NAME} / ${SIMULATOR_RUNTIME_NAME}"
+            echo "- Test artifact: ios-build-products"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Delete simulator
+        if: always()
+        run: |
+          simulator_udid="${{ steps.simulator.outputs.udid }}"
+          if [[ -n "${simulator_udid}" ]]; then
+            xcrun simctl shutdown "${simulator_udid}" || true
+            xcrun simctl delete "${simulator_udid}" || true
+          fi
+
+  unit-tests:
+    name: unit-tests
+    runs-on: macos-15
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - name: Set up Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: ${{ env.XCODE_VERSION }}
+
+      - name: Download build products
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-build-products
+          path: ${{ env.DERIVED_DATA_PATH }}/Build/Products
+
+      - name: Locate xctestrun
+        id: xctestrun
+        run: |
+          set -euo pipefail
+          xctestrun_path="$(find "${DERIVED_DATA_PATH}/Build/Products" -maxdepth 1 -name "*.xctestrun" -print -quit)"
+          if [[ -z "${xctestrun_path}" ]]; then
+            echo "::error::No .xctestrun file found in downloaded build products."
+            find "${DERIVED_DATA_PATH}/Build/Products" -maxdepth 2 -print
+            exit 1
+          fi
+          printf 'path=%s\n' "${xctestrun_path}" >> "${GITHUB_OUTPUT}"
+
+      - name: Create and boot simulator
+        id: simulator
+        run: |
+          set -euo pipefail
+
+          if ! xcrun simctl list devicetypes | grep -Fq "${SIMULATOR_DEVICE_TYPE_IDENTIFIER}"; then
+            echo "::error::Missing simulator device type: ${SIMULATOR_DEVICE_TYPE_IDENTIFIER}"
+            xcrun simctl list devicetypes
+            exit 1
+          fi
+
+          if ! xcrun simctl list runtimes available | grep -Fq "${SIMULATOR_RUNTIME_IDENTIFIER}"; then
+            echo "::error::Missing simulator runtime: ${SIMULATOR_RUNTIME_IDENTIFIER}"
+            xcrun simctl list runtimes available
+            exit 1
+          fi
+
+          simulator_name="InhouseMaker CI ${GITHUB_JOB}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          simulator_udid="$(xcrun simctl create "${simulator_name}" "${SIMULATOR_DEVICE_TYPE_IDENTIFIER}" "${SIMULATOR_RUNTIME_IDENTIFIER}")"
+          printf 'udid=%s\n' "${simulator_udid}" >> "${GITHUB_OUTPUT}"
+          printf 'destination=platform=iOS Simulator,id=%s\n' "${simulator_udid}" >> "${GITHUB_OUTPUT}"
+
+          xcrun simctl boot "${simulator_udid}" || true
+          xcrun simctl bootstatus "${simulator_udid}" -b
+
+      - name: Run unit tests without building
+        run: |
+          set -euo pipefail
+          mkdir -p "${XCTEST_RESULTS_DIR}" "${XCODEBUILD_LOG_DIR}"
+          result_bundle="${XCTEST_RESULTS_DIR}/unit-tests.xcresult"
+          rm -rf "${result_bundle}"
+
+          xcodebuild \
+            test-without-building \
+            -xctestrun "${{ steps.xctestrun.outputs.path }}" \
+            -destination "${{ steps.simulator.outputs.destination }}" \
+            -destination-timeout 60 \
+            -only-testing:InhouseMakeriOSTests \
+            -resultBundlePath "${result_bundle}" \
+            2>&1 | tee "${XCODEBUILD_LOG_DIR}/unit-tests.log"
+
+      - name: Collect simulator diagnostics
+        if: failure()
+        run: |
+          set -euo pipefail
+          mkdir -p build/simulator-diagnostics
+          simulator_udid="${{ steps.simulator.outputs.udid }}"
+          if [[ -n "${simulator_udid}" ]]; then
+            xcrun simctl diagnose -b --timeout=120 --output=build/simulator-diagnostics --udid "${simulator_udid}" || true
+          fi
+
+      - name: Upload unit test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-unit-test-diagnostics
+          path: |
+            ${{ env.XCTEST_RESULTS_DIR }}
+            ${{ env.XCODEBUILD_LOG_DIR }}
+            build/simulator-diagnostics
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Write unit test summary
+        if: always()
+        run: |
+          {
+            echo "### unit-tests"
+            echo "- Status: ${{ job.status }}"
+            echo "- Action: test-without-building"
+            echo "- Target: InhouseMakeriOSTests"
+            echo "- Simulator: ${SIMULATOR_DEVICE_NAME} / ${SIMULATOR_RUNTIME_NAME}"
+            echo "- Result bundle: unit-tests.xcresult"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Delete simulator
+        if: always()
+        run: |
+          simulator_udid="${{ steps.simulator.outputs.udid }}"
+          if [[ -n "${simulator_udid}" ]]; then
+            xcrun simctl shutdown "${simulator_udid}" || true
+            xcrun simctl delete "${simulator_udid}" || true
+          fi
