@@ -6,6 +6,8 @@ import SwiftData
 
 @main
 struct InhouseMakeriOSApp: App {
+    @Environment(\.scenePhase) private var scenePhase
+    @UIApplicationDelegateAdaptor(NotificationApplicationDelegate.self) private var notificationApplicationDelegate
     @StateObject private var router: AppRouter
     @StateObject private var session: AppSessionViewModel
     @State private var hasStartedLaunchSequence = false
@@ -21,14 +23,15 @@ struct InhouseMakeriOSApp: App {
             self.debugLaunchScenario = launchScenario
             _router = StateObject(wrappedValue: launchScenario.router)
             _session = StateObject(wrappedValue: launchScenario.session)
+            notificationApplicationDelegate.notificationPermissionManager = launchScenario.session.container.notificationPermissionManager
         } else {
             self.debugLaunchScenario = nil
-            _router = StateObject(wrappedValue: AppRouter())
-            _session = StateObject(
-                wrappedValue: AppSessionViewModel(
-                    container: AppContainer(modelContainer: modelContainer)
-                )
-            )
+            let appRouter = AppRouter()
+            let container = AppContainer(modelContainer: modelContainer)
+            let appSession = AppSessionViewModel(container: container)
+            _router = StateObject(wrappedValue: appRouter)
+            _session = StateObject(wrappedValue: appSession)
+            notificationApplicationDelegate.notificationPermissionManager = container.notificationPermissionManager
         }
     }
 
@@ -59,9 +62,16 @@ struct InhouseMakeriOSApp: App {
             .task {
                 guard debugLaunchScenario == nil else { return }
                 await runLaunchSequenceIfNeeded()
+                await session.container.notificationPermissionManager.refreshAuthorizationStatus(registerIfNeeded: true)
             }
             .onChange(of: currentRootKind) { oldRoot, newRoot in
                 debugAppRoot("source=AppRoot action=rootChanged from=\(oldRoot.rawValue) to=\(newRoot.rawValue) reason=\(currentRootReason)")
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                guard newPhase == .active else { return }
+                Task {
+                    await session.container.notificationPermissionManager.refreshAuthorizationStatus(registerIfNeeded: true)
+                }
             }
             .onChange(of: session.shouldPresentOnboarding) { _, shouldPresentOnboarding in
                 #if DEBUG
@@ -247,9 +257,10 @@ private struct SplashView: View {
 }
 
 #if DEBUG
-private enum DebugUITestScenarioKind {
+private enum DebugUITestScenarioKind: Equatable {
     case groupInviteFlow
     case recruitManagementFlow
+    case notificationPermissionFlow
 
     static func current() -> Self? {
         let arguments = ProcessInfo.processInfo.arguments
@@ -258,6 +269,9 @@ private enum DebugUITestScenarioKind {
         }
         if arguments.contains(DebugRecruitManagementFlowScenario.launchArgument) {
             return .recruitManagementFlow
+        }
+        if arguments.contains(DebugNotificationPermissionFlowScenario.launchArgument) {
+            return .notificationPermissionFlow
         }
         return nil
     }
@@ -277,10 +291,14 @@ private struct DebugUITestLaunchScenario {
         let defaults = UserDefaults(suiteName: "InhouseMakeriOS.DebugUITest.\(UUID().uuidString)")!
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [DebugUITestURLProtocol.self]
+        let notificationPermissionManager = scenarioKind == .notificationPermissionFlow
+            ? DebugNotificationPermissionFlowScenario.makeManager()
+            : nil
 
         let container = AppContainer(
             modelContainer: modelContainer,
             localStore: AppLocalStore(defaults: defaults, modelContainer: modelContainer),
+            notificationPermissionManager: notificationPermissionManager,
             urlSession: URLSession(configuration: configuration)
         )
         let session = AppSessionViewModel(container: container)
@@ -315,6 +333,8 @@ private struct DebugUITestLaunchScenario {
             session.selectedTab = .match
         case .recruitManagementFlow:
             session.selectedTab = .recruit
+        case .notificationPermissionFlow:
+            session.selectedTab = .profile
         }
 
         let router = AppRouter()
@@ -324,6 +344,8 @@ private struct DebugUITestLaunchScenario {
             rootView = AnyView(DebugGroupInviteFlowRootView(session: session, router: router))
         case .recruitManagementFlow:
             rootView = AnyView(DebugRecruitManagementFlowRootView(session: session, router: router))
+        case .notificationPermissionFlow:
+            rootView = AnyView(DebugNotificationPermissionFlowRootView(session: session, router: router))
         }
         return DebugUITestLaunchScenario(
             session: session,
@@ -444,6 +466,17 @@ private struct DebugRecruitManagementFlowRootView: View {
     }
 }
 
+private struct DebugNotificationPermissionFlowRootView: View {
+    @ObservedObject var session: AppSessionViewModel
+    @ObservedObject var router: AppRouter
+
+    var body: some View {
+        NavigationStack(path: $router.path) {
+            SettingsScreen(session: session, router: router, onBack: {})
+        }
+    }
+}
+
 private final class DebugUITestURLProtocol: URLProtocol {
     override class func canInit(with request: URLRequest) -> Bool {
         DebugUITestScenarioKind.current() != nil
@@ -461,6 +494,8 @@ private final class DebugUITestURLProtocol: URLProtocol {
                 response = await DebugGroupInviteFlowScenario.shared.response(for: request)
             case .recruitManagementFlow:
                 response = await DebugRecruitManagementFlowScenario.shared.response(for: request)
+            case .notificationPermissionFlow:
+                response = DebugProtocolResponse(statusCode: 404, data: Data())
             case nil:
                 return
             }
@@ -939,6 +974,72 @@ private actor DebugGroupInviteFlowScenario {
         ]
         let data = (try? JSONSerialization.data(withJSONObject: payload)) ?? Data()
         return DebugProtocolResponse(statusCode: statusCode, data: data)
+    }
+}
+
+@MainActor
+private final class DebugNotificationPermissionEnvironment:
+    NotificationAuthorizationProviding,
+    RemoteNotificationRegistering,
+    ApplicationSettingsOpening,
+    PushTokenSynchronizing
+{
+    private(set) var currentStatus: NotificationAuthorizationState
+    private let requestResult: NotificationAuthorizationState
+
+    init(currentStatus: NotificationAuthorizationState, requestResult: NotificationAuthorizationState) {
+        self.currentStatus = currentStatus
+        self.requestResult = requestResult
+    }
+
+    func authorizationStatus() async -> NotificationAuthorizationState {
+        currentStatus
+    }
+
+    func requestAuthorization() async throws -> Bool {
+        currentStatus = requestResult
+        return requestResult.canRegisterRemoteNotifications
+    }
+
+    func registerForRemoteNotifications() {}
+
+    func openNotificationSettings() {}
+
+    func syncPushToken(_: String, notificationsEnabled _: Bool) async {}
+}
+
+private enum DebugNotificationPermissionFlowScenario {
+    static let launchArgument = "-ui-test-notification-permission-flow"
+    private static let statusArgument = "-ui-test-notification-auth-status"
+    private static let requestResultArgument = "-ui-test-notification-request-result"
+
+    @MainActor
+    static func makeManager() -> NotificationPermissionManager {
+        let arguments = ProcessInfo.processInfo.arguments
+        let initialStatus = value(for: statusArgument, in: arguments)
+            .flatMap(NotificationAuthorizationState.init(rawValue:))
+            ?? .notDetermined
+        let requestResult = value(for: requestResultArgument, in: arguments)
+            .flatMap(NotificationAuthorizationState.init(rawValue:))
+            ?? initialStatus
+        let environment = DebugNotificationPermissionEnvironment(
+            currentStatus: initialStatus,
+            requestResult: requestResult
+        )
+        return NotificationPermissionManager(
+            authorizationProvider: environment,
+            remoteNotificationRegistrar: environment,
+            settingsOpener: environment,
+            pushTokenSynchronizer: environment,
+            initialAuthorizationState: initialStatus
+        )
+    }
+
+    private static func value(for argument: String, in arguments: [String]) -> String? {
+        guard let index = arguments.firstIndex(of: argument), arguments.indices.contains(index + 1) else {
+            return nil
+        }
+        return arguments[index + 1]
     }
 }
 

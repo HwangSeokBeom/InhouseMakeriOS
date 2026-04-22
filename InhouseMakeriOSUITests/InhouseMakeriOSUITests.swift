@@ -10,6 +10,74 @@ final class InhouseMakeriOSUITests: XCTestCase {
         app.launch()
     }
 
+    func testNotificationPermissionDoesNotAutoPromptOnLaunch() throws {
+        let app = launchNotificationPermissionFlowApp(
+            currentStatus: "notDetermined",
+            requestResult: "authorized"
+        )
+
+        XCTAssertTrue(app.staticTexts["설정"].waitForExistence(timeout: 3))
+        XCTAssertFalse(app.alerts["푸시 알림을 켤까요?"].exists)
+        let status = app.staticTexts["settings.notificationPermission.status"]
+        XCTAssertTrue(scrollToExisting(status, in: app))
+        XCTAssertTrue(waitForLabel(status, equals: "허용 전", timeout: 2))
+    }
+
+    func testNotificationPermissionFlowStartsOnlyAfterCTA() throws {
+        let app = launchNotificationPermissionFlowApp(
+            currentStatus: "notDetermined",
+            requestResult: "authorized"
+        )
+
+        XCTAssertFalse(app.alerts["푸시 알림을 켤까요?"].exists)
+        let primaryButton = app.buttons["settings.notificationPermission.primaryButton"]
+        XCTAssertTrue(scrollToHittable(primaryButton, in: app))
+        primaryButton.tap()
+
+        XCTAssertTrue(app.alerts["푸시 알림을 켤까요?"].waitForExistence(timeout: 3))
+    }
+
+    func testNotificationPermissionDeniedStateShowsSettingsGuidance() throws {
+        let app = launchNotificationPermissionFlowApp(
+            currentStatus: "notDetermined",
+            requestResult: "denied"
+        )
+
+        let primaryButton = app.buttons["settings.notificationPermission.primaryButton"]
+        XCTAssertTrue(scrollToHittable(primaryButton, in: app))
+        primaryButton.tap()
+
+        let permissionAlert = app.alerts["푸시 알림을 켤까요?"]
+        XCTAssertTrue(permissionAlert.waitForExistence(timeout: 3))
+        permissionAlert.buttons["계속"].tap()
+
+        XCTAssertTrue(app.staticTexts["settings.notificationPermission.status"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts["settings.notificationPermission.status"].label, "설정 필요")
+        XCTAssertTrue(app.buttons["settings.notificationPermission.primaryButton"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.buttons["settings.notificationPermission.primaryButton"].label, "설정 열기")
+        XCTAssertTrue(app.staticTexts["설정에서 알림 허용이 필요해요"].exists)
+    }
+
+    func testNotificationPermissionAuthorizedStateShowsEnabledUI() throws {
+        let app = launchNotificationPermissionFlowApp(
+            currentStatus: "notDetermined",
+            requestResult: "authorized"
+        )
+
+        let primaryButton = app.buttons["settings.notificationPermission.primaryButton"]
+        XCTAssertTrue(scrollToHittable(primaryButton, in: app))
+        primaryButton.tap()
+
+        let permissionAlert = app.alerts["푸시 알림을 켤까요?"]
+        XCTAssertTrue(permissionAlert.waitForExistence(timeout: 3))
+        permissionAlert.buttons["계속"].tap()
+
+        XCTAssertTrue(app.staticTexts["settings.notificationPermission.status"].waitForExistence(timeout: 3))
+        XCTAssertEqual(app.staticTexts["settings.notificationPermission.status"].label, "활성")
+        XCTAssertTrue(app.staticTexts["푸시 알림이 켜져 있어요"].exists)
+        XCTAssertFalse(app.buttons["settings.notificationPermission.primaryButton"].exists)
+    }
+
     func testMemberInviteSheetHeaderUsesUpdatedContract() throws {
         let app = launchGroupInviteFlowApp()
 
@@ -192,6 +260,22 @@ final class InhouseMakeriOSUITests: XCTestCase {
         return app
     }
 
+    private func launchNotificationPermissionFlowApp(
+        currentStatus: String,
+        requestResult: String
+    ) -> XCUIApplication {
+        let app = XCUIApplication()
+        app.launchArguments += [
+            "-ui-test-notification-permission-flow",
+            "-ui-test-notification-auth-status",
+            currentStatus,
+            "-ui-test-notification-request-result",
+            requestResult,
+        ]
+        app.launch()
+        return app
+    }
+
     private func enterMatchLobby(in app: XCUIApplication) {
         let createMatchButton = app.buttons["내전 생성"]
         if !waitForHittable(createMatchButton, timeout: 2) {
@@ -249,5 +333,51 @@ final class InhouseMakeriOSUITests: XCTestCase {
         }
         let expectation = XCTNSPredicateExpectation(predicate: predicate, object: element)
         return XCTWaiter.wait(for: [expectation], timeout: timeout) == .completed
+    }
+
+    private func scrollToExisting(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        maxSwipes: Int = 6
+    ) -> Bool {
+        if element.waitForExistence(timeout: 1) {
+            return true
+        }
+
+        let scrollView = app.scrollViews.firstMatch
+        for _ in 0..<maxSwipes {
+            if scrollView.exists {
+                scrollView.swipeUp()
+            } else {
+                app.swipeUp()
+            }
+            if element.waitForExistence(timeout: 1) {
+                return true
+            }
+        }
+        return element.exists
+    }
+
+    private func scrollToHittable(
+        _ element: XCUIElement,
+        in app: XCUIApplication,
+        maxSwipes: Int = 6
+    ) -> Bool {
+        if waitForHittable(element, timeout: 1) {
+            return true
+        }
+
+        let scrollView = app.scrollViews.firstMatch
+        for _ in 0..<maxSwipes {
+            if scrollView.exists {
+                scrollView.swipeUp()
+            } else {
+                app.swipeUp()
+            }
+            if waitForHittable(element, timeout: 1) {
+                return true
+            }
+        }
+        return element.exists && element.isHittable
     }
 }

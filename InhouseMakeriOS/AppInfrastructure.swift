@@ -1,6 +1,9 @@
+import Combine
 import Foundation
 import Security
 import SwiftData
+import UIKit
+import UserNotifications
 
 enum AppEnvironment: String, Equatable, CaseIterable {
     case development
@@ -5246,6 +5249,258 @@ private extension String {
 
 // MARK: - Container
 
+enum NotificationAuthorizationState: String, Equatable {
+    case notDetermined
+    case denied
+    case authorized
+    case provisional
+
+    init(_ status: UNAuthorizationStatus) {
+        switch status {
+        case .authorized:
+            self = .authorized
+        case .provisional, .ephemeral:
+            self = .provisional
+        case .denied:
+            self = .denied
+        case .notDetermined:
+            self = .notDetermined
+        @unknown default:
+            self = .denied
+        }
+    }
+
+    var canRegisterRemoteNotifications: Bool {
+        switch self {
+        case .authorized, .provisional:
+            return true
+        case .notDetermined, .denied:
+            return false
+        }
+    }
+}
+
+enum NotificationPermissionPrimaryAction: Equatable {
+    case showPrePrompt
+    case openSettings
+    case none
+}
+
+@MainActor
+protocol NotificationAuthorizationProviding {
+    func authorizationStatus() async -> NotificationAuthorizationState
+    func requestAuthorization() async throws -> Bool
+}
+
+@MainActor
+protocol RemoteNotificationRegistering {
+    func registerForRemoteNotifications()
+}
+
+@MainActor
+protocol ApplicationSettingsOpening {
+    func openNotificationSettings()
+}
+
+@MainActor
+protocol PushTokenSynchronizing {
+    func syncPushToken(_ deviceToken: String, notificationsEnabled: Bool) async
+}
+
+@MainActor
+struct NoopPushTokenSynchronizer: PushTokenSynchronizing {
+    func syncPushToken(_: String, notificationsEnabled _: Bool) async {}
+}
+
+@MainActor
+final class UserNotificationCenterAuthorizationProvider: NotificationAuthorizationProviding {
+    private let center: UNUserNotificationCenter
+
+    init(center: UNUserNotificationCenter = .current()) {
+        self.center = center
+    }
+
+    func authorizationStatus() async -> NotificationAuthorizationState {
+        let settings = await withCheckedContinuation { continuation in
+            center.getNotificationSettings { settings in
+                continuation.resume(returning: settings)
+            }
+        }
+        return NotificationAuthorizationState(settings.authorizationStatus)
+    }
+
+    func requestAuthorization() async throws -> Bool {
+        try await withCheckedThrowingContinuation { continuation in
+            center.requestAuthorization(options: [.alert, .badge, .sound]) { granted, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+                continuation.resume(returning: granted)
+            }
+        }
+    }
+}
+
+@MainActor
+struct UIApplicationRemoteNotificationRegistrar: RemoteNotificationRegistering {
+    func registerForRemoteNotifications() {
+        UIApplication.shared.registerForRemoteNotifications()
+    }
+}
+
+@MainActor
+struct UIApplicationSettingsOpener: ApplicationSettingsOpening {
+    func openNotificationSettings() {
+        guard let url = URL(string: UIApplication.openSettingsURLString) else { return }
+        UIApplication.shared.open(url)
+    }
+}
+
+@MainActor
+final class NotificationPermissionManager: ObservableObject {
+    @Published private(set) var authorizationState: NotificationAuthorizationState
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var isRequestingAuthorization = false
+    @Published private(set) var lastRegistrationErrorDescription: String?
+    @Published private(set) var lastRegisteredDeviceToken: String?
+
+    private let authorizationProvider: NotificationAuthorizationProviding
+    private let remoteNotificationRegistrar: RemoteNotificationRegistering
+    private let settingsOpener: ApplicationSettingsOpening
+    private let pushTokenSynchronizer: PushTokenSynchronizing
+    private var hasAttemptedRemoteRegistrationThisLaunch = false
+    private var lastSyncedTokenState: (token: String, isEnabled: Bool)?
+
+    init(
+        authorizationProvider: NotificationAuthorizationProviding? = nil,
+        remoteNotificationRegistrar: RemoteNotificationRegistering? = nil,
+        settingsOpener: ApplicationSettingsOpening? = nil,
+        pushTokenSynchronizer: PushTokenSynchronizing? = nil,
+        initialAuthorizationState: NotificationAuthorizationState = .notDetermined
+    ) {
+        self.authorizationProvider = authorizationProvider ?? UserNotificationCenterAuthorizationProvider()
+        self.remoteNotificationRegistrar = remoteNotificationRegistrar ?? UIApplicationRemoteNotificationRegistrar()
+        self.settingsOpener = settingsOpener ?? UIApplicationSettingsOpener()
+        self.pushTokenSynchronizer = pushTokenSynchronizer ?? NoopPushTokenSynchronizer()
+        self.authorizationState = initialAuthorizationState
+    }
+
+    var canUseNotifications: Bool {
+        authorizationState.canRegisterRemoteNotifications
+    }
+
+    func refreshAuthorizationStatus(registerIfNeeded: Bool = false) async {
+        guard !isRefreshing else { return }
+        isRefreshing = true
+        let resolvedState = await authorizationProvider.authorizationStatus()
+        authorizationState = resolvedState
+        isRefreshing = false
+
+        if resolvedState.canRegisterRemoteNotifications {
+            lastRegistrationErrorDescription = nil
+            if registerIfNeeded {
+                registerForRemoteNotificationsIfNeeded()
+            }
+            return
+        }
+
+        hasAttemptedRemoteRegistrationThisLaunch = false
+        await syncStoredTokenIfNeeded(isEnabled: false)
+    }
+
+    func resolvePrimaryAction() async -> NotificationPermissionPrimaryAction {
+        await refreshAuthorizationStatus(registerIfNeeded: false)
+
+        switch authorizationState {
+        case .notDetermined:
+            return .showPrePrompt
+        case .denied:
+            return .openSettings
+        case .authorized, .provisional:
+            registerForRemoteNotificationsIfNeeded()
+            return .none
+        }
+    }
+
+    @discardableResult
+    func requestAuthorization() async -> NotificationAuthorizationState {
+        guard !isRequestingAuthorization else { return authorizationState }
+
+        isRequestingAuthorization = true
+        defer { isRequestingAuthorization = false }
+
+        do {
+            _ = try await authorizationProvider.requestAuthorization()
+            lastRegistrationErrorDescription = nil
+        } catch {
+            lastRegistrationErrorDescription = error.localizedDescription
+        }
+
+        await refreshAuthorizationStatus(registerIfNeeded: true)
+        return authorizationState
+    }
+
+    func openSystemSettings() {
+        settingsOpener.openNotificationSettings()
+    }
+
+    func didRegisterForRemoteNotifications(deviceToken: Data) async {
+        let token = deviceToken.map { String(format: "%02.2hhx", $0) }.joined()
+        lastRegisteredDeviceToken = token
+        lastRegistrationErrorDescription = nil
+        guard authorizationState.canRegisterRemoteNotifications else { return }
+        await syncStoredTokenIfNeeded(isEnabled: true)
+    }
+
+    func didFailToRegisterForRemoteNotifications(error: Error) {
+        hasAttemptedRemoteRegistrationThisLaunch = false
+        lastRegistrationErrorDescription = error.localizedDescription
+    }
+
+    private func registerForRemoteNotificationsIfNeeded() {
+        guard authorizationState.canRegisterRemoteNotifications else { return }
+        guard !hasAttemptedRemoteRegistrationThisLaunch else { return }
+        hasAttemptedRemoteRegistrationThisLaunch = true
+        remoteNotificationRegistrar.registerForRemoteNotifications()
+    }
+
+    private func syncStoredTokenIfNeeded(isEnabled: Bool) async {
+        guard let token = lastRegisteredDeviceToken else { return }
+        if !isEnabled && lastSyncedTokenState == nil {
+            return
+        }
+        if let lastSyncedTokenState,
+           lastSyncedTokenState.token == token,
+           lastSyncedTokenState.isEnabled == isEnabled {
+            return
+        }
+        await pushTokenSynchronizer.syncPushToken(token, notificationsEnabled: isEnabled)
+        lastSyncedTokenState = (token, isEnabled)
+    }
+}
+
+@MainActor
+final class NotificationApplicationDelegate: NSObject, UIApplicationDelegate {
+    var notificationPermissionManager: NotificationPermissionManager?
+
+    func application(
+        _: UIApplication,
+        didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data
+    ) {
+        Task { @MainActor in
+            await notificationPermissionManager?.didRegisterForRemoteNotifications(deviceToken: deviceToken)
+        }
+    }
+
+    func application(
+        _: UIApplication,
+        didFailToRegisterForRemoteNotificationsWithError error: Error
+    ) {
+        notificationPermissionManager?.didFailToRegisterForRemoteNotifications(error: error)
+    }
+}
+
 @MainActor
 final class AppContainer {
     let configuration: AppConfiguration
@@ -5262,18 +5517,21 @@ final class AppContainer {
     let recruitingRepository: RecruitingRepository
     let searchRepository: any SearchRepository
     let searchUseCase: SearchUseCase
+    let notificationPermissionManager: NotificationPermissionManager
 
     init(
         configuration: AppConfiguration = .load(),
         modelContainer: ModelContainer = AppModelContainerFactory.makeContainer(),
         tokenStore: TokenStore = TokenStore(),
         localStore: AppLocalStore? = nil,
+        notificationPermissionManager: NotificationPermissionManager? = nil,
         urlSession: URLSession = .shared
     ) {
+        let resolvedLocalStore = localStore ?? AppLocalStore(defaults: .standard, modelContainer: modelContainer)
         self.configuration = configuration
         self.modelContainer = modelContainer
         self.tokenStore = tokenStore
-        self.localStore = localStore ?? AppLocalStore(defaults: .standard, modelContainer: modelContainer)
+        self.localStore = resolvedLocalStore
         self.apiClient = APIClient(configuration: configuration, tokenStore: tokenStore, session: urlSession)
         self.authRepository = AuthRepository(apiClient: apiClient, tokenStore: tokenStore)
         self.profileRepository = ProfileRepository(apiClient: apiClient)
@@ -5282,6 +5540,7 @@ final class AppContainer {
         self.groupRepository = GroupRepository(apiClient: apiClient)
         self.matchRepository = MatchRepository(apiClient: apiClient)
         self.recruitingRepository = RecruitingRepository(apiClient: apiClient)
+        self.notificationPermissionManager = notificationPermissionManager ?? NotificationPermissionManager()
         self.searchRepository = LiveSearchRepository(
             groupRepository: groupRepository,
             recruitingRepository: recruitingRepository

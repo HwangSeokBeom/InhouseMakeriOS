@@ -6361,6 +6361,107 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(localStore.recentMatches.first?.matchID, "created-match")
     }
 
+    @MainActor
+    func testNotificationPermissionManagerDoesNotRegisterBeforeAuthorization() async {
+        let authorizationProvider = MockNotificationAuthorizationProvider(
+            currentStatus: .notDetermined,
+            requestResult: .authorized
+        )
+        let registrar = MockRemoteNotificationRegistrar()
+        let settingsOpener = MockApplicationSettingsOpener()
+        let synchronizer = MockPushTokenSynchronizer()
+        let manager = NotificationPermissionManager(
+            authorizationProvider: authorizationProvider,
+            remoteNotificationRegistrar: registrar,
+            settingsOpener: settingsOpener,
+            pushTokenSynchronizer: synchronizer,
+            initialAuthorizationState: .notDetermined
+        )
+
+        await manager.refreshAuthorizationStatus(registerIfNeeded: true)
+
+        XCTAssertEqual(manager.authorizationState, .notDetermined)
+        XCTAssertEqual(registrar.registerCallCount, 0)
+        XCTAssertEqual(synchronizer.syncCalls.count, 0)
+    }
+
+    @MainActor
+    func testNotificationPermissionManagerRegistersOnlyWhenAuthorizationGranted() async {
+        let authorizationProvider = MockNotificationAuthorizationProvider(
+            currentStatus: .authorized,
+            requestResult: .authorized
+        )
+        let registrar = MockRemoteNotificationRegistrar()
+        let manager = NotificationPermissionManager(
+            authorizationProvider: authorizationProvider,
+            remoteNotificationRegistrar: registrar,
+            settingsOpener: MockApplicationSettingsOpener(),
+            pushTokenSynchronizer: MockPushTokenSynchronizer(),
+            initialAuthorizationState: .notDetermined
+        )
+
+        await manager.refreshAuthorizationStatus(registerIfNeeded: true)
+
+        XCTAssertEqual(manager.authorizationState, .authorized)
+        XCTAssertEqual(registrar.registerCallCount, 1)
+    }
+
+    @MainActor
+    func testNotificationPermissionManagerUsesSettingsBranchWhenDenied() async {
+        let authorizationProvider = MockNotificationAuthorizationProvider(
+            currentStatus: .denied,
+            requestResult: .denied
+        )
+        let registrar = MockRemoteNotificationRegistrar()
+        let settingsOpener = MockApplicationSettingsOpener()
+        let manager = NotificationPermissionManager(
+            authorizationProvider: authorizationProvider,
+            remoteNotificationRegistrar: registrar,
+            settingsOpener: settingsOpener,
+            pushTokenSynchronizer: MockPushTokenSynchronizer(),
+            initialAuthorizationState: .notDetermined
+        )
+
+        let action = await manager.resolvePrimaryAction()
+        if action == .openSettings {
+            manager.openSystemSettings()
+        }
+
+        XCTAssertEqual(action, .openSettings)
+        XCTAssertEqual(registrar.registerCallCount, 0)
+        XCTAssertEqual(settingsOpener.openSettingsCallCount, 1)
+    }
+
+    @MainActor
+    func testNotificationPermissionManagerSyncsTokenOnlyAfterAuthorization() async {
+        let authorizationProvider = MockNotificationAuthorizationProvider(
+            currentStatus: .notDetermined,
+            requestResult: .authorized
+        )
+        let registrar = MockRemoteNotificationRegistrar()
+        let settingsOpener = MockApplicationSettingsOpener()
+        let synchronizer = MockPushTokenSynchronizer()
+        let manager = NotificationPermissionManager(
+            authorizationProvider: authorizationProvider,
+            remoteNotificationRegistrar: registrar,
+            settingsOpener: settingsOpener,
+            pushTokenSynchronizer: synchronizer,
+            initialAuthorizationState: .notDetermined
+        )
+        let token = Data([0x0A, 0x0B, 0x0C, 0x0D])
+
+        await manager.didRegisterForRemoteNotifications(deviceToken: token)
+        XCTAssertEqual(synchronizer.syncCalls.count, 0)
+
+        authorizationProvider.currentStatus = .authorized
+        await manager.refreshAuthorizationStatus(registerIfNeeded: false)
+        await manager.didRegisterForRemoteNotifications(deviceToken: token)
+
+        XCTAssertEqual(synchronizer.syncCalls.count, 1)
+        XCTAssertEqual(synchronizer.syncCalls.first?.token, "0a0b0c0d")
+        XCTAssertEqual(synchronizer.syncCalls.first?.notificationsEnabled, true)
+    }
+
     private func makeTokens() -> AuthTokens {
         AuthTokens(
             user: AuthUser(id: "u1", email: "user@example.com", nickname: "tester"),
@@ -6623,6 +6724,53 @@ final class InhouseMakeriOSTests: XCTestCase {
             .queryItems?
             .filter { $0.name == name }
             .compactMap(\.value) ?? []
+    }
+}
+
+@MainActor
+private final class MockNotificationAuthorizationProvider: NotificationAuthorizationProviding {
+    var currentStatus: NotificationAuthorizationState
+    let requestResult: NotificationAuthorizationState
+
+    init(currentStatus: NotificationAuthorizationState, requestResult: NotificationAuthorizationState) {
+        self.currentStatus = currentStatus
+        self.requestResult = requestResult
+    }
+
+    func authorizationStatus() async -> NotificationAuthorizationState {
+        currentStatus
+    }
+
+    func requestAuthorization() async throws -> Bool {
+        currentStatus = requestResult
+        return requestResult.canRegisterRemoteNotifications
+    }
+}
+
+@MainActor
+private final class MockRemoteNotificationRegistrar: RemoteNotificationRegistering {
+    private(set) var registerCallCount = 0
+
+    func registerForRemoteNotifications() {
+        registerCallCount += 1
+    }
+}
+
+@MainActor
+private final class MockApplicationSettingsOpener: ApplicationSettingsOpening {
+    private(set) var openSettingsCallCount = 0
+
+    func openNotificationSettings() {
+        openSettingsCallCount += 1
+    }
+}
+
+@MainActor
+private final class MockPushTokenSynchronizer: PushTokenSynchronizing {
+    private(set) var syncCalls: [(token: String, notificationsEnabled: Bool)] = []
+
+    func syncPushToken(_ deviceToken: String, notificationsEnabled: Bool) async {
+        syncCalls.append((token: deviceToken, notificationsEnabled: notificationsEnabled))
     }
 }
 

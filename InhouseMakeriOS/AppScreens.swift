@@ -6137,7 +6137,11 @@ struct AppShellView: View {
         case .search:
             SearchScreen(viewModel: SearchViewModel(session: session), session: session, router: router, onBack: router.pop)
         case .notifications:
-            NotificationsScreen(store: session.container.localStore, onBack: router.pop)
+            NotificationsScreen(
+                store: session.container.localStore,
+                notificationPermissionManager: session.container.notificationPermissionManager,
+                onBack: router.pop
+            )
         case .riotAccounts:
             RiotAccountsScreen(viewModel: RiotAccountsViewModel(session: session), session: session, onBack: router.pop)
         case .settings:
@@ -12308,15 +12312,129 @@ private enum RiotAccountInputField: Hashable {
     case tagLine
 }
 
+private struct NotificationPermissionCardContent {
+    let statusLabel: String
+    let title: String
+    let message: String
+    let primaryButtonTitle: String?
+    let statusTint: Color
+    let statusBackground: Color
+
+    init(state: NotificationAuthorizationState) {
+        switch state {
+        case .notDetermined:
+            statusLabel = "허용 전"
+            title = "푸시 알림을 아직 켜지 않았어요"
+            message = "매치 시작, 일정 변경, 공지 알림은 사용자가 알림 받기를 눌렀을 때만 권한을 요청하고 등록합니다."
+            primaryButtonTitle = "알림 받기"
+            statusTint = AppPalette.accentGold
+            statusBackground = AppPalette.accentGold.opacity(0.16)
+        case .denied:
+            statusLabel = "설정 필요"
+            title = "설정에서 알림 허용이 필요해요"
+            message = "이 기기에서 알림이 거절되어 있어 푸시를 보낼 수 없어요. 설정 앱에서 허용한 뒤 다시 돌아와 주세요."
+            primaryButtonTitle = "설정 열기"
+            statusTint = AppPalette.accentRed
+            statusBackground = AppPalette.accentRed.opacity(0.16)
+        case .authorized:
+            statusLabel = "활성"
+            title = "푸시 알림이 켜져 있어요"
+            message = "허용된 상태에서만 원격 알림을 등록하고 사용할 수 있어요."
+            primaryButtonTitle = nil
+            statusTint = AppPalette.accentGreen
+            statusBackground = AppPalette.accentGreen.opacity(0.16)
+        case .provisional:
+            statusLabel = "조용히 허용됨"
+            title = "조용히 전달되는 알림이 허용되어 있어요"
+            message = "알림 센터로는 받을 수 있지만 배너 방식은 기기 설정에 따라 달라질 수 있어요."
+            primaryButtonTitle = nil
+            statusTint = AppPalette.accentBlue
+            statusBackground = AppPalette.accentBlue.opacity(0.16)
+        }
+    }
+}
+
+private struct NotificationPermissionSummaryCard: View {
+    let state: NotificationAuthorizationState
+    let isBusy: Bool
+    let accessibilityPrefix: String
+    let onPrimaryAction: (() -> Void)?
+
+    private var content: NotificationPermissionCardContent {
+        NotificationPermissionCardContent(state: state)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: "bell.badge")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(content.statusTint)
+                    .frame(width: 38, height: 38)
+                    .background(content.statusBackground)
+                    .clipShape(Circle())
+
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(content.title)
+                        .font(AppTypography.body(14, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                    Text(content.message)
+                        .font(AppTypography.body(12))
+                        .foregroundStyle(AppPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer()
+
+                Text(content.statusLabel)
+                    .font(AppTypography.body(11, weight: .semibold))
+                    .foregroundStyle(content.statusTint)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(content.statusBackground)
+                    .clipShape(Capsule())
+                    .accessibilityIdentifier("\(accessibilityPrefix).status")
+            }
+
+            Text("앱 안의 알림함은 최근 활동 기록이며, 푸시 알림은 허용된 뒤에만 등록합니다.")
+                .font(AppTypography.body(11))
+                .foregroundStyle(AppPalette.textMuted)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let primaryButtonTitle = content.primaryButtonTitle, let onPrimaryAction {
+                Button(isBusy ? "확인 중..." : primaryButtonTitle, action: onPrimaryAction)
+                    .buttonStyle(.borderedProminent)
+                    .tint(AppPalette.accentBlue)
+                    .disabled(isBusy)
+                    .accessibilityIdentifier("\(accessibilityPrefix).primaryButton")
+            }
+        }
+        .padding(16)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("\(accessibilityPrefix).card")
+    }
+}
+
 struct NotificationsScreen: View {
     let store: AppLocalStore
+    @ObservedObject var notificationPermissionManager: NotificationPermissionManager
     let onBack: () -> Void
     @State private var notifications: [NotificationEntry] = []
+    @State private var showsNotificationPermissionPrompt = false
 
     var body: some View {
         screenScaffold(title: "알림", onBack: onBack, rightSystemImage: nil) {
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 16) {
+                    NotificationPermissionSummaryCard(
+                        state: notificationPermissionManager.authorizationState,
+                        isBusy: notificationPermissionManager.isRequestingAuthorization || notificationPermissionManager.isRefreshing,
+                        accessibilityPrefix: "notifications.notificationPermission"
+                    ) {
+                        handleNotificationPermissionPrimaryAction()
+                    }
+
                     if notifications.isEmpty {
                         EmptyStateView(title: "알림", message: "새로운 알림이 아직 없습니다.")
                             .frame(maxHeight: .infinity, alignment: .top)
@@ -12334,6 +12452,17 @@ struct NotificationsScreen: View {
         }
         .task {
             notifications = store.notifications
+            await notificationPermissionManager.refreshAuthorizationStatus(registerIfNeeded: true)
+        }
+        .alert("푸시 알림을 켤까요?", isPresented: $showsNotificationPermissionPrompt) {
+            Button("취소", role: .cancel) {}
+            Button("계속") {
+                Task {
+                    _ = await notificationPermissionManager.requestAuthorization()
+                }
+            }
+        } message: {
+            Text("매치 시작, 일정 변경, 공지 알림을 보내기 전에 먼저 시스템 권한을 요청합니다.")
         }
     }
 
@@ -12395,6 +12524,20 @@ struct NotificationsScreen: View {
         }
         .padding(14)
         .appPanel(background: entry.isUnread ? Color(hex: 0x111A28) : AppPalette.bgCard, radius: 12)
+    }
+
+    private func handleNotificationPermissionPrimaryAction() {
+        Task {
+            let action = await notificationPermissionManager.resolvePrimaryAction()
+            switch action {
+            case .showPrePrompt:
+                showsNotificationPermissionPrompt = true
+            case .openSettings:
+                notificationPermissionManager.openSystemSettings()
+            case .none:
+                break
+            }
+        }
     }
 }
 
@@ -13019,25 +13162,26 @@ struct SettingsScreen: View {
 
     @ObservedObject var session: AppSessionViewModel
     @ObservedObject var router: AppRouter
+    @ObservedObject private var notificationPermissionManager: NotificationPermissionManager
     let onBack: () -> Void
 
     @State private var isProfilePublic: Bool
     @State private var isHistoryPublic: Bool
-    @State private var notificationsEnabled: Bool
     @State private var showsProfileEdit = false
     @State private var activeSheet: SettingsSheet?
     @State private var externalLinkErrorMessage: String?
     @State private var showsSignOutConfirmation = false
     @State private var showsDeleteAccountConfirmation = false
+    @State private var showsNotificationPermissionPrompt = false
 
     init(session: AppSessionViewModel, router: AppRouter, onBack: @escaping () -> Void) {
         self.session = session
         self.router = router
         self.onBack = onBack
+        _notificationPermissionManager = ObservedObject(wrappedValue: session.container.notificationPermissionManager)
         let localStore = session.container.localStore
         _isProfilePublic = State(initialValue: localStore.isProfilePublic)
         _isHistoryPublic = State(initialValue: localStore.isHistoryPublic)
-        _notificationsEnabled = State(initialValue: localStore.notificationsEnabled)
     }
 
     private var appVersionText: String {
@@ -13117,9 +13261,7 @@ struct SettingsScreen: View {
                         ])
                     }
 
-                    settingsSection(title: "알림", rows: [
-                        toggleRow("알림 설정", systemImage: "bell", isOn: $notificationsEnabled)
-                    ])
+                    notificationPermissionSection
 
                     settingsSection(title: "공개 설정", rows: [
                         toggleRow("프로필 공개 범위", systemImage: "eye", isOn: $isProfilePublic),
@@ -13168,6 +13310,19 @@ struct SettingsScreen: View {
         } message: {
             Text(externalLinkErrorMessage ?? "잠시 후 다시 시도해 주세요.")
         }
+        .task {
+            await notificationPermissionManager.refreshAuthorizationStatus(registerIfNeeded: true)
+        }
+        .alert("푸시 알림을 켤까요?", isPresented: $showsNotificationPermissionPrompt) {
+            Button("취소", role: .cancel) {}
+            Button("계속") {
+                Task {
+                    _ = await notificationPermissionManager.requestAuthorization()
+                }
+            }
+        } message: {
+            Text("매치 시작, 일정 변경, 공지 알림을 보내기 전에 먼저 시스템 권한을 요청합니다.")
+        }
         .alert("로그아웃할까요?", isPresented: $showsSignOutConfirmation) {
             Button("취소", role: .cancel) {}
             Button("로그아웃", role: .destructive) {
@@ -13185,9 +13340,6 @@ struct SettingsScreen: View {
             Text("계정과 서버에 저장된 프로필 정보 삭제를 요청합니다. 탈퇴 후에는 현재 세션과 이 기기의 계정 캐시가 정리됩니다.")
         }
         .overlay(alignment: .bottom) { actionBanner(session.actionState) }
-        .onChange(of: notificationsEnabled) { _, newValue in
-            session.container.localStore.setNotificationsEnabled(newValue)
-        }
         .onChange(of: isProfilePublic) { _, newValue in
             session.container.localStore.setProfilePublic(newValue)
         }
@@ -13228,6 +13380,23 @@ struct SettingsScreen: View {
         }
         .background(AppPalette.bgCard)
         .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var notificationPermissionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("알림")
+                .font(AppTypography.body(12, weight: .semibold))
+                .foregroundStyle(AppPalette.textSecondary)
+                .padding(.horizontal, 16)
+
+            NotificationPermissionSummaryCard(
+                state: notificationPermissionManager.authorizationState,
+                isBusy: notificationPermissionManager.isRequestingAuthorization || notificationPermissionManager.isRefreshing,
+                accessibilityPrefix: "settings.notificationPermission"
+            ) {
+                handleNotificationPermissionPrimaryAction()
+            }
+        }
     }
 
     private func settingsRow(
@@ -13294,6 +13463,20 @@ struct SettingsScreen: View {
             .frame(height: 48)
             .tint(AppPalette.accentBlue)
         )
+    }
+
+    private func handleNotificationPermissionPrimaryAction() {
+        Task {
+            let action = await notificationPermissionManager.resolvePrimaryAction()
+            switch action {
+            case .showPrePrompt:
+                showsNotificationPermissionPrompt = true
+            case .openSettings:
+                notificationPermissionManager.openSystemSettings()
+            case .none:
+                break
+            }
+        }
     }
 
     private func handleExternalLinkLoadFailure(_ link: AppExternalLink) {
