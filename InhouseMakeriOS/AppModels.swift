@@ -2916,9 +2916,11 @@ struct HomeSnapshot: Equatable {
     let profile: UserProfile
     let riotAccountsViewState: RiotLinkedAccountsViewState
     let power: PowerProfile?
-    let homeSummaryState: HomeSummaryLoadState
-    let trackedGroupsState: HomeTrackedGroupsLoadState
-    let currentMatchState: HomeCurrentMatchLoadState
+    let scheduledMatchesSectionState: HomeSectionState<Match>
+    let recentGroupsSectionState: HomeSectionState<[GroupSummary]>
+    let publicContentSectionState: HomeSectionState<[RecruitPost]>
+    let localRecordsSectionState: HomeSectionState<LocalMatchRecord>
+    let recentMatchesSectionState: HomeSectionState<MatchHistoryItem>
     let groups: [GroupSummary]
     let currentMatch: Match?
     let latestHistory: MatchHistoryItem?
@@ -2926,6 +2928,11 @@ struct HomeSnapshot: Equatable {
 }
 
 struct GuestHomeSnapshot: Equatable {
+    let scheduledMatchesSectionState: HomeSectionState<Match>
+    let recentGroupsSectionState: HomeSectionState<[GroupSummary]>
+    let publicContentSectionState: HomeSectionState<[RecruitPost]>
+    let localRecordsSectionState: HomeSectionState<LocalMatchRecord>
+    let recentMatchesSectionState: HomeSectionState<MatchHistoryItem>
     let groups: [GroupSummary]
     let currentMatch: Match?
     let latestLocalResult: LocalMatchRecord?
@@ -2937,20 +2944,11 @@ enum HomeContentState: Equatable {
     case authenticated(HomeSnapshot)
 }
 
-enum HomeSummaryLoadState: Equatable {
-    case loaded
-}
-
-enum HomeTrackedGroupsLoadState: Equatable {
-    case loaded
-    case partial
-    case missing
-}
-
-enum HomeCurrentMatchLoadState: Equatable {
-    case loaded
-    case partial
-    case missing
+enum HomeSectionState<Value: Equatable>: Equatable {
+    case loading
+    case populated(Value)
+    case empty
+    case error(UserFacingError)
 }
 
 struct GroupDetailSnapshot: Equatable {

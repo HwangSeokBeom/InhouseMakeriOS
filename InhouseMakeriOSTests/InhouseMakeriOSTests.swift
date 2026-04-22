@@ -3346,10 +3346,116 @@ final class InhouseMakeriOSTests: XCTestCase {
         case let .content(.authenticated(snapshot)):
             XCTAssertTrue(snapshot.recruitingPosts.isEmpty)
             XCTAssertEqual(snapshot.latestHistory?.matchID, "match-1")
+            if case let .error(error) = snapshot.publicContentSectionState {
+                XCTAssertEqual(error.statusCode, 400)
+            } else {
+                XCTFail("Expected public content section error")
+            }
+            if case let .populated(latestHistory) = snapshot.recentMatchesSectionState {
+                XCTAssertEqual(latestHistory.matchID, "match-1")
+            } else {
+                XCTFail("Expected recent matches section content")
+            }
         case let .error(error):
             XCTFail("Expected home content, got error: \(error.title) / \(error.message)")
         default:
             XCTFail("Expected authenticated home content")
+        }
+    }
+
+    @MainActor
+    func testHomeViewModelAuthenticatedEmptyResponseKeepsHomeLayoutContent() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.authenticated-empty.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: AppLocalStore(defaults: defaults),
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/recruiting-posts"):
+                    return (200, try JSONEncoder.app.encode(RecruitPostListDTO(items: [])))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [])))
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (200, try JSONEncoder.app.encode(HistoryResponseDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test_authenticated_empty")
+
+        XCTAssertTrue(viewModel.hasLoadedOnce)
+        XCTAssertFalse(viewModel.isInitialLoading)
+
+        switch viewModel.state {
+        case let .content(.authenticated(snapshot)):
+            XCTAssertTrue(snapshot.groups.isEmpty)
+            XCTAssertNil(snapshot.currentMatch)
+            XCTAssertNil(snapshot.latestHistory)
+            XCTAssertTrue(snapshot.recruitingPosts.isEmpty)
+            XCTAssertEqual(snapshot.scheduledMatchesSectionState, .empty)
+            XCTAssertEqual(snapshot.recentGroupsSectionState, .empty)
+            XCTAssertEqual(snapshot.publicContentSectionState, .empty)
+            XCTAssertEqual(snapshot.localRecordsSectionState, .empty)
+            XCTAssertEqual(snapshot.recentMatchesSectionState, .empty)
+        default:
+            XCTFail("Expected authenticated home content instead of root empty state")
+        }
+    }
+
+    @MainActor
+    func testHomeViewModelGuestEmptyResponseKeepsHomeLayoutContent() async throws {
+        let suiteName = "InhouseMakeriOSTests.home.guest-empty.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            localStore: AppLocalStore(defaults: defaults),
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups/public"):
+                    return (200, try JSONEncoder.app.encode(GroupSummaryListDTO(items: [])))
+                case ("GET", "/recruiting-posts/public"):
+                    return (200, try JSONEncoder.app.encode(RecruitPostListDTO(items: [])))
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.restoreGuestSession()
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test_guest_empty")
+
+        switch viewModel.state {
+        case let .content(.guest(snapshot)):
+            XCTAssertTrue(snapshot.groups.isEmpty)
+            XCTAssertTrue(snapshot.recruitingPosts.isEmpty)
+            XCTAssertNil(snapshot.latestLocalResult)
+            XCTAssertEqual(snapshot.scheduledMatchesSectionState, .empty)
+            XCTAssertEqual(snapshot.recentGroupsSectionState, .empty)
+            XCTAssertEqual(snapshot.publicContentSectionState, .empty)
+            XCTAssertEqual(snapshot.localRecordsSectionState, .empty)
+        default:
+            XCTFail("Expected guest home content instead of root empty state")
         }
     }
 
@@ -3543,10 +3649,18 @@ final class InhouseMakeriOSTests: XCTestCase {
         switch viewModel.state {
         case let .content(.authenticated(snapshot)):
             XCTAssertEqual(snapshot.groups.map(\.id), ["active-group"])
-            XCTAssertEqual(snapshot.trackedGroupsState, .partial)
-            XCTAssertEqual(snapshot.currentMatchState, .partial)
             XCTAssertNil(snapshot.currentMatch)
             XCTAssertEqual(snapshot.latestHistory?.matchID, "match-1")
+            if case let .populated(groups) = snapshot.recentGroupsSectionState {
+                XCTAssertEqual(groups.map(\.id), ["active-group"])
+            } else {
+                XCTFail("Expected recent groups section content")
+            }
+            if case let .error(error) = snapshot.scheduledMatchesSectionState {
+                XCTAssertEqual(error.title, "예정된 내전 로딩 실패")
+            } else {
+                XCTFail("Expected scheduled matches section error")
+            }
         default:
             XCTFail("Expected authenticated home content")
         }
@@ -3646,10 +3760,97 @@ final class InhouseMakeriOSTests: XCTestCase {
         switch viewModel.state {
         case let .content(.authenticated(snapshot)):
             XCTAssertEqual(snapshot.groups.map(\.id), ["active-group"])
-            XCTAssertEqual(snapshot.trackedGroupsState, .loaded)
-            XCTAssertEqual(snapshot.currentMatchState, .partial)
             XCTAssertNil(snapshot.currentMatch)
             XCTAssertEqual(snapshot.latestHistory?.matchID, "match-1")
+            if case let .populated(groups) = snapshot.recentGroupsSectionState {
+                XCTAssertEqual(groups.map(\.id), ["active-group"])
+            } else {
+                XCTFail("Expected recent groups section content")
+            }
+            if case let .error(error) = snapshot.scheduledMatchesSectionState {
+                XCTAssertEqual(error.title, "예정된 내전 로딩 실패")
+            } else {
+                XCTFail("Expected scheduled matches section error")
+            }
+        default:
+            XCTFail("Expected authenticated home content")
+        }
+    }
+
+    @MainActor
+    func testHomeViewModelRecentHistoryFailureKeepsContentWithSectionError() async throws {
+        let tokenStore = makeTokenStore()
+        await tokenStore.save(tokens: makeTokens())
+        let suiteName = "InhouseMakeriOSTests.home.history-failure.\(UUID().uuidString)"
+        guard let defaults = UserDefaults(suiteName: suiteName) else {
+            return XCTFail("Expected isolated user defaults suite")
+        }
+        defaults.removePersistentDomain(forName: suiteName)
+
+        let localStore = AppLocalStore(defaults: defaults)
+        localStore.trackGroup(id: "active-group", name: "남은 그룹")
+        let container = AppContainer(
+            configuration: makeConfiguration(),
+            tokenStore: tokenStore,
+            localStore: localStore,
+            urlSession: makeURLSession { request in
+                switch (request.httpMethod, request.url?.path) {
+                case ("GET", "/groups"):
+                    let payload = try JSONEncoder.app.encode(
+                        GroupSummaryListDTO(
+                            items: [
+                                GroupSummaryDTO(
+                                    id: "active-group",
+                                    name: "남은 그룹",
+                                    description: nil,
+                                    visibility: .private,
+                                    joinPolicy: .inviteOnly,
+                                    tags: ["서울"],
+                                    ownerUserId: "u1",
+                                    memberCount: 5,
+                                    recentMatches: 0
+                                ),
+                            ]
+                        )
+                    )
+                    return (200, payload)
+                case ("GET", "/recruiting-posts"):
+                    return (200, try JSONEncoder.app.encode(RecruitPostListDTO(items: [])))
+                case ("GET", "/riot-accounts"):
+                    return (200, try JSONEncoder.app.encode(RiotAccountListDTO(items: [])))
+                case ("GET", "/users/u1/inhouse-history"):
+                    return (
+                        500,
+                        self.makeServerErrorData(
+                            statusCode: 500,
+                            code: "INTERNAL_SERVER_ERROR",
+                            message: "History failed."
+                        )
+                    )
+                default:
+                    XCTFail("Unexpected request \(request.httpMethod ?? "nil") \(request.url?.path ?? "nil")")
+                    return (500, Data())
+                }
+            }
+        )
+        let session = AppSessionViewModel(container: container)
+        session.applyAuthenticatedSession(UserSession(authTokens: makeTokens(), user: makeProfile()))
+        let viewModel = HomeViewModel(session: session)
+
+        await viewModel.load(force: true, trigger: "test_history_failure")
+
+        switch viewModel.state {
+        case let .content(.authenticated(snapshot)):
+            if case let .populated(groups) = snapshot.recentGroupsSectionState {
+                XCTAssertEqual(groups.map(\.id), ["active-group"])
+            } else {
+                XCTFail("Expected recent groups section content")
+            }
+            if case let .error(error) = snapshot.recentMatchesSectionState {
+                XCTAssertEqual(error.statusCode, 500)
+            } else {
+                XCTFail("Expected recent matches section error")
+            }
         default:
             XCTFail("Expected authenticated home content")
         }

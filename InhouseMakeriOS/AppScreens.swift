@@ -1248,14 +1248,39 @@ private enum RecruitOptionCatalog {
 final class HomeViewModel: ObservableObject {
     @Published private(set) var state: ScreenLoadState<HomeContentState> = .initial
 
+    var isInitialLoading: Bool {
+        guard !hasLoadedOnce else { return false }
+        switch state {
+        case .initial, .loading:
+            return true
+        case .refreshing, .content, .empty, .error:
+            return false
+        }
+    }
+
+    var hasLoadedOnce: Bool {
+        initialLoadTracker.hasLoadedInitialData
+    }
+
+    private enum HomeSectionLoadStatus {
+        case loaded
+        case partial
+        case missing
+    }
+
     private struct TrackedGroupsLoadResult {
         let groups: [GroupSummary]
-        let state: HomeTrackedGroupsLoadState
+        let status: HomeSectionLoadStatus
     }
 
     private struct CurrentMatchLoadResult {
         let match: Match?
-        let state: HomeCurrentMatchLoadState
+        let status: HomeSectionLoadStatus
+    }
+
+    private struct RecruitingPostsLoadResult {
+        let posts: [RecruitPost]
+        let state: HomeSectionState<[RecruitPost]>
     }
 
     private let session: AppSessionViewModel
@@ -1278,79 +1303,268 @@ final class HomeViewModel: ObservableObject {
             )
         }
         debugHomeLoad("load start trigger=\(trigger) force=\(force) scope=\(session.dataScopeKey)")
-        state = .loading
+        if let current = state.value {
+            state = .refreshing(current)
+        } else {
+            state = .loading
+        }
 
         if let profile = session.profile, let userID = session.currentUserID {
+            var groups: [GroupSummary] = []
+            var currentMatch: Match?
+            var latestHistory: MatchHistoryItem?
+            var recruitingPosts: [RecruitPost] = []
+            var scheduledMatchesSectionState: HomeSectionState<Match> = .loading
+            var recentGroupsSectionState: HomeSectionState<[GroupSummary]> = .loading
+            var publicContentSectionState: HomeSectionState<[RecruitPost]> = .loading
+            let localRecordsSectionState: HomeSectionState<LocalMatchRecord> = .empty
+            var recentMatchesSectionState: HomeSectionState<MatchHistoryItem> = .loading
+            var riotAccountsViewState: RiotLinkedAccountsViewState = session.riotAccountsViewState
+            var power: PowerProfile?
+
             do {
                 let trackedGroupsSnapshot = session.container.localStore.storedGroupIDsSnapshot()
                 let recentMatchesSnapshot = session.container.localStore.recentMatchesSnapshot()
                 let trackedGroupsResult = try await loadTrackedGroups(trigger: trigger, rawSnapshot: trackedGroupsSnapshot)
+                groups = trackedGroupsResult.groups
+                recentGroupsSectionState = makeRecentGroupsSectionState(
+                    groups: groups,
+                    status: trackedGroupsResult.status,
+                    isGuest: false
+                )
+
                 let currentMatchResult = try await loadCurrentMatch(trigger: trigger, rawSnapshot: recentMatchesSnapshot)
-                let posts = try await loadRecruitingPostsForHome(isAuthenticated: true, trigger: trigger)
+                currentMatch = currentMatchResult.match
+                scheduledMatchesSectionState = makeScheduledMatchesSectionState(
+                    match: currentMatch,
+                    status: currentMatchResult.status
+                )
+
+                let postsResult = try await loadRecruitingPostsForHome(isAuthenticated: true, trigger: trigger)
+                recruitingPosts = Array(postsResult.posts.prefix(4))
+                publicContentSectionState = postsResult.state
+
                 debugHomeLoad("requestSource trigger=\(trigger) endpoint=/riot-accounts source=HomeViewModel.refreshRiotAccountsViewState")
-                let riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
+                riotAccountsViewState = await session.refreshRiotAccountsViewState(force: force)
                 if case let .error(error) = riotAccountsViewState, error.requiresAuthentication {
                     throw error
                 }
-                let power: PowerProfile?
+
                 if riotAccountsViewState.hasLinkedAccounts {
                     debugHomeLoad("requestSource trigger=\(trigger) endpoint=/users/\(userID)/power-profile source=HomeViewModel.load")
                     power = try? await session.container.profileRepository.powerProfile(userID: userID)
                 } else {
                     power = nil
                 }
-                debugHomeLoad("requestSource trigger=\(trigger) endpoint=/users/\(userID)/inhouse-history source=HomeViewModel.load")
-                let history = try await session.container.profileRepository.history(userID: userID, limit: 1)
+
+                do {
+                    debugHomeLoad("requestSource trigger=\(trigger) endpoint=/users/\(userID)/inhouse-history source=HomeViewModel.load")
+                    let history = try await session.container.profileRepository.history(userID: userID, limit: 1)
+                    latestHistory = history.first
+                    recentMatchesSectionState = history.first.map(HomeSectionState.populated) ?? .empty
+                } catch let error as UserFacingError {
+                    if error.requiresAuthentication {
+                        throw error
+                    }
+                    recentMatchesSectionState = .error(error)
+                } catch {
+                    recentMatchesSectionState = .error(
+                        UserFacingError(
+                            title: "최근 경기 로딩 실패",
+                            message: "최근 경기 정보를 불러오지 못했습니다."
+                        )
+                    )
+                }
+
                 let snapshot = HomeSnapshot(
                     profile: profile,
                     riotAccountsViewState: riotAccountsViewState,
                     power: power,
-                    homeSummaryState: .loaded,
-                    trackedGroupsState: trackedGroupsResult.state,
-                    currentMatchState: currentMatchResult.state,
-                    groups: trackedGroupsResult.groups,
-                    currentMatch: currentMatchResult.match,
-                    latestHistory: history.first,
-                    recruitingPosts: Array(posts.prefix(4))
+                    scheduledMatchesSectionState: scheduledMatchesSectionState,
+                    recentGroupsSectionState: recentGroupsSectionState,
+                    publicContentSectionState: publicContentSectionState,
+                    localRecordsSectionState: localRecordsSectionState,
+                    recentMatchesSectionState: recentMatchesSectionState,
+                    groups: groups,
+                    currentMatch: currentMatch,
+                    latestHistory: latestHistory,
+                    recruitingPosts: recruitingPosts
                 )
                 homeSummaryLoaded = true
                 trackedGroupsCount = snapshot.groups.count
                 currentMatchID = snapshot.currentMatch?.id
-
-                if snapshot.groups.isEmpty && snapshot.currentMatch == nil && snapshot.latestHistory == nil && posts.isEmpty {
-                    state = .empty("홈 집계에 사용할 데이터가 아직 없습니다.\n그룹을 만들거나 모집글을 확인해 흐름을 시작해주세요.")
-                } else {
-                    state = .content(.authenticated(snapshot))
-                }
+                state = .content(.authenticated(snapshot))
                 didSucceed = true
             } catch let error as UserFacingError {
-                session.handleProtectedLoadError(
-                    error,
-                    requirement: .profileSync,
-                    state: &state,
-                    fallbackMessage: "로그인 후 홈 정보를 다시 확인할 수 있어요."
+                if error.requiresAuthentication {
+                    session.requireReauthentication(for: .profileSync)
+                }
+
+                scheduledMatchesSectionState = resolvePendingSectionState(
+                    scheduledMatchesSectionState,
+                    fallbackError: homeSectionError(
+                        title: "예정된 내전 로딩 실패",
+                        message: error.requiresAuthentication
+                            ? "로그인 후 예정된 내전을 다시 확인할 수 있어요."
+                            : "예정된 내전 정보를 불러오지 못했습니다."
+                    )
                 )
+                recentGroupsSectionState = resolvePendingSectionState(
+                    recentGroupsSectionState,
+                    fallbackError: homeSectionError(
+                        title: "참여 그룹 로딩 실패",
+                        message: error.requiresAuthentication
+                            ? "로그인 후 참여 그룹을 다시 확인할 수 있어요."
+                            : "최근 참여 그룹 정보를 불러오지 못했습니다."
+                    )
+                )
+                publicContentSectionState = resolvePendingSectionState(
+                    publicContentSectionState,
+                    fallbackError: homeSectionError(
+                        title: "공개 콘텐츠 로딩 실패",
+                        message: error.requiresAuthentication
+                            ? "로그인 후 공개 콘텐츠를 다시 확인할 수 있어요."
+                            : "공개 그룹과 모집글을 불러오지 못했습니다."
+                    )
+                )
+                recentMatchesSectionState = resolvePendingSectionState(
+                    recentMatchesSectionState,
+                    fallbackError: homeSectionError(
+                        title: "최근 경기 로딩 실패",
+                        message: error.requiresAuthentication
+                            ? "로그인 후 최근 경기를 다시 확인할 수 있어요."
+                            : "최근 경기 정보를 불러오지 못했습니다."
+                    )
+                )
+
+                let snapshot = HomeSnapshot(
+                    profile: profile,
+                    riotAccountsViewState: riotAccountsViewState,
+                    power: power,
+                    scheduledMatchesSectionState: scheduledMatchesSectionState,
+                    recentGroupsSectionState: recentGroupsSectionState,
+                    publicContentSectionState: publicContentSectionState,
+                    localRecordsSectionState: localRecordsSectionState,
+                    recentMatchesSectionState: recentMatchesSectionState,
+                    groups: groups,
+                    currentMatch: currentMatch,
+                    latestHistory: latestHistory,
+                    recruitingPosts: recruitingPosts
+                )
+                homeSummaryLoaded = true
+                trackedGroupsCount = snapshot.groups.count
+                currentMatchID = snapshot.currentMatch?.id
+                state = .content(.authenticated(snapshot))
+                didSucceed = true
             } catch {
-                state = .error(UserFacingError(title: "홈 로딩 실패", message: "홈 데이터를 불러오지 못했습니다."))
+                let fallbackError = homeSectionError(
+                    title: "홈 로딩 실패",
+                    message: "홈 데이터를 불러오지 못했습니다."
+                )
+                let snapshot = HomeSnapshot(
+                    profile: profile,
+                    riotAccountsViewState: riotAccountsViewState,
+                    power: power,
+                    scheduledMatchesSectionState: resolvePendingSectionState(
+                        scheduledMatchesSectionState,
+                        fallbackError: homeSectionError(
+                            title: "예정된 내전 로딩 실패",
+                            message: fallbackError.message
+                        )
+                    ),
+                    recentGroupsSectionState: resolvePendingSectionState(
+                        recentGroupsSectionState,
+                        fallbackError: homeSectionError(
+                            title: "참여 그룹 로딩 실패",
+                            message: fallbackError.message
+                        )
+                    ),
+                    publicContentSectionState: resolvePendingSectionState(
+                        publicContentSectionState,
+                        fallbackError: homeSectionError(
+                            title: "공개 콘텐츠 로딩 실패",
+                            message: fallbackError.message
+                        )
+                    ),
+                    localRecordsSectionState: localRecordsSectionState,
+                    recentMatchesSectionState: resolvePendingSectionState(
+                        recentMatchesSectionState,
+                        fallbackError: homeSectionError(
+                            title: "최근 경기 로딩 실패",
+                            message: fallbackError.message
+                        )
+                    ),
+                    groups: groups,
+                    currentMatch: currentMatch,
+                    latestHistory: latestHistory,
+                    recruitingPosts: recruitingPosts
+                )
+                homeSummaryLoaded = true
+                trackedGroupsCount = snapshot.groups.count
+                currentMatchID = snapshot.currentMatch?.id
+                state = .content(.authenticated(snapshot))
+                didSucceed = true
             }
             return
         }
 
-        debugHomeLoad("requestSource trigger=\(trigger) endpoint=/groups source=HomeViewModel.load guest=true")
-        let groups = ((try? await session.container.groupRepository.listPublic()) ?? []).filterPubliclyVisible()
-        let posts = (try? await loadRecruitingPostsForHome(isAuthenticated: false, trigger: trigger)) ?? []
+        var groups: [GroupSummary] = []
+        var recentGroupsSectionState: HomeSectionState<[GroupSummary]> = .loading
+        var publicContentSectionState: HomeSectionState<[RecruitPost]> = .loading
+        let scheduledMatchesSectionState: HomeSectionState<Match> = .empty
+        let latestLocalResult = session.container.localStore.localMatchRecords.first
+        let localRecordsSectionState: HomeSectionState<LocalMatchRecord> = latestLocalResult.map(HomeSectionState.populated) ?? .empty
+        let recentMatchesSectionState: HomeSectionState<MatchHistoryItem> = .empty
+        var recruitingPosts: [RecruitPost] = []
+
+        do {
+            debugHomeLoad("requestSource trigger=\(trigger) endpoint=/groups source=HomeViewModel.load guest=true")
+            groups = try await session.container.groupRepository.listPublic()
+            recentGroupsSectionState = groups.isEmpty
+                ? .empty
+                : .populated(Array(groups.prefix(4)))
+        } catch let error as UserFacingError {
+            recentGroupsSectionState = .error(error)
+        } catch {
+            recentGroupsSectionState = .error(
+                homeSectionError(
+                    title: "공개 그룹 로딩 실패",
+                    message: "공개 그룹 목록을 불러오지 못했습니다."
+                )
+            )
+        }
+
+        do {
+            let postsResult = try await loadRecruitingPostsForHome(isAuthenticated: false, trigger: trigger)
+            recruitingPosts = Array(postsResult.posts.prefix(4))
+            publicContentSectionState = postsResult.state
+        } catch let error as UserFacingError {
+            publicContentSectionState = .error(error)
+        } catch {
+            publicContentSectionState = .error(
+                homeSectionError(
+                    title: "공개 콘텐츠 로딩 실패",
+                    message: "공개 모집글을 불러오지 못했습니다."
+                )
+            )
+        }
+
         let guestSnapshot = GuestHomeSnapshot(
+            scheduledMatchesSectionState: scheduledMatchesSectionState,
+            recentGroupsSectionState: recentGroupsSectionState,
+            publicContentSectionState: publicContentSectionState,
+            localRecordsSectionState: localRecordsSectionState,
+            recentMatchesSectionState: recentMatchesSectionState,
             groups: Array(groups.prefix(4)),
             currentMatch: nil,
-            latestLocalResult: session.container.localStore.localMatchRecords.first,
-            recruitingPosts: Array(posts.prefix(4))
+            latestLocalResult: latestLocalResult,
+            recruitingPosts: recruitingPosts
         )
 
-        if groups.isEmpty && guestSnapshot.latestLocalResult == nil && posts.isEmpty {
-            state = .empty("아직 둘러볼 공개 그룹이나 모집글이 없습니다.\n공개 그룹을 확인하거나 실제 내전 흐름을 시작해 보세요.")
-        } else {
-            state = .content(.guest(guestSnapshot))
-        }
+        homeSummaryLoaded = true
+        trackedGroupsCount = guestSnapshot.groups.count
+        currentMatchID = nil
+        state = .content(.guest(guestSnapshot))
         didSucceed = true
     }
 
@@ -1366,6 +1580,65 @@ final class HomeViewModel: ObservableObject {
     func reset() {
         state = .initial
         initialLoadTracker.reset()
+    }
+
+    private func makeRecentGroupsSectionState(
+        groups: [GroupSummary],
+        status: HomeSectionLoadStatus,
+        isGuest: Bool
+    ) -> HomeSectionState<[GroupSummary]> {
+        if !groups.isEmpty {
+            return .populated(Array(groups.prefix(4)))
+        }
+
+        switch status {
+        case .loaded, .missing:
+            return .empty
+        case .partial:
+            return .error(
+                homeSectionError(
+                    title: isGuest ? "공개 그룹 로딩 실패" : "참여 그룹 로딩 실패",
+                    message: isGuest
+                        ? "공개 그룹 목록을 불러오지 못했습니다."
+                        : "최근 참여 그룹 정보를 불러오지 못했습니다."
+                )
+            )
+        }
+    }
+
+    private func makeScheduledMatchesSectionState(
+        match: Match?,
+        status: HomeSectionLoadStatus
+    ) -> HomeSectionState<Match> {
+        if let match {
+            return .populated(match)
+        }
+
+        switch status {
+        case .loaded, .missing:
+            return .empty
+        case .partial:
+            return .error(
+                homeSectionError(
+                    title: "예정된 내전 로딩 실패",
+                    message: "예정된 내전 정보를 불러오지 못했습니다."
+                )
+            )
+        }
+    }
+
+    private func resolvePendingSectionState<Value: Equatable>(
+        _ state: HomeSectionState<Value>,
+        fallbackError: UserFacingError
+    ) -> HomeSectionState<Value> {
+        if case .loading = state {
+            return .error(fallbackError)
+        }
+        return state
+    }
+
+    private func homeSectionError(title: String, message: String) -> UserFacingError {
+        UserFacingError(title: title, message: message)
     }
 
     private func loadTrackedGroups(
@@ -1397,7 +1670,7 @@ final class HomeViewModel: ObservableObject {
             if hadPartialFailure {
                 debugHomeLoadDetail("action=partial_failure section=trackedGroups code=INVALID_HOME_TEST_ID fatal=false")
             }
-            return TrackedGroupsLoadResult(groups: [], state: hadPartialFailure ? .partial : .missing)
+            return TrackedGroupsLoadResult(groups: [], status: hadPartialFailure ? .partial : .missing)
         }
 
         do {
@@ -1420,23 +1693,23 @@ final class HomeViewModel: ObservableObject {
                 debugHomeLoadDetail("action=partial_failure section=trackedGroups code=GROUP_ACCESS_FORBIDDEN fatal=false")
             }
 
-            let state: HomeTrackedGroupsLoadState
+            let status: HomeSectionLoadStatus
             if resolvedGroups.isEmpty {
-                state = hadPartialFailure ? .partial : .missing
+                status = hadPartialFailure ? .partial : .missing
             } else {
-                state = hadPartialFailure ? .partial : .loaded
+                status = hadPartialFailure ? .partial : .loaded
             }
 
-            return TrackedGroupsLoadResult(groups: resolvedGroups, state: state)
+            return TrackedGroupsLoadResult(groups: resolvedGroups, status: status)
         } catch let error as UserFacingError {
             if error.requiresAuthentication {
                 throw error
             }
             debugHomeLoadDetail("action=partial_failure section=trackedGroups code=\(debugCode(for: error)) fatal=false")
-            return TrackedGroupsLoadResult(groups: [], state: .partial)
+            return TrackedGroupsLoadResult(groups: [], status: .partial)
         } catch {
             debugHomeLoadDetail("action=partial_failure section=trackedGroups code=UNKNOWN fatal=false")
-            return TrackedGroupsLoadResult(groups: [], state: .partial)
+            return TrackedGroupsLoadResult(groups: [], status: .partial)
         }
     }
 
@@ -1464,7 +1737,7 @@ final class HomeViewModel: ObservableObject {
             if hadPartialFailure {
                 debugHomeLoadDetail("action=partial_failure section=currentMatch code=CONTEXT_CLEARED fatal=false")
             }
-            return CurrentMatchLoadResult(match: nil, state: hadPartialFailure ? .partial : .missing)
+            return CurrentMatchLoadResult(match: nil, status: hadPartialFailure ? .partial : .missing)
         }
 
         for context in currentContexts {
@@ -1485,7 +1758,7 @@ final class HomeViewModel: ObservableObject {
             debugHomeLoad("requestSource trigger=\(trigger) endpoint=/matches/\(context.matchID) source=HomeViewModel.loadCurrentMatch")
             do {
                 let match = try await session.container.matchRepository.detail(matchID: context.matchID)
-                return CurrentMatchLoadResult(match: match, state: hadPartialFailure ? .partial : .loaded)
+                return CurrentMatchLoadResult(match: match, status: hadPartialFailure ? .partial : .loaded)
             } catch let error as UserFacingError {
                 if error.requiresAuthentication {
                     throw error
@@ -1503,17 +1776,17 @@ final class HomeViewModel: ObservableObject {
                 }
 
                 debugHomeLoadDetail("action=partial_failure section=currentMatch code=\(debugCode(for: error)) fatal=false")
-                return CurrentMatchLoadResult(match: nil, state: .partial)
+                return CurrentMatchLoadResult(match: nil, status: .partial)
             } catch {
                 debugHomeLoadDetail("action=partial_failure section=currentMatch code=UNKNOWN fatal=false")
-                return CurrentMatchLoadResult(match: nil, state: .partial)
+                return CurrentMatchLoadResult(match: nil, status: .partial)
             }
         }
 
-        return CurrentMatchLoadResult(match: nil, state: hadPartialFailure ? .partial : .missing)
+        return CurrentMatchLoadResult(match: nil, status: hadPartialFailure ? .partial : .missing)
     }
 
-    private func loadRecruitingPostsForHome(isAuthenticated: Bool, trigger: String) async throws -> [RecruitPost] {
+    private func loadRecruitingPostsForHome(isAuthenticated: Bool, trigger: String) async throws -> RecruitingPostsLoadResult {
         do {
             let posts: [RecruitPost]
             if isAuthenticated {
@@ -1523,7 +1796,11 @@ final class HomeViewModel: ObservableObject {
                 debugHomeLoad("requestSource trigger=\(trigger) endpoint=/recruiting-posts source=HomeViewModel.loadRecruitingPostsForHome authenticated=false")
                 posts = try await session.container.recruitingRepository.listPublic(status: .open)
             }
-            return posts.filter { !session.container.localStore.isUserBlocked($0.createdBy) }
+            let filteredPosts = posts.filter { !session.container.localStore.isUserBlocked($0.createdBy) }
+            return RecruitingPostsLoadResult(
+                posts: filteredPosts,
+                state: filteredPosts.isEmpty ? .empty : .populated(Array(filteredPosts.prefix(4)))
+            )
         } catch let error as UserFacingError {
             if isAuthenticated, error.requiresAuthentication {
                 throw error
@@ -1531,10 +1808,18 @@ final class HomeViewModel: ObservableObject {
             debugHomeLoad(
                 "recruiting section failed but screen continues endpoint=\(error.endpoint ?? "nil") status=\(error.statusCode.map(String.init) ?? "nil") message=\(error.message)"
             )
-            return []
+            return RecruitingPostsLoadResult(posts: [], state: .error(error))
         } catch {
             debugHomeLoad("recruiting section failed but screen continues endpoint=unknown status=nil message=\(error.localizedDescription)")
-            return []
+            return RecruitingPostsLoadResult(
+                posts: [],
+                state: .error(
+                    homeSectionError(
+                        title: "공개 콘텐츠 로딩 실패",
+                        message: "공개 모집글을 불러오지 못했습니다."
+                    )
+                )
+            )
         }
     }
 
@@ -6381,225 +6666,563 @@ struct HomeScreen: View {
     private var content: some View {
         switch viewModel.state {
         case .initial, .loading:
-            LoadingStateView(title: "홈 데이터를 준비 중입니다")
+            homeScrollContent(contentState: nil)
         case let .error(error):
-            ErrorStateView(error: error) { Task { await viewModel.load(force: true) } }
+            homeScrollContent(contentState: nil, fallbackError: error)
         case let .empty(message):
-            ScrollView {
-                StatusBarView()
-                EmptyStateView(title: "홈", message: message, actionTitle: "그룹 탭으로 이동") {
-                    session.selectedTab = .match
-                }
-            }
+            homeScrollContent(
+                contentState: nil,
+                fallbackError: UserFacingError(title: "홈", message: message)
+            )
         case let .refreshing(contentState), let .content(contentState):
-            ScrollView(showsIndicators: false) {
-                VStack(spacing: 0) {
-                    VStack(spacing: 20) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("오늘의 내전을 시작하세요")
-                                .font(AppTypography.heading(18, weight: .bold))
-                            Text("10명을 모아 자동 밸런스 팀을 생성합니다")
-                                .font(AppTypography.body(12))
-                                .foregroundStyle(AppPalette.textSecondary)
-                            Button {
-                                session.selectedTab = .match
-                            } label: {
-                                HStack(spacing: 6) {
-                                    Image(systemName: "plus")
-                                    Text("내전 만들기")
-                                }
-                            }
-                            .buttonStyle(PrimaryButtonStyle())
-                            .frame(maxWidth: 124)
+            homeScrollContent(contentState: contentState)
+        }
+    }
+
+    private func homeScrollContent(
+        contentState: HomeContentState?,
+        fallbackError: UserFacingError? = nil
+    ) -> some View {
+        let currentMatch = currentMatch(for: contentState)
+
+        return ScrollView(showsIndicators: false) {
+            VStack(spacing: 0) {
+                VStack(spacing: 20) {
+                    homeHeroCard
+
+                    HStack(spacing: 8) {
+                        quickAction(symbol: "person.3.fill", title: "10명\n모으기", tint: AppPalette.accentBlue) {
+                            session.selectedTab = .match
                         }
-                        .padding(18)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .background(
-                            LinearGradient(
-                                colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
-                        .clipShape(RoundedRectangle(cornerRadius: 16))
-
-                        let groups = groups(for: contentState)
-                        let currentMatch = currentMatch(for: contentState)
-
-                        HStack(spacing: 8) {
-                            quickAction(symbol: "person.3.fill", title: "10명\n모으기", tint: AppPalette.accentBlue) {
-                                session.selectedTab = .match
-                            }
-                            quickAction(symbol: "arrow.left.arrow.right", title: "팀 자동\n생성", tint: AppPalette.accentPurple) {
-                                if let match = currentMatch {
-                                    router.push(.teamBalance(groupID: match.groupID, matchID: match.id), source: "HomeScreen.quickAction.teamBalance")
-                                } else {
-                                    session.selectedTab = .match
-                                }
-                            }
-                            quickAction(symbol: "checkmark.circle", title: "결과\n입력", tint: AppPalette.accentGreen) {
-                                if let match = currentMatch {
-                                    router.push(.matchResult(matchID: match.id), source: "HomeScreen.quickAction.matchResult")
-                                } else {
-                                    session.selectedTab = .match
-                                }
-                            }
-                            quickAction(symbol: "megaphone", title: "상대팀\n모집", tint: AppPalette.accentOrange) {
-                                session.selectedTab = .recruit
-                            }
-                        }
-
-                        homeContentSection(title: "예정된 내전") {
-                            openHomeSection(.homeUpcomingMatches, section: "예정된 내전", destination: "전체 예정 내전 목록")
-                        } content: {
+                        quickAction(symbol: "arrow.left.arrow.right", title: "팀 자동\n생성", tint: AppPalette.accentPurple) {
                             if let match = currentMatch {
-                                Button {
-                                    router.push(.matchLobby(groupID: match.groupID, matchID: match.id), source: "HomeScreen.upcomingMatchCard")
-                                } label: {
-                                    VStack(alignment: .leading, spacing: 8) {
-                                        HStack {
-                                            Text(groups.first(where: { $0.id == match.groupID })?.name ?? "롤내전모임")
-                                                .font(AppTypography.body(14, weight: .semibold))
-                                            Spacer()
-                                            Text(match.scheduledAt?.shortDateText ?? "예정 미정")
-                                                .font(AppTypography.body(12, weight: .semibold))
-                                                .foregroundStyle(AppPalette.accentBlue)
-                                        }
-                                        Text("\(match.acceptedCount)/10명 모집 중 · TOP, SUP 필요")
-                                            .font(AppTypography.body(11))
-                                            .foregroundStyle(AppPalette.textSecondary)
-                                        ProgressView(value: Double(match.acceptedCount), total: 10)
-                                            .tint(AppPalette.accentBlue)
-                                    }
-                                    .padding(16)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                    .background(AppPalette.bgCard)
-                                    .overlay(RoundedRectangle(cornerRadius: 12).stroke(AppPalette.border, lineWidth: 1))
-                                    .clipShape(RoundedRectangle(cornerRadius: 12))
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-
-                        homeContentSection(title: "최근 참여 그룹") {
-                            openHomeSection(.homeGroups, section: "최근 참여 그룹", destination: "전체 그룹/참여 그룹 목록")
-                        } content: {
-                            HStack(spacing: 10) {
-                                ForEach(Array(groups.prefix(2))) { group in
-                                    Button {
-                                        session.openGroupDetailIfAccessible(group, router: router)
-                                    } label: {
-                                        VStack(alignment: .leading, spacing: 8) {
-                                            Text(group.name)
-                                                .font(AppTypography.body(13, weight: .semibold))
-                                                .foregroundStyle(AppPalette.textPrimary)
-                                                .lineLimit(1)
-                                            Text("\(group.memberCount)명 · \(group.tags.first ?? "서울")")
-                                                .font(AppTypography.body(10))
-                                                .foregroundStyle(AppPalette.textMuted)
-                                            Text(group.description ?? "최근 내전 준비 중")
-                                                .font(AppTypography.body(10))
-                                                .foregroundStyle(AppPalette.textSecondary)
-                                                .lineLimit(2)
-                                        }
-                                        .padding(.horizontal, 12)
-                                        .padding(.vertical, 14)
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .appPanel(background: AppPalette.bgCard, radius: 12)
-                                    }
-                                    .buttonStyle(.plain)
-                                }
-                            }
-                        }
-
-                        switch contentState {
-                        case let .authenticated(snapshot):
-                            homeContentSection(
-                                title: "내 파워 프로필",
-                                trailing: powerSectionTrailingText(for: snapshot.riotAccountsViewState)
-                            ) {
-                                openPowerSection(for: snapshot.riotAccountsViewState)
-                            } content: {
-                                powerSummaryCard(
-                                    profile: snapshot.profile,
-                                    power: snapshot.power,
-                                    riotAccountsViewState: snapshot.riotAccountsViewState
-                                )
-                            }
-
-                            homeContentSection(title: "최근 경기") {
-                                openHomeSection(.homeRecentMatches, section: "최근 경기", destination: "최근 경기 전체 목록")
-                            } content: {
-                                if let latestHistory = snapshot.latestHistory {
-                                    Button {
-                                        router.push(.matchDetail(matchID: latestHistory.matchID), source: "HomeScreen.latestHistoryCard")
-                                    } label: {
-                                        MatchCardView(
-                                            title: snapshot.groups.first?.name ?? "롤내전모임",
-                                            dateText: latestHistory.scheduledAt.dottedDateText,
-                                            isWin: latestHistory.result == "WIN",
-                                            blueSummary: "블루 팀",
-                                            redSummary: "레드 팀",
-                                            detail: "KDA \(latestHistory.kda) · MMR \(Int(latestHistory.deltaMMR))"
-                                        )
-                                    }
-                                    .buttonStyle(.plain)
-                                } else {
-                                    guestBenefitCard(
-                                        title: "아직 계정 기록이 없어요",
-                                        message: "경기 결과를 저장하면 최근 내전 성적이 여기에 쌓입니다.",
-                                        buttonTitle: "결과 입력하러 가기"
-                                    ) {
-                                        if let match = currentMatch {
-                                            router.push(.matchResult(matchID: match.id), source: "HomeScreen.emptyHistoryCta")
-                                        } else {
-                                            session.selectedTab = .match
-                                        }
-                                    }
-                                }
-                            }
-                        case let .guest(snapshot):
-                            SectionHeaderView(title: "로그인하면 더 편해요")
-                            guestBenefitCard(
-                                title: "찜, 동기화, 기기 간 이어하기",
-                                message: "지금은 로컬 저장만 사용할 수 있어요. 로그인하면 기록 저장, 공유, 이어하기가 계정에 연결됩니다.",
-                                buttonTitle: "로그인하고 동기화"
-                            ) {
-                                session.requireAuthentication(for: .profileSync)
-                            }
-
-                            SectionHeaderView(title: "최근 로컬 저장")
-                            if let latestLocal = snapshot.latestLocalResult {
-                                MatchCardView(
-                                    title: latestLocal.groupName,
-                                    dateText: latestLocal.savedAt.dottedDateText,
-                                    isWin: latestLocal.winningTeam == .blue,
-                                    blueSummary: "승리 팀 \(latestLocal.winningTeam == .blue ? "블루" : "레드")",
-                                    redSummary: "밸런스 \(latestLocal.balanceRating)/5",
-                                    detail: "로컬 저장 · MVP \(latestLocal.mvpUserID)"
-                                )
+                                router.push(.teamBalance(groupID: match.groupID, matchID: match.id), source: "HomeScreen.quickAction.teamBalance")
                             } else {
-                                guestBenefitCard(
-                                    title: "아직 로컬 기록이 없어요",
-                                    message: "경기 결과를 저장하면 이 탭에서 최근 내전 흐름을 다시 확인할 수 있어요.",
-                                    buttonTitle: "결과 입력하러 가기"
-                                ) {
-                                    if let match = currentMatch {
-                                        router.push(.matchResult(matchID: match.id), source: "HomeScreen.guestResultCta")
-                                    } else {
-                                        session.selectedTab = .match
-                                    }
-                                }
+                                session.selectedTab = .match
                             }
+                        }
+                        quickAction(symbol: "checkmark.circle", title: "결과\n입력", tint: AppPalette.accentGreen) {
+                            if let match = currentMatch {
+                                router.push(.matchResult(matchID: match.id), source: "HomeScreen.quickAction.matchResult")
+                            } else {
+                                session.selectedTab = .match
+                            }
+                        }
+                        quickAction(symbol: "megaphone", title: "상대팀\n모집", tint: AppPalette.accentOrange) {
+                            session.selectedTab = .recruit
                         }
                     }
-                    .padding(.horizontal, 24)
-                    .padding(.vertical, 8)
+
+                    upcomingMatchesSection(contentState: contentState, fallbackError: fallbackError)
+                    recentGroupsSection(contentState: contentState, fallbackError: fallbackError)
+
+                    if session.isGuest {
+                        publicContentSection(contentState: contentState, fallbackError: fallbackError)
+
+                        SectionHeaderView(title: "로그인하면 더 편해요")
+                        guestBenefitCard(
+                            title: "찜, 동기화, 기기 간 이어하기",
+                            message: "지금은 로컬 저장만 사용할 수 있어요. 로그인하면 기록 저장, 공유, 이어하기가 계정에 연결됩니다.",
+                            buttonTitle: "로그인하고 동기화"
+                        ) {
+                            session.requireAuthentication(for: .profileSync)
+                        }
+
+                        localRecordsSection(contentState: contentState, currentMatch: currentMatch, fallbackError: fallbackError)
+                    } else if let profile = authenticatedProfile(for: contentState) ?? session.profile {
+                        let riotAccountsViewState = riotAccountsViewState(for: contentState, fallbackError: fallbackError)
+
+                        homeContentSection(
+                            title: "내 파워 프로필",
+                            trailing: powerSectionTrailingText(for: riotAccountsViewState)
+                        ) {
+                            openPowerSection(for: riotAccountsViewState)
+                        } content: {
+                            powerSummaryCard(
+                                profile: profile,
+                                power: authenticatedSnapshot(for: contentState)?.power,
+                                riotAccountsViewState: riotAccountsViewState
+                            )
+                        }
+
+                        recentMatchesSection(contentState: contentState, currentMatch: currentMatch, fallbackError: fallbackError)
+                    }
+                }
+                .padding(.horizontal, 24)
+                .padding(.vertical, 8)
+            }
+        }
+        .refreshable { await viewModel.refresh() }
+    }
+
+    private var homeHeroCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("오늘의 내전을 시작하세요")
+                .font(AppTypography.heading(18, weight: .bold))
+            Text("10명을 모아 자동 밸런스 팀을 생성합니다")
+                .font(AppTypography.body(12))
+                .foregroundStyle(AppPalette.textSecondary)
+            Button {
+                session.selectedTab = .match
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "plus")
+                    Text("내전 만들기")
                 }
             }
-            .refreshable { await viewModel.refresh() }
+            .buttonStyle(PrimaryButtonStyle())
+            .frame(maxWidth: 124)
         }
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [Color(hex: 0x1A2744), AppPalette.bgPrimary],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
+        )
+        .overlay(RoundedRectangle(cornerRadius: 16).stroke(AppPalette.border, lineWidth: 1))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+    }
+
+    private func upcomingMatchesSection(
+        contentState: HomeContentState?,
+        fallbackError: UserFacingError?
+    ) -> some View {
+        let groups = groups(for: contentState)
+        let sectionState = homeSectionState(
+            for: contentState,
+            authenticated: \.scheduledMatchesSectionState,
+            guest: \.scheduledMatchesSectionState,
+            fallbackError: fallbackError,
+            fallbackTitle: "예정된 내전 로딩 실패",
+            fallbackMessage: "예정된 내전 정보를 불러오지 못했습니다."
+        )
+
+        return homeContentSection(title: "예정된 내전") {
+            openHomeSection(.homeUpcomingMatches, section: "예정된 내전", destination: "전체 예정 내전 목록")
+        } content: {
+            switch sectionState {
+            case .loading:
+                homeSkeletonCard(height: 102)
+            case let .populated(match):
+                upcomingMatchCard(match, groups: groups)
+            case .empty:
+                guestBenefitCard(
+                    title: "예정된 내전이 아직 없어요",
+                    message: "현재 이어서 진행할 내전이 없습니다. 새 내전을 만들면 이 자리에서 바로 이어갈 수 있어요.",
+                    buttonTitle: "내전 만들기"
+                ) {
+                    session.selectedTab = .match
+                }
+            case let .error(error):
+                guestBenefitCard(
+                    title: "예정된 내전을 불러오지 못했어요",
+                    message: error.message,
+                    buttonTitle: "다시 시도"
+                ) {
+                    Task { await viewModel.load(force: true, trigger: "home_retry_upcoming") }
+                }
+            }
+        }
+    }
+
+    private func recentGroupsSection(
+        contentState: HomeContentState?,
+        fallbackError: UserFacingError?
+    ) -> some View {
+        let title = session.isGuest ? "공개 그룹" : "최근 참여 그룹"
+        let sectionState = homeSectionState(
+            for: contentState,
+            authenticated: \.recentGroupsSectionState,
+            guest: \.recentGroupsSectionState,
+            fallbackError: fallbackError,
+            fallbackTitle: session.isGuest ? "공개 그룹 로딩 실패" : "참여 그룹 로딩 실패",
+            fallbackMessage: session.isGuest
+                ? "공개 그룹 목록을 불러오지 못했습니다."
+                : "최근 참여 그룹 정보를 불러오지 못했습니다."
+        )
+
+        return homeContentSection(title: title) {
+            openHomeSection(.homeGroups, section: title, destination: session.isGuest ? "전체 공개 그룹 목록" : "전체 그룹/참여 그룹 목록")
+        } content: {
+            switch sectionState {
+            case .loading:
+                HStack(spacing: 10) {
+                    homeSkeletonCard(height: 112)
+                    homeSkeletonCard(height: 112)
+                }
+            case let .populated(groups):
+                HStack(spacing: 10) {
+                    ForEach(Array(groups.prefix(2))) { group in
+                        homeGroupCard(group)
+                    }
+                }
+            case .empty:
+                guestBenefitCard(
+                    title: session.isGuest ? "공개 그룹이 아직 없어요" : "아직 참여 그룹이 없어요",
+                    message: session.isGuest
+                        ? "그룹 탭에서 새 공개 그룹을 둘러보면 홈 흐름이 더 풍부해져요."
+                        : "그룹 탭에서 새 그룹을 둘러보거나 직접 그룹을 만들면 여기에 최근 흐름이 쌓여요.",
+                    buttonTitle: "그룹 탭으로 이동"
+                ) {
+                    session.selectedTab = .match
+                }
+            case let .error(error):
+                guestBenefitCard(
+                    title: session.isGuest ? "공개 그룹을 불러오지 못했어요" : "참여 그룹을 불러오지 못했어요",
+                    message: error.message,
+                    buttonTitle: "다시 시도"
+                ) {
+                    Task { await viewModel.load(force: true, trigger: "home_retry_groups") }
+                }
+            }
+        }
+    }
+
+    private func publicContentSection(
+        contentState: HomeContentState?,
+        fallbackError: UserFacingError?
+    ) -> some View {
+        let sectionState = homeSectionState(
+            for: contentState,
+            authenticated: \.publicContentSectionState,
+            guest: \.publicContentSectionState,
+            fallbackError: fallbackError,
+            fallbackTitle: "공개 콘텐츠 로딩 실패",
+            fallbackMessage: "공개 모집글을 불러오지 못했습니다."
+        )
+
+        return homeContentSection(title: "둘러볼 모집글") {
+            session.selectedTab = .recruit
+        } content: {
+            switch sectionState {
+            case .loading:
+                VStack(spacing: 10) {
+                    homeSkeletonCard(height: 116)
+                    homeSkeletonCard(height: 116)
+                }
+            case let .populated(posts):
+                VStack(spacing: 10) {
+                    ForEach(Array(posts.prefix(2))) { post in
+                        homeRecruitPostCard(post)
+                    }
+                }
+            case .empty:
+                guestBenefitCard(
+                    title: "공개 모집글이 아직 없어요",
+                    message: "모집 탭에서 새 글을 확인하면 지금 참여할 수 있는 내전 흐름을 더 쉽게 찾을 수 있어요.",
+                    buttonTitle: "모집 탭으로 이동"
+                ) {
+                    session.selectedTab = .recruit
+                }
+            case let .error(error):
+                guestBenefitCard(
+                    title: "공개 모집글을 불러오지 못했어요",
+                    message: error.message,
+                    buttonTitle: "다시 시도"
+                ) {
+                    Task { await viewModel.load(force: true, trigger: "home_retry_public_content") }
+                }
+            }
+        }
+    }
+
+    private func recentMatchesSection(
+        contentState: HomeContentState?,
+        currentMatch: Match?,
+        fallbackError: UserFacingError?
+    ) -> some View {
+        let snapshot = authenticatedSnapshot(for: contentState)
+        let sectionState = homeSectionState(
+            for: contentState,
+            authenticated: \.recentMatchesSectionState,
+            guest: \.recentMatchesSectionState,
+            fallbackError: fallbackError,
+            fallbackTitle: "최근 경기 로딩 실패",
+            fallbackMessage: "최근 경기 정보를 불러오지 못했습니다."
+        )
+
+        return homeContentSection(title: "최근 경기") {
+            openHomeSection(.homeRecentMatches, section: "최근 경기", destination: "최근 경기 전체 목록")
+        } content: {
+            switch sectionState {
+            case .loading:
+                homeSkeletonCard(height: 116)
+            case let .populated(latestHistory):
+                Button {
+                    router.push(.matchDetail(matchID: latestHistory.matchID), source: "HomeScreen.latestHistoryCard")
+                } label: {
+                    MatchCardView(
+                        title: snapshot?.groups.first?.name ?? "롤내전모임",
+                        dateText: latestHistory.scheduledAt.dottedDateText,
+                        isWin: latestHistory.result == "WIN",
+                        blueSummary: "블루 팀",
+                        redSummary: "레드 팀",
+                        detail: "KDA \(latestHistory.kda) · MMR \(Int(latestHistory.deltaMMR))"
+                    )
+                }
+                .buttonStyle(.plain)
+            case .empty:
+                guestBenefitCard(
+                    title: "아직 계정 기록이 없어요",
+                    message: "경기 결과를 저장하면 최근 내전 성적이 여기에 쌓입니다.",
+                    buttonTitle: "결과 입력하러 가기"
+                ) {
+                    if let match = currentMatch {
+                        router.push(.matchResult(matchID: match.id), source: "HomeScreen.emptyHistoryCta")
+                    } else {
+                        session.selectedTab = .match
+                    }
+                }
+            case let .error(error):
+                guestBenefitCard(
+                    title: "최근 경기 정보를 불러오지 못했어요",
+                    message: error.message,
+                    buttonTitle: "다시 시도"
+                ) {
+                    Task { await viewModel.load(force: true, trigger: "home_retry_recent_matches") }
+                }
+            }
+        }
+    }
+
+    private func localRecordsSection(
+        contentState: HomeContentState?,
+        currentMatch: Match?,
+        fallbackError: UserFacingError?
+    ) -> some View {
+        let sectionState = homeSectionState(
+            for: contentState,
+            authenticated: \.localRecordsSectionState,
+            guest: \.localRecordsSectionState,
+            fallbackError: fallbackError,
+            fallbackTitle: "최근 로컬 저장 로딩 실패",
+            fallbackMessage: "최근 로컬 저장 정보를 불러오지 못했습니다."
+        )
+
+        return homeContentSection(title: "최근 로컬 저장", trailing: "기기 저장") {
+            session.selectedTab = .history
+        } content: {
+            switch sectionState {
+            case .loading:
+                homeSkeletonCard(height: 116)
+            case let .populated(latestLocal):
+                MatchCardView(
+                    title: latestLocal.groupName,
+                    dateText: latestLocal.savedAt.dottedDateText,
+                    isWin: latestLocal.winningTeam == .blue,
+                    blueSummary: "승리 팀 \(latestLocal.winningTeam == .blue ? "블루" : "레드")",
+                    redSummary: "밸런스 \(latestLocal.balanceRating)/5",
+                    detail: "로컬 저장 · MVP \(latestLocal.mvpUserID)"
+                )
+            case .empty:
+                guestBenefitCard(
+                    title: "아직 로컬 기록이 없어요",
+                    message: "경기 결과를 저장하면 이 탭에서 최근 내전 흐름을 다시 확인할 수 있어요.",
+                    buttonTitle: "결과 입력하러 가기"
+                ) {
+                    if let match = currentMatch {
+                        router.push(.matchResult(matchID: match.id), source: "HomeScreen.guestResultCta")
+                    } else {
+                        session.selectedTab = .match
+                    }
+                }
+            case let .error(error):
+                guestBenefitCard(
+                    title: "로컬 저장 정보를 불러오지 못했어요",
+                    message: error.message,
+                    buttonTitle: "다시 시도"
+                ) {
+                    Task { await viewModel.load(force: true, trigger: "home_retry_local_records") }
+                }
+            }
+        }
+    }
+
+    private func authenticatedSnapshot(for content: HomeContentState?) -> HomeSnapshot? {
+        guard case let .authenticated(snapshot)? = content else { return nil }
+        return snapshot
+    }
+
+    private func authenticatedProfile(for content: HomeContentState?) -> UserProfile? {
+        authenticatedSnapshot(for: content)?.profile
+    }
+
+    private func riotAccountsViewState(
+        for content: HomeContentState?,
+        fallbackError: UserFacingError?
+    ) -> RiotLinkedAccountsViewState {
+        if let snapshot = authenticatedSnapshot(for: content) {
+            return snapshot.riotAccountsViewState
+        }
+        if let fallbackError, !viewModel.isInitialLoading {
+            return .error(
+                UserFacingError(
+                    title: "Riot ID 상태를 확인하지 못했어요",
+                    message: fallbackError.message
+                )
+            )
+        }
+        return .loading
+    }
+
+    private func homeSectionState<Value: Equatable>(
+        for content: HomeContentState?,
+        authenticated: KeyPath<HomeSnapshot, HomeSectionState<Value>>,
+        guest: KeyPath<GuestHomeSnapshot, HomeSectionState<Value>>,
+        fallbackError: UserFacingError?,
+        fallbackTitle: String,
+        fallbackMessage: String
+    ) -> HomeSectionState<Value> {
+        if let content {
+            switch content {
+            case let .authenticated(snapshot):
+                return snapshot[keyPath: authenticated]
+            case let .guest(snapshot):
+                return snapshot[keyPath: guest]
+            }
+        }
+
+        if viewModel.isInitialLoading {
+            return .loading
+        }
+
+        return .error(
+            UserFacingError(
+                title: fallbackTitle,
+                message: fallbackError?.message ?? fallbackMessage
+            )
+        )
+    }
+
+    private func upcomingMatchCard(_ match: Match, groups: [GroupSummary]) -> some View {
+        Button {
+            router.push(.matchLobby(groupID: match.groupID, matchID: match.id), source: "HomeScreen.upcomingMatchCard")
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text(
+                        groups.first(where: { $0.id == match.groupID })?.name
+                            ?? session.container.localStore.groupName(for: match.groupID)
+                            ?? "롤내전모임"
+                    )
+                    .font(AppTypography.body(14, weight: .semibold))
+                    Spacer()
+                    Text(match.scheduledAt?.shortDateText ?? "예정 미정")
+                        .font(AppTypography.body(12, weight: .semibold))
+                        .foregroundStyle(AppPalette.accentBlue)
+                }
+                Text("\(match.acceptedCount)/10명 모집 중 · TOP, SUP 필요")
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
+                ProgressView(value: Double(match.acceptedCount), total: 10)
+                    .tint(AppPalette.accentBlue)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .appPanel(background: AppPalette.bgCard, radius: 12)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func homeGroupCard(_ group: GroupSummary) -> some View {
+        Button {
+            session.openGroupDetailIfAccessible(group, router: router)
+        } label: {
+            VStack(alignment: .leading, spacing: 8) {
+                Text(group.name)
+                    .font(AppTypography.body(13, weight: .semibold))
+                    .foregroundStyle(AppPalette.textPrimary)
+                    .lineLimit(1)
+                Text("\(group.memberCount)명 · \(group.tags.first ?? "서울")")
+                    .font(AppTypography.body(10))
+                    .foregroundStyle(AppPalette.textMuted)
+                Text(group.description ?? "최근 내전 준비 중")
+                    .font(AppTypography.body(10))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .lineLimit(2)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .appPanel(background: AppPalette.bgCard, radius: 12)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func homeRecruitPostCard(_ post: RecruitPost) -> some View {
+        Button {
+            session.selectedTab = .recruit
+        } label: {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack {
+                    Text(post.title)
+                        .font(AppTypography.body(14, weight: .semibold))
+                        .foregroundStyle(AppPalette.textPrimary)
+                        .lineLimit(1)
+                    Spacer()
+                    Text(post.scheduledAt?.shortDateText ?? "일정 미정")
+                        .font(AppTypography.body(11, weight: .semibold))
+                        .foregroundStyle(AppPalette.accentBlue)
+                }
+
+                HStack(spacing: 6) {
+                    ForEach(Array(post.requiredPositions.prefix(3)), id: \.self) { value in
+                        Text(value)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.accentBlue)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(AppPalette.bgTertiary)
+                            .clipShape(Capsule())
+                    }
+                    ForEach(Array(post.tags.filter { !$0.isEmpty }.prefix(2)), id: \.self) { value in
+                        Text(value)
+                            .font(AppTypography.body(11))
+                            .foregroundStyle(AppPalette.accentPurple)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(AppPalette.bgTertiary)
+                            .clipShape(Capsule())
+                    }
+                }
+
+                Text(post.body ?? "모집 중인 내전 글입니다.")
+                    .font(AppTypography.body(11))
+                    .foregroundStyle(AppPalette.textSecondary)
+                    .lineLimit(2)
+            }
+            .padding(16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .appPanel(background: AppPalette.bgCard, radius: 12)
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func homeSkeletonCard(height: CGFloat) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            homeSkeletonLine(width: 110, height: 12)
+            homeSkeletonLine(height: 12)
+            homeSkeletonLine(width: 160, height: 12)
+            Spacer(minLength: 0)
+            homeSkeletonLine(width: 96, height: 36, radius: 10)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, minHeight: height, alignment: .topLeading)
+        .appPanel(background: AppPalette.bgCard, radius: 12)
+    }
+
+    private func homeSkeletonLine(
+        width: CGFloat? = nil,
+        height: CGFloat,
+        radius: CGFloat = 6
+    ) -> some View {
+        RoundedRectangle(cornerRadius: radius, style: .continuous)
+            .fill(AppPalette.bgTertiary)
+            .frame(width: width, height: height)
+            .opacity(0.92)
     }
 
     private func quickAction(symbol: String, title: String, tint: Color, action: @escaping () -> Void) -> some View {
@@ -6636,7 +7259,8 @@ struct HomeScreen: View {
         }
     }
 
-    private func groups(for content: HomeContentState) -> [GroupSummary] {
+    private func groups(for content: HomeContentState?) -> [GroupSummary] {
+        guard let content else { return [] }
         switch content {
         case let .guest(snapshot):
             return snapshot.groups
@@ -6645,7 +7269,8 @@ struct HomeScreen: View {
         }
     }
 
-    private func currentMatch(for content: HomeContentState) -> Match? {
+    private func currentMatch(for content: HomeContentState?) -> Match? {
+        guard let content else { return nil }
         switch content {
         case let .guest(snapshot):
             return snapshot.currentMatch
