@@ -2154,6 +2154,8 @@ struct EmailSignUpRequestDTO: Encodable {
     let email: String
     let password: String
     let nickname: String
+    let agreedToTerms: Bool
+    let agreedToPrivacy: Bool
 }
 
 struct EmailLoginRequestDTO: Encodable {
@@ -4077,7 +4079,9 @@ final class AuthRepository {
                     EmailSignUpRequestDTO(
                         email: email,
                         password: password,
-                        nickname: nickname
+                        nickname: nickname,
+                        agreedToTerms: true,
+                        agreedToPrivacy: true
                     )
                 ),
                 requiresAuth: false

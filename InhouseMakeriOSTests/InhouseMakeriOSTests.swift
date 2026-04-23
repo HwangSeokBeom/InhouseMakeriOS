@@ -1784,7 +1784,7 @@ final class InhouseMakeriOSTests: XCTestCase {
         XCTAssertEqual(tokens.user.provider, .apple)
     }
 
-    func testEmailSignUpRequestDoesNotSendConsentPayload() async throws {
+    func testEmailSignUpRequestSendsRequiredConsentPayload() async throws {
         let tokenStore = makeTokenStore()
         let repository = AuthRepository(
             apiClient: APIClient(
@@ -1795,10 +1795,13 @@ final class InhouseMakeriOSTests: XCTestCase {
 
                     let body = try XCTUnwrap(self.requestBodyData(from: request))
                     let payload = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
-                    XCTAssertNil(payload["agreedToTerms"])
-                    XCTAssertNil(payload["agreedToPrivacy"])
+                    XCTAssertEqual(payload["agreedToTerms"] as? Bool, true)
+                    XCTAssertEqual(payload["agreedToPrivacy"] as? Bool, true)
                     XCTAssertNil(payload["agreedToMarketing"])
-                    XCTAssertEqual(Set(payload.keys), Set(["email", "password", "nickname"]))
+                    XCTAssertEqual(
+                        Set(payload.keys),
+                        Set(["email", "password", "nickname", "agreedToTerms", "agreedToPrivacy"])
+                    )
 
                     let response = AuthTokensDTO(
                         user: AuthUserDTO(
